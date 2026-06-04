@@ -6,6 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
+	"syscall"
 	"time"
 )
 
@@ -43,10 +45,34 @@ func writeRestartNotify(path string, nf restartNotifyFile) error {
 		return err
 	}
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	f, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if _, err := f.Write(b); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	if dir := filepath.Dir(path); dir != "" {
+		if df, err := os.Open(dir); err == nil {
+			_ = df.Sync()
+			_ = df.Close()
+		}
+	}
+	return nil
 }
 
 func loadRestartNotify(stateDir string) ([]int64, error) {
@@ -139,8 +165,18 @@ func (a *App) waitTasksDone(timeout time.Duration) {
 	log.Printf("WARN: graceful restart proceeding with tasks still running")
 }
 
-// gracefulServiceRestart stops in-flight work and reasonix serve processes,
-// notifies the user, then asks systemd to restart this unit.
+const restartUnit = "reasonix-telegram.service"
+
+// triggerSystemRestart schedules a unit restart outside this process cgroup.
+// Blocking "systemctl restart" from inside the service can deadlock shutdown.
+func triggerSystemRestart() error {
+	cmd := exec.Command("systemctl", "restart", "--no-block", restartUnit)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	return cmd.Run()
+}
+
+// gracefulServiceRestart stops in-flight work, persists who to notify on boot,
+// then asks systemd to restart this unit (--no-block, detached session).
 func (a *App) gracefulServiceRestart(chatID int64) {
 	a.restartMu.Lock()
 	if a.restarting {
@@ -149,29 +185,55 @@ func (a *App) gracefulServiceRestart(chatID int64) {
 		return
 	}
 	a.restarting = true
+	a.restartStarted = time.Now()
 	a.restartMu.Unlock()
 
-	a.reply(chatID, msgRestarting)
+	// Persist first: the new process must read this after systemd replaces us.
 	if err := saveRestartNotify(a.cfg.StateDir, chatID); err != nil {
 		log.Printf("save restart notify: %v", err)
+		a.restartMu.Lock()
+		a.restarting = false
+		a.restartMu.Unlock()
+		a.reply(chatID, "❌ 无法保存重启通知，请检查数据目录权限。")
+		return
 	}
+	a.reply(chatID, msgRestarting)
 
-	a.cancelAllTasks()
-	a.waitTasksDone(8 * time.Second)
-	a.stopAllServes()
-	// Let reasonix serve flush session JSONL after SIGTERM (stopAllServes waits up to 5s).
-	time.Sleep(800 * time.Millisecond)
-
-	log.Printf("chat=%d: initiating graceful systemd restart", chatID)
 	go func() {
-		time.Sleep(600 * time.Millisecond)
-		cmd := exec.Command("systemctl", "restart", "reasonix-telegram.service")
-		if out, err := cmd.CombinedOutput(); err != nil {
-			log.Printf("systemctl restart failed: %v (%s)", err, string(out))
+		a.cancelAllTasks()
+		a.waitTasksDone(5 * time.Second)
+		a.stopAllServes()
+		time.Sleep(500 * time.Millisecond)
+
+		log.Printf("chat=%d: initiating graceful systemd restart (--no-block)", chatID)
+		if err := triggerSystemRestart(); err != nil {
+			log.Printf("systemctl restart failed: %v", err)
 			a.restartMu.Lock()
 			a.restarting = false
 			a.restartMu.Unlock()
 			a.reply(chatID, "❌ 重启失败，请检查服务器日志。")
+			return
 		}
+		// Success: systemd stops this process; new instance sends msgConnected on boot.
 	}()
+}
+
+var restartWatch sync.Once
+
+// startRestartWatchdog clears restarting if systemd restart never replaced the process.
+func (a *App) startRestartWatchdog() {
+	restartWatch.Do(func() {
+		go func() {
+			t := time.NewTicker(15 * time.Second)
+			for range t.C {
+				a.restartMu.Lock()
+				stuck := a.restarting && time.Since(a.restartStarted) > 45*time.Second
+				if stuck {
+					a.restarting = false
+					log.Printf("WARN: restart appears stuck >45s; accepting messages again")
+				}
+				a.restartMu.Unlock()
+			}
+		}()
+	})
 }

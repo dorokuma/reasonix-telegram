@@ -129,8 +129,9 @@ type App struct {
 	state      *stateStore
 	sessMu     sync.Mutex
 	sess       map[int64]*session
-	restartMu  sync.Mutex
-	restarting bool
+	restartMu      sync.Mutex
+	restarting     bool
+	restartStarted time.Time
 }
 
 func main() {
@@ -165,6 +166,7 @@ func main() {
 		log.Fatalf("chat workdir: %v", err)
 	}
 	log.Printf("chat-only mode: workdir=%s (tools disabled in reasonix.toml)", app.chatWorkdir())
+	app.startRestartWatchdog()
 	app.restorePersistedSessions()
 	app.notifyBridgeRestarted()
 
@@ -217,7 +219,7 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 	restarting := a.restarting
 	a.restartMu.Unlock()
 	if restarting {
-		a.reply(m.Chat.ID, "🔄 服务重启中，请稍候…")
+		a.reply(m.Chat.ID, "🔄 服务重启中，完成后会发 🟢 已连接 提示。")
 		return
 	}
 	text := strings.TrimSpace(m.Text)
