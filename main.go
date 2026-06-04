@@ -86,7 +86,7 @@ func loadConfig() Config {
 	c := Config{
 		BotToken:       os.Getenv("TG_BOT_TOKEN"),
 		ReasonixBin:    getenv("REASONIX_BIN", "reasonix"),
-		MaxOutputBytes: atoi(getenv("MAX_OUTPUT_BYTES", "32000")),
+		MaxOutputBytes: atoi(getenv("MAX_OUTPUT_BYTES", "524288")),
 		MaxDuration:    atoi(getenv("MAX_DURATION_MIN", "30")),
 		Model:          os.Getenv("MODEL"),
 		StateDir: getenv("STATE_DIR", defaultStateDir),
@@ -246,7 +246,8 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 			"• `/restart` — 重启桥接",
 			"• 直接发消息 — 纯文字聊天",
 			"",
-			fmt.Sprintf("上限：回复约 %d 字节，超时 %d 分钟", a.cfg.MaxOutputBytes, a.cfg.MaxDuration),
+			fmt.Sprintf("单条最多 %d 字，超长自动连发；缓冲约 %d 字节，超时 %d 分钟",
+				telegramMaxMessageRunes, a.cfg.MaxOutputBytes, a.cfg.MaxDuration),
 		}, "\n"))
 		return
 
@@ -442,32 +443,28 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		streamDone = true
 
 		bufMu.Lock()
-		body := truncate(buf.String(), a.cfg.MaxOutputBytes)
+		body := buf.String()
 		tr := truncated
 		bufMu.Unlock()
 		body = strings.TrimSpace(body)
 		if body == "" {
 			return
 		}
+		if len(body) > maxFinalizeBytes {
+			body = trimUTF8Bytes(body, maxFinalizeBytes)
+			tr = true
+		}
 		if tr {
 			body += "\n\n（内容过长，已截断尾部）"
 		}
 		if useDraft {
-			a.finalizeDraft(chatID, draftID, body)
+			n := a.finalizeDraft(chatID, draftID, body)
+			log.Printf("chat=%d draftID=%d: finalize %d part(s) total=%d bytes", chatID, draftID, n, len(body))
 			return
 		}
-		if streamMsgID == 0 {
-			sent, err := a.bot.Send(tgbotapi.NewMessage(chatID, body))
-			if err != nil {
-				log.Printf("chat=%d: stream send failed: %v", chatID, err)
-				return
-			}
-			streamMsgID = sent.MessageID
-			return
-		}
-		edit := tgbotapi.NewEditMessageText(chatID, streamMsgID, body)
-		if _, err := a.bot.Send(edit); err != nil {
-			log.Printf("chat=%d msgID=%d: final edit failed: %v", chatID, streamMsgID, err)
+		n := a.sendTextParts(chatID, body, &streamMsgID)
+		if n == 0 {
+			log.Printf("chat=%d: finalize send failed (0 parts)", chatID)
 		}
 	}
 
@@ -478,35 +475,36 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			return
 		}
 		bufMu.Lock()
-		body := strings.TrimSpace(truncate(buf.String(), a.cfg.MaxOutputBytes))
+		body := strings.TrimSpace(buf.String())
 		bufMu.Unlock()
 		if body == "" {
 			return
 		}
+		preview := telegramPreviewTail(body, telegramMaxMessageRunes)
 		if useDraft {
-			if body == lastDraftBody {
+			if preview == lastDraftBody {
 				return
 			}
-			if a.sendDraft(chatID, draftID, body) {
-				lastDraftBody = body
+			if a.sendDraft(chatID, draftID, preview) {
+				lastDraftBody = preview
 				return
 			}
 			useDraft = false
 		}
 		if streamMsgID == 0 {
-			sent, err := a.bot.Send(tgbotapi.NewMessage(chatID, body))
+			sent, err := a.bot.Send(tgbotapi.NewMessage(chatID, preview))
 			if err != nil {
 				log.Printf("chat=%d: stream send failed: %v", chatID, err)
 				return
 			}
 			streamMsgID = sent.MessageID
-			lastDraftBody = body
+			lastDraftBody = preview
 			return
 		}
-		if body == lastDraftBody {
+		if preview == lastDraftBody {
 			return
 		}
-		edit := tgbotapi.NewEditMessageText(chatID, streamMsgID, body)
+		edit := tgbotapi.NewEditMessageText(chatID, streamMsgID, preview)
 		if _, err := a.bot.Send(edit); err == nil {
 			lastDraftBody = body
 		}
@@ -620,26 +618,22 @@ func (a *App) nextDraftID() int64 {
 	return int64(time.Now().Unix()%1_000_000_000)*10000 + int64(seq%10000)
 }
 
-// finalizeDraft ends a native-draft turn (TelePi prompt-handler finalizeResponse):
-// 1) final sendMessageDraft with full text (awaited, while streamDone blocks stale drafts)
-// 2) sendMessage immediately after — client dismisses the preview on the real message.
+// finalizeDraft ends a native-draft turn: last draft frame, then one or more sendMessage parts.
 // Never send empty sendMessageDraft here; that creates a ghost bubble revoked seconds later.
-func (a *App) finalizeDraft(chatID int64, draftID int64, text string) {
-	if len(text) > 4096 {
-		text = truncate(text, 4096)
+func (a *App) finalizeDraft(chatID int64, draftID int64, text string) int {
+	parts := splitTelegramText(text, telegramMaxMessageRunes)
+	if len(parts) == 0 {
+		return 0
 	}
-	_ = a.sendDraft(chatID, draftID, text)
-	if _, err := a.bot.Send(tgbotapi.NewMessage(chatID, text)); err != nil {
-		log.Printf("chat=%d draftID=%d: finalize sendMessage failed: %v", chatID, draftID, err)
-		return
-	}
-	log.Printf("chat=%d draftID=%d: finalize sendMessage ok len=%d", chatID, draftID, len(text))
+	_ = a.sendDraft(chatID, draftID, parts[0])
+	return a.sendTextParts(chatID, text, nil)
 }
 
 // sendDraft pushes streaming preview text via sendMessageDraft (Bot API 9.5+).
 func (a *App) sendDraft(chatID int64, draftID int64, text string) bool {
-	if len(text) > 4096 {
-		text = truncate(text, 4096)
+	text = telegramPreviewTail(text, telegramMaxMessageRunes)
+	if text == "" {
+		return false
 	}
 	_, err := a.bot.MakeRequest("sendMessageDraft", tgbotapi.Params{
 		"chat_id":  strconv.FormatInt(chatID, 10),

@@ -389,20 +389,28 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 	return turnResult{err: ctx.Err()}
 }
 
-// appendChunk builds Telegram preview text with truncation window.
+// appendChunk accumulates streamed assistant text (full buffer; finalize may split across messages).
 func appendChunk(buf *strings.Builder, chunk string, maxBytes int, truncated *bool) {
 	clean := stripANSI(chunk)
 	if clean == "" || isReasonixNoise(clean) {
 		return
 	}
-	buf.WriteString(clean)
-	if buf.Len() > maxBytes*2 {
-		keep := maxBytes
-		s := buf.String()
-		buf.Reset()
-		buf.WriteString("…[truncated]…\n")
-		buf.WriteString(s[len(s)-keep:])
-		*truncated = true
+	cap := maxBytes
+	if cap <= 0 {
+		cap = maxFinalizeBytes
 	}
+	if buf.Len() >= cap {
+		*truncated = true
+		return
+	}
+	if buf.Len()+len(clean) > cap {
+		*truncated = true
+		remain := cap - buf.Len()
+		if remain > 0 {
+			buf.WriteString(trimUTF8Bytes(clean, remain))
+		}
+		return
+	}
+	buf.WriteString(clean)
 }
 
