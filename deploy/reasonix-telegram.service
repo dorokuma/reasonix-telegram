@@ -1,0 +1,20 @@
+[Unit]
+Description=reasonix-telegram: Telegram bridge for Reasonix
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/reasonix-telegram.env
+Environment=REASONIX_CACHE_DIR=/var/lib/reasonix-telegram/cache
+Environment=XDG_CACHE_HOME=/var/lib/reasonix-telegram/cache
+ExecStart=/usr/local/bin/reasonix-telegram
+Restart=on-failure
+RestartSec=5
+
+# Hardening (adjust ReadWritePaths if STATE_DIR differs)
+ProtectHome=read-only
+ReadWritePaths=/var/lib/reasonix-telegram
+
+[Install]
+WantedBy=multi-user.target

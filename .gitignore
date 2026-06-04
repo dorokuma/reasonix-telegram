@@ -1,0 +1,5 @@
+reasonix-telegram
+*.bak*
+.env
+*.jsonl
+restart_notify.json
