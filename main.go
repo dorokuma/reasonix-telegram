@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
@@ -437,6 +438,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 	)
 	const streamDebounce = 50 * time.Millisecond
 	var procErr error
+	replyDelivered := false
 
 	// endStream mirrors TelePi finalizeResponse: set streamDone first, flush last
 	// draft frame, then sendMessage so no late sendMessageDraft lands after the real message.
@@ -463,14 +465,18 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		if tr {
 			body += "\n\n（内容过长，已截断尾部）"
 		}
+		var n int
 		if useDraft {
-			n := a.finalizeDraft(chatID, draftID, body)
-			log.Printf("chat=%d draftID=%d: finalize %d part(s) total=%d bytes", chatID, draftID, n, len(body))
-			return
+			n = a.finalizeDraft(chatID, draftID, body)
+			log.Printf("chat=%d draftID=%d: finalize %d part(s) total=%d runes", chatID, draftID, n, utf8.RuneCountInString(body))
+		} else {
+			n = a.sendTextParts(chatID, body, &streamMsgID)
+			if n == 0 {
+				log.Printf("chat=%d: finalize send failed (0 parts)", chatID)
+			}
 		}
-		n := a.sendTextParts(chatID, body, &streamMsgID)
-		if n == 0 {
-			log.Printf("chat=%d: finalize send failed (0 parts)", chatID)
+		if n > 0 {
+			replyDelivered = true
 		}
 	}
 
@@ -593,6 +599,10 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		draftMu.Lock()
 		streamDone = true
 		draftMu.Unlock()
+		if replyDelivered && errors.Is(procErr, context.Canceled) {
+			log.Printf("chat=%d prompt=%q: canceled after reply delivered", chatID, logPreview(prompt, 80))
+			return
+		}
 		msg := fmt.Sprintf("请求失败：%s", userFacingError(procErr))
 		if errors.Is(procErr, context.DeadlineExceeded) {
 			msg = fmt.Sprintf("超时（%d 分钟）", a.cfg.MaxDuration)
@@ -600,7 +610,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			msg = "已中止"
 		}
 		a.reply(chatID, msg)
-		log.Printf("chat=%d prompt=%q err=%v stream=draft", chatID, truncate(prompt, 60), procErr)
+		log.Printf("chat=%d prompt=%q err=%v", chatID, logPreview(prompt, 80), procErr)
 		return
 	}
 
@@ -612,9 +622,10 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		a.reply(chatID, "（模型没有返回文字）")
 	}
 	bufMu.Lock()
-	finalLen := len(strings.TrimSpace(buf.String()))
+	finalBody := strings.TrimSpace(buf.String())
 	bufMu.Unlock()
-	log.Printf("chat=%d prompt=%q stream=draft draftID=%d finalLen=%d msgID=%d", chatID, truncate(prompt, 60), draftID, finalLen, streamMsgID)
+	log.Printf("chat=%d prompt=%q stream=draft draftID=%d finalLen=%d runes=%d parts-cap=%d msgID=%d",
+		chatID, logPreview(prompt, 80), draftID, len(finalBody), utf8.RuneCountInString(finalBody), telegramMaxMessageRunes, streamMsgID)
 }
 
 // nextDraftID returns a unique Telegram draft_id (int32-safe, no second-level collisions).

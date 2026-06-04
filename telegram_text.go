@@ -76,6 +76,15 @@ func telegramPreviewTail(text string, maxRunes int) string {
 	return string(runes[len(runes)-maxRunes:])
 }
 
+// logPreview shortens text for logs (no user-visible [cut] marker).
+func logPreview(s string, maxBytes int) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= maxBytes {
+		return s
+	}
+	return trimUTF8Bytes(s, maxBytes) + "…"
+}
+
 // trimUTF8Bytes trims s to at most maxBytes without breaking a UTF-8 code point.
 func trimUTF8Bytes(s string, maxBytes int) string {
 	if len(s) <= maxBytes {
