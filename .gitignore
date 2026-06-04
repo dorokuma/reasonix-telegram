@@ -1,5 +1,40 @@
+# Binary
 reasonix-telegram
-*.bak*
+/reasonix-telegram
+
+# Secrets & runtime data (never commit)
 .env
+.env.*
+!.env.example
 *.jsonl
 restart_notify.json
+state.json
+
+# Backups & local overrides
+*.bak*
+*.local
+
+# Go
+/vendor/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+coverage.out
+coverage.html
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+
+# Logs & temp
+*.log
+tmp/
+temp/
