@@ -26,6 +26,9 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
+// Telegram shows "typing…" for ~5s per sendChatAction; refresh before it expires.
+const typingRefreshInterval = 4 * time.Second
+
 // Strip ANSI / TUI art from reasonix output. Reasonix in `run` mode emits
 // progress blocks like "\x1b[2m  ▎ thinking [0m" which render as garbage
 // in Telegram. We strip CSI sequences (\x1b[...m) and OSC sequences, plus
@@ -340,6 +343,30 @@ func (a *App) reply(chatID int64, text string) {
 	}
 }
 
+// beginTyping shows Telegram "typing…" until the returned stop function runs.
+func (a *App) beginTyping(chatID int64) (stop func()) {
+	ctx, cancel := context.WithCancel(context.Background())
+	send := func() {
+		if _, err := a.bot.Send(tgbotapi.NewChatAction(chatID, tgbotapi.ChatTyping)); err != nil {
+			log.Printf("chat=%d: sendChatAction typing: %v", chatID, err)
+		}
+	}
+	send()
+	go func() {
+		ticker := time.NewTicker(typingRefreshInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				send()
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	return cancel
+}
+
 // runTask streams the model reply into one Telegram bubble (sendMessageDraft when
 // supported, else editMessageText). No "running/done" status prefix — only text.
 func (a *App) runTask(chatID int64, replyTo int, prompt string) {
@@ -371,6 +398,9 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		a.reply(chatID, fmt.Sprintf("Reasonix 服务启动失败: %v", err))
 		return
 	}
+
+	stopTyping := a.beginTyping(chatID)
+	defer stopTyping()
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(a.cfg.MaxDuration)*time.Minute)
 	s.mu.Lock()
