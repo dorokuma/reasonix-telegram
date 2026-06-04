@@ -395,9 +395,9 @@ func appendChunk(buf *strings.Builder, chunk string, maxBytes int, truncated *bo
 	if clean == "" || isReasonixNoise(clean) {
 		return
 	}
-	cap := maxBytes
-	if cap <= 0 {
-		cap = maxFinalizeBytes
+	cap := maxFinalizeBytes
+	if maxBytes > 0 && maxBytes < cap {
+		cap = maxBytes
 	}
 	if buf.Len() >= cap {
 		*truncated = true

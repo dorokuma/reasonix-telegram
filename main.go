@@ -76,7 +76,7 @@ type Config struct {
 	BotToken       string  // TG_BOT_TOKEN
 	ReasonixBin  string  // REASONIX_BIN, default "reasonix"
 	AllowedUsers []int64 // ALLOWED_USERS, comma-separated TG user IDs; empty = anyone
-	MaxOutputBytes int     // MAX_OUTPUT_BYTES, default 32000
+	MaxOutputBytes int     // MAX_OUTPUT_BYTES, default 524288 (stream buffer before split-send)
 	MaxDuration    int     // MAX_DURATION_MIN, default 30
 	Model          string  // MODEL, default "" (reasonix default)
 	StateDir string // STATE_DIR, default /var/lib/reasonix-telegram
@@ -217,6 +217,9 @@ func registerCommands(bot *tgbotapi.BotAPI) error {
 }
 
 func (a *App) handleMessage(m *tgbotapi.Message) {
+	if m.From == nil {
+		return
+	}
 	if !a.allowed(m.From) {
 		a.reply(m.Chat.ID, "⛔ 无权使用此机器人")
 		return
@@ -339,19 +342,22 @@ func (a *App) resetReasonixSession(chatID int64) {
 }
 
 func (a *App) reply(chatID int64, text string) {
-	if _, err := a.bot.Send(tgbotapi.NewMessage(chatID, text)); err != nil {
-		log.Printf("send reply failed: %v", err)
+	if n := a.sendTextParts(chatID, text, nil); n == 0 {
+		log.Printf("chat=%d: send reply failed (empty)", chatID)
+	}
+}
+
+// sendTyping shows the client "typing…" indicator (API returns bool, not Message).
+func (a *App) sendTyping(chatID int64) {
+	if _, err := a.bot.Request(tgbotapi.NewChatAction(chatID, tgbotapi.ChatTyping)); err != nil {
+		log.Printf("chat=%d: sendChatAction typing: %v", chatID, err)
 	}
 }
 
 // beginTyping shows Telegram "typing…" until the returned stop function runs.
 func (a *App) beginTyping(chatID int64) (stop func()) {
 	ctx, cancel := context.WithCancel(context.Background())
-	send := func() {
-		if _, err := a.bot.Send(tgbotapi.NewChatAction(chatID, tgbotapi.ChatTyping)); err != nil {
-			log.Printf("chat=%d: sendChatAction typing: %v", chatID, err)
-		}
-	}
+	send := func() { a.sendTyping(chatID) }
 	send()
 	go func() {
 		ticker := time.NewTicker(typingRefreshInterval)
@@ -506,7 +512,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		}
 		edit := tgbotapi.NewEditMessageText(chatID, streamMsgID, preview)
 		if _, err := a.bot.Send(edit); err == nil {
-			lastDraftBody = body
+			lastDraftBody = preview
 		}
 	}
 

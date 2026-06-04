@@ -3,10 +3,13 @@ package main
 import (
 	"log"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
+
+const multiPartSendGap = 80 * time.Millisecond
 
 // Telegram Bot API: max length of a single text message (UTF-8 code points / runes).
 const telegramMaxMessageRunes = 4096
@@ -112,6 +115,9 @@ func (a *App) sendTextParts(chatID int64, text string, editFirstMsgID *int) int 
 		sent++
 		if i == 0 && editFirstMsgID != nil && *editFirstMsgID == 0 {
 			*editFirstMsgID = m.MessageID
+		}
+		if i+1 < len(parts) {
+			time.Sleep(multiPartSendGap)
 		}
 	}
 	return sent

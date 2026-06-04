@@ -24,7 +24,7 @@ func TestSplitTelegramText_multipart(t *testing.T) {
 			t.Fatalf("part %d too long: %d runes", i, utf8.RuneCountInString(p))
 		}
 	}
-	if parts[0]+parts[1] != s {
+	if strings.Join(parts, "") != s {
 		t.Fatalf("lost content")
 	}
 }
