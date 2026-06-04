@@ -275,7 +275,7 @@ func (a *App) lockServeChatOnly(port int) {
 // runServeTurn submits a prompt to the long-lived reasonix serve process and
 // streams SSE events until turn_done. The conversation history stays in the
 // same Reasonix session file across Telegram messages and bridge restarts.
-func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onChunk func(string)) error {
+func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onChunk func(string), onComplete func()) error {
 	s := a.getOrCreateSession(chatID)
 	s.mu.Lock()
 	port := s.servePort
@@ -285,7 +285,7 @@ func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onC
 
 	eventsDone := make(chan turnResult, 1)
 	go func() {
-		eventsDone <- a.consumeServeEvents(ctx, port, onChunk)
+		eventsDone <- a.consumeServeEvents(ctx, port, onChunk, onComplete)
 	}()
 
 	if err := postJSON(port, "/submit", map[string]string{"input": prompt}); err != nil {
@@ -306,7 +306,7 @@ func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onC
 	}
 }
 
-func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(string)) turnResult {
+func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(string), onComplete func()) turnResult {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serveBaseURL(port)+"/events", nil)
 	if err != nil {
 		return turnResult{err: err}
@@ -319,6 +319,7 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 
 	var turnErr error
 	var toolCancel sync.Once
+	var gotTextDelta bool
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
 	for sc.Scan() {
@@ -335,11 +336,18 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 		case "text":
 			// Streaming token deltas — append in place (never suffix "\n" per chunk).
 			if ev.Text != "" {
+				gotTextDelta = true
 				onChunk(ev.Text)
 			}
 		case "message":
-			// Full answer at end of stream; duplicates accumulated "text" deltas.
-			continue
+			// Full answer at end; normally duplicates "text" deltas — use as fallback only.
+			if ev.Text != "" && !gotTextDelta {
+				onChunk(ev.Text)
+			}
+			// Finalize UI as soon as the full message is known (often before turn_done).
+			if ev.Text != "" && onComplete != nil {
+				onComplete()
+			}
 		case "reasoning":
 			// Hidden in Telegram — reasoning is verbose and also arrives as deltas.
 			continue
@@ -364,6 +372,9 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 		case "turn_done":
 			if ev.Err != "" {
 				turnErr = fmt.Errorf("%s", ev.Err)
+			}
+			if onComplete != nil {
+				onComplete()
 			}
 			return turnResult{err: turnErr}
 		case "notice":

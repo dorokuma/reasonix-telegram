@@ -19,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -85,7 +86,7 @@ func loadConfig() Config {
 		MaxOutputBytes: atoi(getenv("MAX_OUTPUT_BYTES", "32000")),
 		MaxDuration:    atoi(getenv("MAX_DURATION_MIN", "30")),
 		Model:          os.Getenv("MODEL"),
-		StateDir:       getenv("STATE_DIR", defaultStateDir),
+		StateDir: getenv("STATE_DIR", defaultStateDir),
 	}
 	if s := os.Getenv("ALLOWED_USERS"); s != "" {
 		for _, p := range strings.Split(s, ",") {
@@ -132,6 +133,7 @@ type App struct {
 	restartMu      sync.Mutex
 	restarting     bool
 	restartStarted time.Time
+	draftSeq       uint64 // per-process draft_id sequence (avoids same-second collisions)
 }
 
 func main() {
@@ -166,6 +168,7 @@ func main() {
 		log.Fatalf("chat workdir: %v", err)
 	}
 	log.Printf("chat-only mode: workdir=%s (tools disabled in reasonix.toml)", app.chatWorkdir())
+	log.Printf("telegram stream: sendMessageDraft + sendMessage finalize (TelePi/Hermes pattern)")
 	app.startRestartWatchdog()
 	app.restorePersistedSessions()
 	app.notifyBridgeRestarted()
@@ -382,41 +385,46 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 	}()
 
 	var (
-		buf          strings.Builder
-		bufMu        sync.Mutex
-		draftTicker  = time.NewTicker(300 * time.Millisecond)
-		truncated    bool
-		finished     = make(chan struct{})
-		streamMsgID  int
-		draftID      = time.Now().UnixNano()
-		useDraft     = true
+		buf           strings.Builder
+		bufMu         sync.Mutex
+		draftMu       sync.Mutex
+		truncated     bool
+		finished      = make(chan struct{})
+		flushNow      = make(chan struct{}, 1) // reasonix "message" / turn_done — finalize early
+		pushWake      = make(chan struct{}, 1)
+		streamMsgID   int
+		draftID       = a.nextDraftID()
+		useDraft      = true
+		streamDone    bool
+		lastDraftBody string
 	)
+	const streamDebounce = 50 * time.Millisecond
 	var procErr error
 
-	pushOnce := func(final bool) {
+	// endStream mirrors TelePi finalizeResponse: set streamDone first, flush last
+	// draft frame, then sendMessage so no late sendMessageDraft lands after the real message.
+	endStream := func() {
+		draftMu.Lock()
+		defer draftMu.Unlock()
+		if streamDone {
+			return
+		}
+		streamDone = true
+
 		bufMu.Lock()
 		body := truncate(buf.String(), a.cfg.MaxOutputBytes)
 		tr := truncated
 		bufMu.Unlock()
 		body = strings.TrimSpace(body)
 		if body == "" {
-			if final && useDraft {
-				a.clearDraft(chatID, draftID)
-			}
 			return
 		}
-		if final && tr {
+		if tr {
 			body += "\n\n（内容过长，已截断尾部）"
 		}
 		if useDraft {
-			if final {
-				a.finalizeDraft(chatID, draftID, body)
-				return
-			}
-			if a.sendDraft(chatID, draftID, body) {
-				return
-			}
-			useDraft = false
+			a.finalizeDraft(chatID, draftID, body)
+			return
 		}
 		if streamMsgID == 0 {
 			sent, err := a.bot.Send(tgbotapi.NewMessage(chatID, body))
@@ -428,28 +436,108 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			return
 		}
 		edit := tgbotapi.NewEditMessageText(chatID, streamMsgID, body)
-		_, _ = a.bot.Send(edit)
+		if _, err := a.bot.Send(edit); err != nil {
+			log.Printf("chat=%d msgID=%d: final edit failed: %v", chatID, streamMsgID, err)
+		}
+	}
+
+	pushDraft := func() {
+		draftMu.Lock()
+		defer draftMu.Unlock()
+		if streamDone {
+			return
+		}
+		bufMu.Lock()
+		body := strings.TrimSpace(truncate(buf.String(), a.cfg.MaxOutputBytes))
+		bufMu.Unlock()
+		if body == "" {
+			return
+		}
+		if useDraft {
+			if body == lastDraftBody {
+				return
+			}
+			if a.sendDraft(chatID, draftID, body) {
+				lastDraftBody = body
+				return
+			}
+			useDraft = false
+		}
+		if streamMsgID == 0 {
+			sent, err := a.bot.Send(tgbotapi.NewMessage(chatID, body))
+			if err != nil {
+				log.Printf("chat=%d: stream send failed: %v", chatID, err)
+				return
+			}
+			streamMsgID = sent.MessageID
+			lastDraftBody = body
+			return
+		}
+		if body == lastDraftBody {
+			return
+		}
+		edit := tgbotapi.NewEditMessageText(chatID, streamMsgID, body)
+		if _, err := a.bot.Send(edit); err == nil {
+			lastDraftBody = body
+		}
+	}
+
+	signalFlush := func() {
+		select {
+		case flushNow <- struct{}{}:
+		default:
+		}
+	}
+
+	wakePush := func() {
+		select {
+		case pushWake <- struct{}{}:
+		default:
+		}
 	}
 
 	go func() {
-		procErr = a.runServeTurn(ctx, chatID, prompt, func(chunk string) {
-			bufMu.Lock()
-			appendChunk(&buf, chunk, a.cfg.MaxOutputBytes, &truncated)
-			bufMu.Unlock()
-		})
+		procErr = a.runServeTurn(ctx, chatID, prompt,
+			func(chunk string) {
+				bufMu.Lock()
+				appendChunk(&buf, chunk, a.cfg.MaxOutputBytes, &truncated)
+				bufMu.Unlock()
+				wakePush()
+			},
+			signalFlush,
+		)
 		close(finished)
 	}()
 
 	pusherDone := make(chan struct{})
 	go func() {
 		defer close(pusherDone)
-		defer draftTicker.Stop()
+		debounce := time.NewTimer(time.Hour)
+		debounce.Stop()
+		stopDebounce := func() {
+			if !debounce.Stop() {
+				select {
+				case <-debounce.C:
+				default:
+				}
+			}
+		}
+		flushAndEnd := func() {
+			stopDebounce()
+			pushDraft()
+			endStream()
+		}
 		for {
 			select {
-			case <-draftTicker.C:
-				pushOnce(false)
+			case <-pushWake:
+				stopDebounce()
+				debounce.Reset(streamDebounce)
+			case <-debounce.C:
+				pushDraft()
+			case <-flushNow:
+				flushAndEnd()
 			case <-finished:
-				pushOnce(true)
+				flushAndEnd()
 				return
 			}
 		}
@@ -468,9 +556,9 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 	}
 
 	if procErr != nil {
-		if useDraft {
-			a.clearDraft(chatID, draftID)
-		}
+		draftMu.Lock()
+		streamDone = true
+		draftMu.Unlock()
 		msg := fmt.Sprintf("请求失败：%s", userFacingError(procErr))
 		if errors.Is(procErr, context.DeadlineExceeded) {
 			msg = fmt.Sprintf("超时（%d 分钟）", a.cfg.MaxDuration)
@@ -486,34 +574,36 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 	empty := strings.TrimSpace(buf.String()) == ""
 	bufMu.Unlock()
 	if empty && streamMsgID == 0 && useDraft {
-		a.clearDraft(chatID, draftID)
+		// sendMessage dismisses the native draft preview; never clearDraft(empty) here.
 		a.reply(chatID, "（模型没有返回文字）")
 	}
-	log.Printf("chat=%d prompt=%q stream=draft msgID=%d", chatID, truncate(prompt, 60), streamMsgID)
+	bufMu.Lock()
+	finalLen := len(strings.TrimSpace(buf.String()))
+	bufMu.Unlock()
+	log.Printf("chat=%d prompt=%q stream=draft draftID=%d finalLen=%d msgID=%d", chatID, truncate(prompt, 60), draftID, finalLen, streamMsgID)
 }
 
-// clearDraft dismisses the native draft bubble (Bot API 10.0+ allows empty text).
-func (a *App) clearDraft(chatID int64, draftID int64) {
-	_, err := a.bot.MakeRequest("sendMessageDraft", tgbotapi.Params{
-		"chat_id":  strconv.FormatInt(chatID, 10),
-		"draft_id": strconv.FormatInt(draftID, 10),
-		"text":     "",
-	})
-	if err != nil {
-		log.Printf("clearDraft failed chat=%d: %v", chatID, err)
-	}
+// nextDraftID returns a unique Telegram draft_id (int32-safe, no second-level collisions).
+func (a *App) nextDraftID() int64 {
+	seq := atomic.AddUint64(&a.draftSeq, 1)
+	// Low 9 digits from unix seconds + 4-digit sequence within the same second.
+	return int64(time.Now().Unix()%1_000_000_000)*10000 + int64(seq%10000)
 }
 
-// finalizeDraft ends streaming: last draft frame, clear draft, send real message.
+// finalizeDraft ends a native-draft turn (TelePi prompt-handler finalizeResponse):
+// 1) final sendMessageDraft with full text (awaited, while streamDone blocks stale drafts)
+// 2) sendMessage immediately after — client dismisses the preview on the real message.
+// Never send empty sendMessageDraft here; that creates a ghost bubble revoked seconds later.
 func (a *App) finalizeDraft(chatID int64, draftID int64, text string) {
 	if len(text) > 4096 {
 		text = truncate(text, 4096)
 	}
 	_ = a.sendDraft(chatID, draftID, text)
-	a.clearDraft(chatID, draftID)
 	if _, err := a.bot.Send(tgbotapi.NewMessage(chatID, text)); err != nil {
-		log.Printf("chat=%d: finalize sendMessage failed: %v", chatID, err)
+		log.Printf("chat=%d draftID=%d: finalize sendMessage failed: %v", chatID, draftID, err)
+		return
 	}
+	log.Printf("chat=%d draftID=%d: finalize sendMessage ok len=%d", chatID, draftID, len(text))
 }
 
 // sendDraft pushes streaming preview text via sendMessageDraft (Bot API 9.5+).
