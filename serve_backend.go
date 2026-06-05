@@ -369,6 +369,25 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 			} else {
 				// tool mode: signal tool boundary, then send commentary
 				if ev.Tool != nil && !ev.Tool.Partial && ev.Tool.Name != "" {
+					// ask tool: intercept for clarify flow
+					if ev.Tool.Name == "ask" {
+						log.Printf("port=%d: ask tool dispatched, pausing for user input", port)
+						// Parse the question from args
+						var askArgs struct {
+							Question string   `json:"question"`
+							Choices  []string `json:"choices"`
+						}
+						if ev.Tool.Args != "" {
+							json.Unmarshal([]byte(ev.Tool.Args), &askArgs)
+						}
+						// Cancel the current turn so the user can respond
+						_ = postJSON(port, "/cancel", map[string]any{})
+						return turnResult{err: &errAskUser{
+							question: askArgs.Question,
+							choices:  askArgs.Choices,
+						}}
+					}
+
 					if onToolDispatch != nil {
 						onToolDispatch()
 					}

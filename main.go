@@ -126,15 +126,22 @@ func atoi(s string) int {
 	return n
 }
 
+type clarifyState struct {
+	question  string
+	choices   []string
+	clarifyID string
+}
+
 // session: one per Telegram chat — workdir, Reasonix session file, serve process.
 type session struct {
-	mu           sync.Mutex
-	workdir      string
-	sessionPath  string
-	servePort    int
-	serveCmd     *exec.Cmd
-	task         *runningTask // non-nil while a turn is in flight
-	lastActivity time.Time    // last message activity, for /sessions
+	mu             sync.Mutex
+	workdir        string
+	sessionPath    string
+	servePort      int
+	serveCmd       *exec.Cmd
+	task           *runningTask // non-nil while a turn is in flight
+	lastActivity   time.Time    // last message activity, for /sessions
+	pendingClarify *clarifyState // non-nil while awaiting user clarify answer
 }
 
 type runningTask struct {
@@ -206,10 +213,12 @@ func main() {
 	updates := bot.GetUpdatesChan(u)
 
 	for upd := range updates {
-		if upd.Message == nil {
-			continue
+		if upd.Message != nil {
+			go app.handleMessage(upd.Message)
 		}
-		go app.handleMessage(upd.Message)
+		if upd.CallbackQuery != nil {
+			go app.handleCallbackQuery(upd.CallbackQuery)
+		}
 	}
 }
 
@@ -233,6 +242,15 @@ func registerCommands(bot *tgbotapi.BotAPI) error {
 	return err
 }
 
+// errAskUser is a sentinel error returned by consumeServeEvents when the
+// model calls the ask tool. The question details are carried in the error.
+type errAskUser struct {
+	question string
+	choices  []string
+}
+
+func (e *errAskUser) Error() string { return "ask:" + e.question }
+
 func (a *App) handleMessage(m *tgbotapi.Message) {
 	if m.From == nil {
 		return
@@ -250,6 +268,21 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 	}
 	text := strings.TrimSpace(m.Text)
 	if text == "" {
+		return
+	}
+
+	// Check if we're awaiting a clarify answer.
+	s := a.getOrCreateSession(m.Chat.ID)
+	s.mu.Lock()
+	pc := s.pendingClarify
+	s.mu.Unlock()
+	if pc != nil {
+		s.mu.Lock()
+		s.pendingClarify = nil
+		s.mu.Unlock()
+		// Submit the user's answer as a new prompt
+		answer := fmt.Sprintf("[用户回答: %s]\n%s", pc.question, text)
+		a.runTask(m.Chat.ID, m.MessageID, answer)
 		return
 	}
 
@@ -735,6 +768,44 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			log.Printf("chat=%d prompt=%q: canceled after reply delivered", chatID, logPreview(prompt, 80))
 			return
 		}
+		// Handle clarify (ask tool) — send question to user, set pendingClarify.
+		var askErr *errAskUser
+		if errors.As(procErr, &askErr) {
+			log.Printf("chat=%d: ask tool -> clarify: %s", chatID, askErr.question)
+			s.mu.Lock()
+			s.pendingClarify = &clarifyState{
+				question:  askErr.question,
+				choices:   askErr.choices,
+				clarifyID: fmt.Sprintf("%s", askErr.question),
+			}
+			s.mu.Unlock()
+			// Send the question to the user
+			text := "❓ " + askErr.question
+			if len(askErr.choices) > 0 {
+				text += "\n\n" + a.formatChoices(askErr.choices)
+			} else {
+				text += "\n\n📝 请直接回复你的回答。"
+			}
+			msg := tgbotapi.NewMessage(chatID, text)
+			msg.ParseMode = "HTML"
+			if len(askErr.choices) > 0 {
+				var rows [][]tgbotapi.InlineKeyboardButton
+				for i, choice := range askErr.choices {
+					idx := i
+					data := fmt.Sprintf("cl:%s:%d", askErr.question, idx)
+					rows = append(rows, []tgbotapi.InlineKeyboardButton{
+						{Text: fmt.Sprintf("%d. %s", i+1, choice), CallbackData: &data},
+					})
+				}
+				otherData := fmt.Sprintf("cl:%s:other", askErr.question)
+				rows = append(rows, []tgbotapi.InlineKeyboardButton{
+					{Text: "✏️ 其他（输入答案）", CallbackData: &otherData},
+				})
+				msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
+			}
+			_, _ = a.bot.Send(msg)
+			return
+		}
 		msg := fmt.Sprintf("请求失败：%s", userFacingError(procErr))
 		if errors.Is(procErr, context.DeadlineExceeded) {
 			msg = fmt.Sprintf("超时（%d 分钟）", a.cfg.MaxDuration)
@@ -870,6 +941,73 @@ func (a *App) modeHandler(m *tgbotapi.Message, arg string) {
 		modeLabel = "全能编程（工具可用）"
 	}
 	a.reply(m.Chat.ID, fmt.Sprintf("已切换到 %s 模式\n%s", newMode, modeLabel))
+}
+
+func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
+	if cq.Message == nil || cq.From == nil {
+		return
+	}
+	chatID := cq.Message.Chat.ID
+	data := strings.TrimSpace(cq.Data)
+
+	// Only handle clarify callbacks: cl:{clarifyID}:{choice}
+	if !strings.HasPrefix(data, "cl:") {
+		return
+	}
+	parts := strings.SplitN(data, ":", 3)
+	if len(parts) < 3 {
+		return
+	}
+	clarifyID := parts[1]
+	choiceIdx := parts[2]
+
+	s := a.getOrCreateSession(chatID)
+	s.mu.Lock()
+	pc := s.pendingClarify
+	if pc == nil || pc.clarifyID != clarifyID {
+		s.mu.Unlock()
+		return
+	}
+	s.pendingClarify = nil
+	s.mu.Unlock()
+
+	var answer string
+	if choiceIdx == "other" {
+		// User wants to type their own answer — re-set pendingClarify and ask
+		s.mu.Lock()
+		s.pendingClarify = pc
+		s.mu.Unlock()
+		msg := tgbotapi.NewMessage(chatID, "📝 请输入你的回答：")
+		msg.ParseMode = "HTML"
+		msg.ReplyToMessageID = cq.Message.MessageID
+		_, _ = a.bot.Send(msg)
+		_, _ = a.bot.Request(tgbotapi.NewCallbackWithAlert(cq.ID, "请输入你的回答"))
+		return
+	}
+	if idx, err := strconv.Atoi(choiceIdx); err == nil && idx >= 0 && idx < len(pc.choices) {
+		answer = pc.choices[idx]
+	}
+	if answer == "" {
+		answer = choiceIdx
+	}
+
+	// Answer the callback so TG stops the loading spinner
+	_, _ = a.bot.Request(tgbotapi.NewCallback(cq.ID, ""))
+
+	// Submit the answer as a new prompt
+	prompt := fmt.Sprintf("[用户选择了: %s]\n%s", pc.question, answer)
+	a.runTask(chatID, cq.Message.MessageID, prompt)
+}
+
+func (a *App) formatChoices(choices []string) string {
+	var b strings.Builder
+	for i, c := range choices {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		fmt.Fprintf(&b, "%d. %s", i+1, c)
+	}
+	return b.String()
 }
 
 func (a *App) sessionsHandler(m *tgbotapi.Message) {
