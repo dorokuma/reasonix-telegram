@@ -572,7 +572,10 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			// Fall through to edit path for this frame
 		}
 		if streamMsgID == 0 {
-			sent, err := a.bot.Send(tgbotapi.NewMessage(chatID, preview))
+			previewHTML := formatForTelegram(preview)
+			msg := tgbotapi.NewMessage(chatID, previewHTML)
+			msg.ParseMode = "HTML"
+			sent, err := a.bot.Send(msg)
 			if err != nil {
 				log.Printf("chat=%d: stream send failed: %v", chatID, err)
 				editFailCount++
@@ -589,7 +592,9 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		if preview == lastDraftBody {
 			return
 		}
-		edit := tgbotapi.NewEditMessageText(chatID, streamMsgID, preview)
+		previewHTML := formatForTelegram(preview)
+		edit := tgbotapi.NewEditMessageText(chatID, streamMsgID, previewHTML)
+		edit.ParseMode = "HTML"
 		if _, err := a.bot.Send(edit); err == nil {
 			editFailCount = 0
 			lastDraftBody = preview
@@ -772,15 +777,18 @@ func (a *App) finalizeDraft(chatID int64, draftID int64, text string) int {
 }
 
 // sendDraft pushes streaming preview text via sendMessageDraft (Bot API 9.5+).
+// Text is automatically converted from markdown to Telegram HTML format.
 func (a *App) sendDraft(chatID int64, draftID int64, text string) bool {
+	text = formatForTelegram(text)
 	text = telegramPreviewTail(text, telegramMaxMessageRunes)
 	if text == "" {
 		return false
 	}
 	_, err := a.bot.MakeRequest("sendMessageDraft", tgbotapi.Params{
-		"chat_id":  strconv.FormatInt(chatID, 10),
-		"draft_id": strconv.FormatInt(draftID, 10),
-		"text":     text,
+		"chat_id":    strconv.FormatInt(chatID, 10),
+		"draft_id":   strconv.FormatInt(draftID, 10),
+		"text":       text,
+		"parse_mode": "HTML",
 	})
 	if err != nil {
 		log.Printf("sendMessageDraft failed (fallback to edit): %v", err)
