@@ -16,6 +16,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"os/exec"
 	"os/signal"
 	"regexp"
@@ -81,6 +82,81 @@ const (
 	ModeTool = "tool"
 )
 
+// Callback data prefixes and actions.
+const (
+	prefixApproval = "ap:"
+	prefixClarify  = "cl:"
+	prefixModel    = "md:"
+	prefixEffort   = "ef:"
+	actionOnce     = "once"
+	actionSession  = "session"
+	actionDeny     = "deny"
+	actionOther    = "other"
+	actionPage     = "page"
+)
+
+// Available models — populated from reasonix doctor --json at startup.
+var availableModels = []struct {
+	ID   string
+	Name string
+}{}
+
+func loadModelsFromReasonix(bin string) {
+	cmd := exec.Command(bin, "doctor", "--json")
+	out, err := cmd.Output()
+	if err != nil {
+		log.Printf("loadModels: reasonix doctor failed: %v", err)
+		return
+	}
+	var doc struct {
+		Config   struct {
+			DefaultModel string `json:"default_model"`
+		} `json:"config"`
+		Providers []struct {
+			Name        string   `json:"name"`
+			Models      []string `json:"models"`
+			IsDefault   bool     `json:"is_default"`
+		} `json:"providers"`
+	}
+	if err := json.Unmarshal(out, &doc); err != nil {
+		log.Printf("loadModels: parse doctor json: %v", err)
+		return
+	}
+	// Default provider name.
+	defProv := doc.Config.DefaultModel
+	availableModels = availableModels[:0]
+	for _, p := range doc.Providers {
+		isDefProv := p.Name == defProv
+		for _, m := range p.Models {
+			id := p.Name + "/" + m
+			display := p.Name + ": " + m
+			if isDefProv {
+				display += " ⭐"
+			}
+			availableModels = append(availableModels, struct {
+				ID   string
+				Name string
+			}{id, display})
+		}
+	}
+	log.Printf("loadModels: loaded %d models from reasonix: %v", len(availableModels), func() []string {
+		ids := make([]string, len(availableModels))
+		for i, m := range availableModels {
+			ids[i] = m.ID
+		}
+		return ids
+	}())
+}
+
+func modelByID(id string) (string, bool) {
+	for _, m := range availableModels {
+		if m.ID == id {
+			return m.Name, true
+		}
+	}
+	return "", false
+}
+
 // Config: env-driven. Copy `.env.example` and fill in.
 type Config struct {
 	BotToken       string  // TG_BOT_TOKEN
@@ -135,7 +211,9 @@ type clarifyState struct {
 	askID      string
 	questionID string
 	port       int // reasonix serve port for submitting answer
-	clarifyID  string
+	clarifyID     string
+	awaitingCustom bool   // true after user clicks "Other", cleared on text input
+	messageID     int    // Telegram message ID with the inline keyboard
 	// Multi-question tracking
 	allQuestions []askQuestionData // all questions in the ask
 	qIndex       int               // which question we're on (0-based)
@@ -159,6 +237,9 @@ type session struct {
 	lastActivity     time.Time    // last message activity, for /sessions
 	pendingClarify   *clarifyState  // non-nil while awaiting user clarify answer
 	pendingApproval  *approvalState // non-nil while awaiting user approval
+	wakePusher       func() // signal the turn pusher to check for new content
+	model            string // per-session model override (empty = use global)
+	lastUsage        wireUsage // latest usage data from serve
 }
 
 type runningTask struct {
@@ -176,6 +257,29 @@ type App struct {
 	restartStarted time.Time
 	draftSeq       uint64 // per-process draft_id sequence (avoids same-second collisions)
 	clarifySeq     uint64 // monotonic counter for clarify IDs
+	mode           atomic.Value // string: ModeChat or ModeTool
+}
+
+func (a *App) getMode() string {
+	if v := a.mode.Load(); v != nil {
+		return v.(string)
+	}
+	return ModeChat
+}
+
+func (a *App) setMode(m string) {
+	a.mode.Store(m)
+}
+
+func modeLabelFor(mode string) string {
+	if mode == ModeTool {
+		return "⌨️ 编程模式"
+	}
+	return "💬 聊天模式"
+}
+
+func (a *App) modeLabel() string {
+	return modeLabelFor(a.getMode())
 }
 
 func main() {
@@ -187,6 +291,7 @@ func main() {
 	if _, err := exec.LookPath(cfg.ReasonixBin); err != nil {
 		log.Fatalf("reasonix binary not found on PATH: %s (%v)", cfg.ReasonixBin, err)
 	}
+	loadModelsFromReasonix(cfg.ReasonixBin)
 
 	bot, err := tgbotapi.NewBotAPI(cfg.BotToken)
 	if err != nil {
@@ -206,11 +311,18 @@ func main() {
 		log.Fatalf("state dir: %v", err)
 	}
 	app := &App{cfg: cfg, bot: bot, state: st, sess: map[int64]*session{}}
+	app.setMode(cfg.Mode)
 	if err := app.ensureChatWorkdir(); err != nil {
 		log.Fatalf("chat workdir: %v", err)
 	}
 	log.Printf("mode=%s workdir=%s", app.cfg.Mode, app.chatWorkdir())
 	log.Printf("telegram stream: sendMessageDraft + sendMessage finalize (TelePi/Hermes pattern)")
+
+	// Log restart reason on startup.
+	reason := app.detectRestartReason()
+	log.Printf("restart reason: %s", reason)
+	app.saveStartInfo(reason)
+
 	app.startRestartWatchdog()
 	app.restorePersistedSessions()
 	app.notifyBridgeRestarted()
@@ -218,10 +330,15 @@ func main() {
 	go func() {
 		sig := make(chan os.Signal, 1)
 		signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
-		<-sig
-		log.Printf("shutdown signal: flushing reasonix sessions…")
-		app.cancelAllTasks()
-		app.waitTasksDone(5 * time.Second)
+		s := <-sig
+		log.Printf("shutdown signal: received %v, waiting for running tasks to complete…", s)
+		// Don't accept new tasks.
+		app.restartMu.Lock()
+		app.restarting = true
+		app.restartMu.Unlock()
+		// Wait for running tasks to finish naturally (max 5 min).
+		app.waitTasksDone(5 * time.Minute)
+		log.Printf("shutdown: all tasks done, stopping serves…")
 		app.stopAllServes()
 		os.Exit(0)
 	}()
@@ -250,11 +367,12 @@ func registerCommands(bot *tgbotapi.BotAPI) error {
 		{Command: "status", Description: "是否在生成回复"},
 		{Command: "stop", Description: "中止当前回复"},
 		{Command: "new", Description: "开启新对话"},
-		{Command: "clear", Description: "同 /new，开启新对话"},
 		{Command: "restart", Description: "重启桥接"},
 		{Command: "health", Description: "所有 serve 进程状态"},
 		{Command: "sessions", Description: "活跃会话列表"},
-		{Command: "mode", Description: "切换模式：/mode chat 或 /mode tool"},
+		{Command: "chat", Description: "切换到聊天模式"},
+		{Command: "code", Description: "切换到编程模式"},
+		{Command: "model", Description: "切换模型：/model [名称]"},
 	}
 	_, err := bot.Request(tgbotapi.NewSetMyCommands(cmds...))
 	return err
@@ -284,109 +402,99 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 	s := a.getOrCreateSession(m.Chat.ID)
 	s.mu.Lock()
 	pc := s.pendingClarify
-	s.mu.Unlock()
+	log.Printf("chat=%d: handleMessage text=%q pendingClarify=%v", m.Chat.ID, logPreview(text, 40), pc != nil)
 	if pc != nil {
-		// Store this text answer
-		pc.answers[pc.questionID] = []string{text}
+		// Store text answer (under lock to avoid concurrent-map write).
+		answerText := text
+		if pc.awaitingCustom {
+			pc.awaitingCustom = false
+			answerText = "(自定义) " + text
+		}
+		log.Printf("chat=%d: clarify text answer for q=%s: %q", m.Chat.ID, pc.questionID, answerText)
+		pc.answers[pc.questionID] = []string{answerText}
 
-		// Check if there are more questions
 		nextIdx := pc.qIndex + 1
 		if nextIdx < len(pc.allQuestions) {
-			// Show the next question
+			// Advance to next question (all fields mutated under lock).
 			nextQ := pc.allQuestions[nextIdx]
-			s.mu.Lock()
 			pc.qIndex = nextIdx
 			pc.questionID = nextQ.ID
 			pc.choices = nextQ.Options
 			cidNum := atomic.AddUint64(&a.clarifySeq, 1)
 			pc.clarifyID = strconv.FormatUint(cidNum, 36)
-			s.mu.Unlock()
-
-			qText := strings.TrimSpace(nextQ.Text)
+			// Snapshot data needed outside lock.
+			qText := htmlEscape(strings.TrimSpace(nextQ.Text))
+			if qText == "" {
+				qText = htmlEscape(strings.TrimSpace(nextQ.ID))
+			}
 			if qText == "" {
 				qText = "请选择："
 			}
 			header := fmt.Sprintf("问题 %d/%d\n", nextIdx+1, len(pc.allQuestions))
+			options := nextQ.Options
+			clarifyID := pc.clarifyID
+			prevMsgID := pc.messageID
+			s.mu.Unlock()
+
+			a.removeKeyboard(m.Chat.ID, prevMsgID)
 			replyText := "❓ " + header + qText
-			if len(nextQ.Options) > 0 {
-				replyText += "\n\n" + a.formatChoices(nextQ.Options)
-			}
 			msg := tgbotapi.NewMessage(m.Chat.ID, replyText)
 			msg.ParseMode = "HTML"
-			if len(nextQ.Options) > 0 {
+			if len(options) > 0 {
 				var rows [][]tgbotapi.InlineKeyboardButton
-				for i, choice := range nextQ.Options {
-					data := fmt.Sprintf("cl:%s:%d", pc.clarifyID, i)
+				for i, choice := range options {
+					data := fmt.Sprintf("%s%s:%d", prefixClarify, clarifyID, i)
+					btnText := truncateForButton(fmt.Sprintf("%d. %s", i+1, choice))
 					rows = append(rows, []tgbotapi.InlineKeyboardButton{
-						{Text: fmt.Sprintf("%d. %s", i+1, choice), CallbackData: &data},
+						{Text: btnText, CallbackData: &data},
 					})
 				}
-				otherData := fmt.Sprintf("cl:%s:other", pc.clarifyID)
+				otherData := fmt.Sprintf("%s%s:%s", prefixClarify, clarifyID, actionOther)
 				rows = append(rows, []tgbotapi.InlineKeyboardButton{
 					{Text: "✏️ 其他（输入答案）", CallbackData: &otherData},
 				})
 				msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
 			}
-			_, _ = a.bot.Send(msg)
+			if sent, err := a.bot.Send(msg); err != nil {
+				log.Printf("send failed: %v", err)
+			} else {
+				s.mu.Lock()
+				s.pendingClarify.messageID = sent.MessageID
+				s.mu.Unlock()
+			}
 			return
 		}
 
-		// All answered — submit
-		s.mu.Lock()
+		// All answered — submit.
+		prevMsgID := pc.messageID
 		s.pendingClarify = nil
 		s.mu.Unlock()
-
-		type answerEntry struct {
-			QuestionID string   `json:"questionId"`
-			Selected   []string `json:"selected"`
-		}
-		var answersPayload []answerEntry
-		for _, q := range pc.allQuestions {
-			sel, ok := pc.answers[q.ID]
-			if !ok {
-				sel = []string{""}
-			}
-			answersPayload = append(answersPayload, answerEntry{
-				QuestionID: q.ID,
-				Selected:   sel,
-			})
-		}
-		body, _ := json.Marshal(map[string]any{
-			"id":      pc.askID,
-			"answers": answersPayload,
-		})
-		url := fmt.Sprintf("http://127.0.0.1:%d/answer", pc.port)
-		resp, err := http.Post(url, "application/json", bytes.NewReader(body))
-		if err != nil {
-			log.Printf("chat=%d: post answer failed: %v", m.Chat.ID, err)
-			return
-		}
-		resp.Body.Close()
-		log.Printf("chat=%d: all %d text answers submitted to serve (askID=%s)", m.Chat.ID, len(pc.allQuestions), pc.askID)
+		a.removeKeyboard(m.Chat.ID, prevMsgID)
+		a.submitClarifyAnswers(pc, m.Chat.ID)
 		return
 	}
+	s.mu.Unlock()
 
 	// Slash commands.
 	switch {
 	case text == "/start" || text == "/help":
-		modeLabel := "纯对话（工具关闭）"
-		if a.cfg.Mode == ModeTool {
-			modeLabel = "全能编程（工具可用）"
-		}
 		a.reply(m.Chat.ID, strings.Join([]string{
 			"🤖 Reasonix Telegram",
 			"",
-			fmt.Sprintf("模式：%s", modeLabel),
+			fmt.Sprintf("模式：%s", a.modeLabel()),
 			"",
 			"指令：",
 			"• `/stop` — 中止当前回复",
 			"• `/status` — 是否在生成中",
-			"• `/new`、`/clear` — 新对话",
+			"• `/new` — 新对话",
 			"• `/restart` — 重启桥接",
 			"• `/health` — 所有服务状态",
 			"• `/sessions` — 活跃会话",
-			"• `/mode chat|tool` — 切换模式",
-			"• 直接发消息 — 开始对话",
+			"• `/chat` — 聊天模式",
+			"• `/code` — 编程模式",
+			"• `/model` — 切换模型",
+			"• `/effort` — 推理深度 (auto/low/medium/high/max)",
+			"• 发送 /start 查看本菜单",
 			"",
 			fmt.Sprintf("单条最多 %d 字，超长自动连发；缓冲约 %d 字节，超时 %d 分钟",
 				telegramMaxMessageRunes, a.cfg.MaxOutputBytes, a.cfg.MaxDuration),
@@ -413,19 +521,50 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 		s := a.getOrCreateSession(m.Chat.ID)
 		s.mu.Lock()
 		busy := s.task != nil
+		u := s.lastUsage
+		model := s.model
 		s.mu.Unlock()
+		if model == "" {
+			model = a.cfg.Model
+		}
+		modelName, _ := modelByID(model)
+		if modelName == "" {
+			modelName = model
+		}
 		stateCN := "空闲"
 		if busy {
 			stateCN = "生成中"
 		}
-		modeLabel := "纯对话（工具关闭）"
-		if a.cfg.Mode == ModeTool {
-			modeLabel = "全能编程（工具可用）"
+		lines := []string{
+			fmt.Sprintf("状态：%s", stateCN),
+			fmt.Sprintf("模式：%s", a.modeLabel()),
+			fmt.Sprintf("模型：%s", modelName),
 		}
-		a.reply(m.Chat.ID, fmt.Sprintf("状态：%s\n模式：%s", stateCN, modeLabel))
+		// Last start info.
+		if si := loadStartInfo(a.cfg.StateDir); si != nil {
+			lines = append(lines, fmt.Sprintf("启动：%s", si.Time))
+			lines = append(lines, fmt.Sprintf("原因：%s (PID %d)", si.Reason, si.PID))
+		}
+		// Usage stats (only if we have data from the last turn).
+		if u.TotalTokens > 0 {
+			hitRate := 0.0
+			total := u.CacheHitTokens + u.CacheMissTokens
+			if total > 0 {
+				hitRate = float64(u.CacheHitTokens) / float64(total) * 100
+			}
+			lines = append(lines, "")
+			lines = append(lines, fmt.Sprintf("输入 %d / 输出 %d / 共 %d tokens", u.PromptTokens, u.CompletionTokens, u.TotalTokens))
+			if total > 0 {
+				lines = append(lines, fmt.Sprintf("缓存命中：%d / %d（%.2f%%）", u.CacheHitTokens, total, hitRate))
+			}
+			if u.Cost > 0 {
+				lines = append(lines, fmt.Sprintf("本轮花费：%.4f %s", u.Cost, u.Currency))
+			}
+		}
+		a.reply(m.Chat.ID, strings.Join(lines, "\n"))
 		return
 
-	case text == "/new" || text == "/clear":
+	case text == "/new":
 		a.resetReasonixSession(m.Chat.ID)
 		a.reply(m.Chat.ID, "🆕 新对话已开启，直接发消息即可。")
 		return
@@ -442,9 +581,27 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 		a.sessionsHandler(m)
 		return
 
-	case strings.HasPrefix(text, "/mode"):
-		a.modeHandler(m, strings.TrimSpace(strings.TrimPrefix(text, "/mode")))
+	case text == "/chat":
+		a.modeHandler(m, "chat")
 		return
+
+	case text == "/code":
+		a.modeHandler(m, "code")
+		return
+
+	case strings.HasPrefix(text, "/model"):
+		a.modelHandler(m, strings.TrimSpace(strings.TrimPrefix(text, "/model")))
+		return
+
+	case strings.HasPrefix(text, "/effort"):
+		a.effortHandler(m, strings.TrimSpace(strings.TrimPrefix(text, "/effort")))
+		return
+
+	default:
+		if strings.HasPrefix(text, "/") {
+			a.reply(m.Chat.ID, fmt.Sprintf("未知指令：%s\n发送 /help 查看可用指令", text))
+			return
+		}
 	}
 
 	// If this is a reply, include the original message as context.
@@ -572,6 +729,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 	defer func() {
 		s.mu.Lock()
 		s.task = nil
+		s.wakePusher = nil
 		s.mu.Unlock()
 		cancel()
 	}()
@@ -611,8 +769,10 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		draftMu.Lock()
 		defer draftMu.Unlock()
 		if streamDone {
+			log.Printf("chat=%d: endStream called but streamDone already true", chatID)
 			return
 		}
+		log.Printf("chat=%d: endStream setting streamDone=true", chatID)
 		streamDone = true
 
 		bufMu.Lock()
@@ -621,6 +781,10 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		bufMu.Unlock()
 		body = strings.TrimSpace(body)
 		if body == "" {
+			// Dismiss any open draft (sendMessageDraft native preview).
+			if useDraft {
+				a.dismissDraft(chatID, draftID)
+			}
 			return
 		}
 		if len(body) > maxFinalizeBytes {
@@ -655,12 +819,14 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		draftMu.Lock()
 		defer draftMu.Unlock()
 		if streamDone {
+			log.Printf("chat=%d: pushDraft skip (streamDone)", chatID)
 			return
 		}
 		bufMu.Lock()
 		body := strings.TrimSpace(buf.String())
 		bufMu.Unlock()
 		if body == "" {
+			log.Printf("chat=%d: pushDraft skip (empty buffer)", chatID)
 			return
 		}
 		preview := telegramPreviewTail(body, telegramMaxMessageRunes)
@@ -733,6 +899,11 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		}
 	}
 
+	// Register pusher signal on session so clarify answer handlers can kick the stream.
+	s.mu.Lock()
+	s.wakePusher = wakePush
+	s.mu.Unlock()
+
 	go func() {
 		procErr = a.runServeTurn(ctx, chatID, prompt,
 			func(chunk string) {
@@ -749,23 +920,41 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				default:
 				}
 			},
-			func(text string) {
+			func(text string) int {
 				// onCommentary: send a standalone message (tool progress, result)
 				// Not part of the stream buffer — send immediately as new message.
 				// Don't touch draftMu to avoid contention with pusher goroutine.
 				msg := tgbotapi.NewMessage(chatID, formatForTelegram(text))
 				msg.ParseMode = "HTML"
-				if _, err := a.bot.Send(msg); err != nil {
+				sent, err := a.bot.Send(msg)
+				if err != nil {
 					log.Printf("chat=%d: commentary send failed: %v", chatID, err)
+					return 0
 				}
 				replyDelivered = true
+				return sent.MessageID
 			},
 			func(askID string, questions []askQuestionData) {
 				// onAskRequest: model wants user input (ask tool).
-				// Text was buffered in consumeServeEvents — use it as question.
 				if len(questions) == 0 {
 					return
 				}
+
+				// Reset stream state: the pre-ask "message" event already
+				// triggered onComplete → flushAndEnd → endStream, which set
+				// streamDone = true. Clear it so post-answer output flows.
+				draftMu.Lock()
+				streamDone = false
+				bufMu.Lock()
+				buf.Reset()
+				truncated = false
+				bufMu.Unlock()
+				draftID = a.nextDraftID()
+				useDraft = true
+				lastDraftBody = ""
+				streamMsgID = 0
+				msgCreatedAt = time.Now()
+				draftMu.Unlock()
 
 				// Build answers map and store all questions for multi-question tracking
 				answers := make(map[string][]string, len(questions))
@@ -788,8 +977,11 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				}
 				s.mu.Unlock()
 
-				// Send question with buttons
-				qText := strings.TrimSpace(q.Text)
+				// Send question with header + question text + options with descriptions
+				qText := htmlEscape(strings.TrimSpace(q.Text))
+				if qText == "" {
+					qText = htmlEscape(strings.TrimSpace(q.ID))
+				}
 				if qText == "" {
 					qText = "请选择："
 				}
@@ -798,32 +990,51 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 					header = fmt.Sprintf("问题 1/%d\n", len(questions))
 				}
 				text := "❓ " + header + qText
-				if len(q.Options) > 0 {
-					text += "\n\n" + a.formatChoices(q.Options)
-				}
 				msg := tgbotapi.NewMessage(chatID, text)
 				msg.ParseMode = "HTML"
 				if len(q.Options) > 0 {
 					var rows [][]tgbotapi.InlineKeyboardButton
 					for i, choice := range q.Options {
-						data := fmt.Sprintf("cl:%s:%d", cid, i)
+						data := fmt.Sprintf("%s%s:%d", prefixClarify, cid, i)
+						btnText := truncateForButton(fmt.Sprintf("%d. %s", i+1, choice))
 						rows = append(rows, []tgbotapi.InlineKeyboardButton{
-							{Text: fmt.Sprintf("%d. %s", i+1, choice), CallbackData: &data},
+							{Text: btnText, CallbackData: &data},
 						})
 					}
-					otherData := fmt.Sprintf("cl:%s:other", cid)
+					otherData := fmt.Sprintf("%s%s:%s", prefixClarify, cid, actionOther)
 					rows = append(rows, []tgbotapi.InlineKeyboardButton{
 						{Text: "✏️ 其他（输入答案）", CallbackData: &otherData},
 					})
 					msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
 				}
-				_, _ = a.bot.Send(msg)
+				// Send message and store ID for keyboard removal
+				if sent, err := a.bot.Send(msg); err != nil {
+					log.Printf("send failed: %v", err)
+				} else {
+					s.mu.Lock()
+					s.pendingClarify.messageID = sent.MessageID
+					s.mu.Unlock()
+				}
 				replyDelivered = true
 			},
 			func(approvalID, toolName string) {
 				// onApprovalRequest: model needs user approval (plan or tool).
 				// Finalize current stream content first.
 				signalFlush()
+				// Reset stream state: signalFlush triggered endStream which
+				// set streamDone = true. Clear it so post-approval output flows.
+				draftMu.Lock()
+				streamDone = false
+				bufMu.Lock()
+				buf.Reset()
+				truncated = false
+				bufMu.Unlock()
+				draftID = a.nextDraftID()
+				useDraft = true
+				lastDraftBody = ""
+				streamMsgID = 0
+				msgCreatedAt = time.Now()
+				draftMu.Unlock()
 				replyDelivered = true
 
 				// Show approval prompt with inline buttons
@@ -840,7 +1051,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 
 				// Set pendingApproval for callback
 				s.mu.Lock()
-				apID := fmt.Sprintf("ap:%s", approvalID)
+				apID := fmt.Sprintf("%s%s", prefixApproval, approvalID)
 				s.pendingApproval = &approvalState{
 					approvalID: approvalID,
 					toolName:   toolName,
@@ -848,10 +1059,10 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				}
 				s.mu.Unlock()
 
-				text := fmt.Sprintf("%s 需要批准：%s", emoji, label)
-				onceData := fmt.Sprintf("%s:once", apID)
-				sessionData := fmt.Sprintf("%s:session", apID)
-				denyData := fmt.Sprintf("%s:deny", apID)
+				text := fmt.Sprintf("%s 需要批准：%s", emoji, htmlEscape(label))
+				onceData := fmt.Sprintf("%s:%s", apID, actionOnce)
+				sessionData := fmt.Sprintf("%s:%s", apID, actionSession)
+				denyData := fmt.Sprintf("%s:%s", apID, actionDeny)
 				msg := tgbotapi.NewMessage(chatID, text)
 				msg.ParseMode = "HTML"
 				msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
@@ -863,7 +1074,13 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 						{Text: "❌ 拒绝", CallbackData: &denyData},
 					},
 				)
-				_, _ = a.bot.Send(msg)
+				a.sendSafe(msg)
+			},
+			func(u wireUsage) {
+				// onUsage: store latest usage data for /status display.
+				s.mu.Lock()
+				s.lastUsage = u
+				s.mu.Unlock()
 			},
 		)
 		close(finished)
@@ -918,15 +1135,20 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		for {
 			select {
 			case <-pushWake:
+				log.Printf("chat=%d: pusher: pushWake", chatID)
 				stopDebounce()
 				debounce.Reset(streamDebounce)
 			case <-debounce.C:
+				log.Printf("chat=%d: pusher: debounce fire", chatID)
 				pushDraft()
 			case <-newSegment:
+				log.Printf("chat=%d: pusher: newSegment", chatID)
 				newSegmentHandler()
 			case <-flushNow:
+				log.Printf("chat=%d: pusher: flushNow", chatID)
 				flushAndEnd()
 			case <-finished:
+				log.Printf("chat=%d: pusher: finished", chatID)
 				flushAndEnd()
 				return
 			}
@@ -974,17 +1196,14 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		empty = true
 	}
 
-	if empty && streamMsgID == 0 && useDraft {
-		// sendMessage dismisses the native draft preview; never clearDraft(empty) here.
-		if !replyDelivered {
-			a.reply(chatID, "（模型没有返回文字）")
-		}
+	if empty && !replyDelivered {
+		a.reply(chatID, "（模型没有返回文字）")
 	}
 	bufMu.Lock()
 	finalBody := strings.TrimSpace(buf.String())
 	bufMu.Unlock()
-	log.Printf("chat=%d prompt=%q stream=draft draftID=%d finalLen=%d runes=%d parts-cap=%d msgID=%d",
-		chatID, logPreview(prompt, 80), draftID, len(finalBody), utf8.RuneCountInString(finalBody), telegramMaxMessageRunes, streamMsgID)
+	log.Printf("chat=%d prompt=%q stream=draft draftID=%d finalLen=%d runes=%d body=%q",
+		chatID, logPreview(prompt, 80), draftID, len(finalBody), utf8.RuneCountInString(finalBody), logPreview(finalBody, 200))
 }
 
 // nextDraftID returns a unique Telegram draft_id (int32-safe, no second-level collisions).
@@ -1026,10 +1245,19 @@ func (a *App) sendDraft(chatID int64, draftID int64, text string) bool {
 	return true
 }
 
+// dismissDraft clears a native draft preview by sending an empty sendMessageDraft.
+func (a *App) dismissDraft(chatID int64, draftID int64) {
+	_, _ = a.bot.MakeRequest("sendMessageDraft", tgbotapi.Params{
+		"chat_id":  strconv.FormatInt(chatID, 10),
+		"draft_id": strconv.FormatInt(draftID, 10),
+		"text":     "",
+	})
+}
+
 func (a *App) healthHandler(m *tgbotapi.Message) {
 	a.sessMu.Lock()
 	defer a.sessMu.Unlock()
-	lines := []string{fmt.Sprintf("模式: %s", a.cfg.Mode)}
+	lines := []string{fmt.Sprintf("模式: %s", a.modeLabel())}
 	if len(a.sess) == 0 {
 		lines = append(lines, "暂无活跃会话")
 	} else {
@@ -1065,29 +1293,265 @@ func (a *App) modeHandler(m *tgbotapi.Message, arg string) {
 	switch arg {
 	case "chat", "":
 		newMode = ModeChat
-	case "tool":
+	case "code", "tool":
 		newMode = ModeTool
 	default:
-		a.reply(m.Chat.ID, "可用模式：`chat`（纯对话，工具关闭）或 `tool`（全能编程）\n用法：/mode chat 或 /mode tool")
+		a.reply(m.Chat.ID, "用法：/chat 或 /code")
 		return
 	}
-	if a.cfg.Mode == newMode {
-		a.reply(m.Chat.ID, fmt.Sprintf("当前已经是 %s 模式", newMode))
+	if a.getMode() == newMode {
+		a.reply(m.Chat.ID, fmt.Sprintf("当前已经是%s", modeLabelFor(newMode)))
 		return
 	}
 	// Stop existing serve, switch mode, rewrite toml, restart.
 	a.stopServe(m.Chat.ID)
-	a.cfg.Mode = newMode
+	a.setMode(newMode)
 	_ = a.ensureChatWorkdir()
 	if err := a.startServe(m.Chat.ID); err != nil {
 		a.reply(m.Chat.ID, fmt.Sprintf("切换模式失败: %v", err))
 		return
 	}
-	modeLabel := "纯对话（工具关闭）"
-	if newMode == ModeTool {
-		modeLabel = "全能编程（工具可用）"
+	a.reply(m.Chat.ID, fmt.Sprintf("已切换到%s", modeLabelFor(newMode)))
+}
+
+func (a *App) modelHandler(m *tgbotapi.Message, arg string) {
+	a.restartMu.Lock()
+	if a.restarting {
+		a.restartMu.Unlock()
+		a.reply(m.Chat.ID, "🔄 服务重启中，稍后再试。")
+		return
 	}
-	a.reply(m.Chat.ID, fmt.Sprintf("已切换到 %s 模式\n%s", newMode, modeLabel))
+	a.restartMu.Unlock()
+
+	arg = strings.ToLower(strings.TrimSpace(arg))
+	if arg == "" {
+		a.sendModelPicker(m.Chat.ID, 0)
+		return
+	}
+
+	name, ok := modelByID(arg)
+	if !ok {
+		ids := make([]string, len(availableModels))
+		for i, m := range availableModels {
+			ids[i] = m.ID
+		}
+		a.reply(m.Chat.ID, fmt.Sprintf("未知模型：%s\n可用：%s", arg, strings.Join(ids, ", ")))
+		return
+	}
+
+	s := a.getOrCreateSession(m.Chat.ID)
+	s.mu.Lock()
+	current := s.model
+	if current == "" {
+		current = a.cfg.Model
+	}
+	s.mu.Unlock()
+
+	if arg == current {
+		a.reply(m.Chat.ID, fmt.Sprintf("当前已经是 %s", name))
+		return
+	}
+
+	a.switchModel(m.Chat.ID, arg, name)
+}
+
+const modelsPerPage = 4
+
+func (a *App) sendModelPicker(chatID int64, page int) {
+	total := len(availableModels)
+	totalPages := (total + modelsPerPage - 1) / modelsPerPage
+	if page < 0 {
+		page = 0
+	}
+	if page >= totalPages {
+		page = totalPages - 1
+	}
+
+	start := page * modelsPerPage
+	end := start + modelsPerPage
+	if end > total {
+		end = total
+	}
+
+	s := a.getOrCreateSession(chatID)
+	s.mu.Lock()
+	current := s.model
+	if current == "" {
+		current = a.cfg.Model
+	}
+	s.mu.Unlock()
+
+	var rows [][]tgbotapi.InlineKeyboardButton
+	for i := start; i < end; i++ {
+		m := availableModels[i]
+		label := m.Name
+		if m.ID == current {
+			label = "✅ " + label
+		}
+		data := fmt.Sprintf("%s%s", prefixModel, m.ID)
+		rows = append(rows, []tgbotapi.InlineKeyboardButton{
+			{Text: label, CallbackData: &data},
+		})
+	}
+
+	// Pagination row
+	if totalPages > 1 {
+		var nav []tgbotapi.InlineKeyboardButton
+		if page > 0 {
+			pdata := fmt.Sprintf("%s%s:%d", prefixModel, actionPage, page-1)
+			nav = append(nav, tgbotapi.InlineKeyboardButton{Text: "◀️ 上一页", CallbackData: &pdata})
+		}
+		nav = append(nav, tgbotapi.InlineKeyboardButton{Text: fmt.Sprintf("%d/%d", page+1, totalPages), CallbackData: strPtr("_")})
+		if page < totalPages-1 {
+			pdata := fmt.Sprintf("%s%s:%d", prefixModel, actionPage, page+1)
+			nav = append(nav, tgbotapi.InlineKeyboardButton{Text: "下一页 ▶️", CallbackData: &pdata})
+		}
+		rows = append(rows, nav)
+	}
+
+	text := fmt.Sprintf("🤖 选择模型（当前：%s）", a.modelDisplayName(current))
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.ParseMode = "HTML"
+	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
+	a.sendSafe(msg)
+}
+
+func strPtr(s string) *string { return &s }
+
+func (a *App) modelDisplayName(id string) string {
+	if name, ok := modelByID(id); ok {
+		return name
+	}
+	return id
+}
+
+func (a *App) switchModel(chatID int64, modelID, modelName string) {
+	s := a.getOrCreateSession(chatID)
+	a.stopServe(chatID)
+	s.mu.Lock()
+	s.model = modelID
+	s.mu.Unlock()
+	// Persist to .env file.
+	if err := a.persistModel(modelID); err != nil {
+		log.Printf("chat=%d: persist model failed: %v", chatID, err)
+	}
+	if err := a.startServe(chatID); err != nil {
+		a.reply(chatID, fmt.Sprintf("切换模型失败: %v", err))
+		return
+	}
+	a.reply(chatID, fmt.Sprintf("已切换到 %s", modelName))
+}
+
+var effortLevels = []struct {
+	ID   string
+	Name string
+}{
+	{"auto", "自动 (默认)"},
+	{"low", "低"},
+	{"medium", "中"},
+	{"high", "高"},
+	{"max", "最高"},
+}
+
+func (a *App) effortHandler(m *tgbotapi.Message, arg string) {
+	a.restartMu.Lock()
+	if a.restarting {
+		a.restartMu.Unlock()
+		a.reply(m.Chat.ID, "🔄 服务重启中，稍后再试。")
+		return
+	}
+	a.restartMu.Unlock()
+
+	arg = strings.ToLower(strings.TrimSpace(arg))
+	if arg == "" {
+		// Ensure serve is running so we have a port.
+		s := a.getOrCreateSession(m.Chat.ID)
+		s.mu.Lock()
+		port := s.servePort
+		s.mu.Unlock()
+		if port == 0 {
+			if err := a.startServe(m.Chat.ID); err != nil {
+				a.reply(m.Chat.ID, fmt.Sprintf("启动 serve 失败: %v", err))
+				return
+			}
+		}
+		a.sendEffortPicker(m.Chat.ID, 0)
+		return
+	}
+
+	// Validate level.
+	valid := false
+	for _, l := range effortLevels {
+		if l.ID == arg {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		a.reply(m.Chat.ID, "用法：/effort auto|low|medium|high|max")
+		return
+	}
+
+	// Submit to reasonix serve.
+	s := a.getOrCreateSession(m.Chat.ID)
+	s.mu.Lock()
+	port := s.servePort
+	s.mu.Unlock()
+	if port == 0 {
+		a.reply(m.Chat.ID, "serve 未运行")
+		return
+	}
+	if err := postJSON(port, "/submit", map[string]string{"input": "/effort " + arg}); err != nil {
+		a.reply(m.Chat.ID, fmt.Sprintf("切换 effort 失败: %v", err))
+		return
+	}
+	a.reply(m.Chat.ID, fmt.Sprintf("推理深度已切换到 %s", arg))
+}
+
+func (a *App) sendEffortPicker(chatID int64, _ int) {
+	s := a.getOrCreateSession(chatID)
+	s.mu.Lock()
+	port := s.servePort
+	s.mu.Unlock()
+
+	var rows [][]tgbotapi.InlineKeyboardButton
+	for _, l := range effortLevels {
+		data := fmt.Sprintf("%s%s", prefixEffort, l.ID)
+		rows = append(rows, []tgbotapi.InlineKeyboardButton{
+			{Text: l.Name, CallbackData: &data},
+		})
+	}
+	msg := tgbotapi.NewMessage(chatID, "🤔 选择推理深度")
+	msg.ParseMode = "HTML"
+	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
+	a.sendSafe(msg)
+	_ = port // keep port reference for future use
+}
+
+// persistModel writes the model ID to the .env file so it survives restarts.
+func (a *App) persistModel(modelID string) error {
+	envPath := filepath.Join(filepath.Dir(a.cfg.ReasonixBin), ".env")
+	// Try project dir first, then state dir.
+	if _, err := os.Stat(envPath); err != nil {
+		envPath = "/root/reasonix-telegram/.env"
+	}
+	data, err := os.ReadFile(envPath)
+	if err != nil {
+		return err
+	}
+	lines := strings.Split(string(data), "\n")
+	found := false
+	for i, line := range lines {
+		if strings.HasPrefix(line, "MODEL=") || strings.HasPrefix(line, "MODEL =") {
+			lines[i] = "MODEL=" + modelID
+			found = true
+			break
+		}
+	}
+	if !found {
+		lines = append(lines, "MODEL="+modelID)
+	}
+	return os.WriteFile(envPath, []byte(strings.Join(lines, "\n")), 0o644)
 }
 
 func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
@@ -1096,9 +1560,10 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 	}
 	chatID := cq.Message.Chat.ID
 	data := strings.TrimSpace(cq.Data)
+	log.Printf("chat=%d: callback data=%q", chatID, data)
 
 	// --- Approval callbacks: ap:{approvalID}:{action} ---
-	if strings.HasPrefix(data, "ap:") {
+	if strings.HasPrefix(data, prefixApproval) {
 		parts := strings.SplitN(data, ":", 3)
 		if len(parts) < 3 {
 			return
@@ -1116,15 +1581,16 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 		s.pendingApproval = nil
 		s.mu.Unlock()
 
-		_, _ = a.bot.Request(tgbotapi.NewCallback(cq.ID, ""))
+		a.answerCallback(cq.ID, "")
+		a.removeKeyboard(chatID, cq.Message.MessageID)
 
 		var allow bool
 		var session bool
 		switch action {
-		case "once":
+		case actionOnce:
 			allow = true
 			session = false
-		case "session":
+		case actionSession:
 			allow = true
 			session = true
 		default: // deny
@@ -1139,8 +1605,70 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 		return
 	}
 
+	// --- Model callbacks: md:{modelID} or md:page:{page} ---
+	if strings.HasPrefix(data, prefixModel) {
+		a.answerCallback(cq.ID, "")
+		payload := strings.TrimPrefix(data, prefixModel)
+		if payload == "_" {
+			return // no-op (page indicator)
+		}
+		if strings.HasPrefix(payload, actionPage+":") {
+			// Pagination
+			pageStr := strings.TrimPrefix(payload, actionPage+":")
+			page, _ := strconv.Atoi(pageStr)
+			a.sendModelPicker(chatID, page)
+			return
+		}
+		// Model selection
+		modelID := payload
+		name, ok := modelByID(modelID)
+		if !ok {
+			return
+		}
+		s := a.getOrCreateSession(chatID)
+		s.mu.Lock()
+		current := s.model
+		if current == "" {
+			current = a.cfg.Model
+		}
+		s.mu.Unlock()
+		if modelID == current {
+			a.reply(chatID, fmt.Sprintf("当前已经是 %s", name))
+			return
+		}
+		a.removeKeyboard(chatID, cq.Message.MessageID)
+		a.switchModel(chatID, modelID, name)
+		return
+	}
+
+	// --- Effort callbacks: ef:{level} ---
+	if strings.HasPrefix(data, prefixEffort) {
+		a.answerCallback(cq.ID, "")
+		level := strings.TrimPrefix(data, prefixEffort)
+		if level == "" {
+			return
+		}
+
+		// Get serve port from session.
+		s := a.getOrCreateSession(chatID)
+		s.mu.Lock()
+		port := s.servePort
+		s.mu.Unlock()
+		if port == 0 {
+			a.reply(chatID, "serve 未运行")
+			return
+		}
+		if err := postJSON(port, "/submit", map[string]string{"input": "/effort " + level}); err != nil {
+			a.reply(chatID, fmt.Sprintf("切换 effort 失败: %v", err))
+			return
+		}
+		a.removeKeyboard(chatID, cq.Message.MessageID)
+		a.reply(chatID, fmt.Sprintf("推理深度已切换到 %s", level))
+		return
+	}
+
 	// --- Clarify callbacks: cl:{clarifyID}:{choice} ---
-	if !strings.HasPrefix(data, "cl:") {
+	if !strings.HasPrefix(data, prefixClarify) {
 		return
 	}
 	parts := strings.SplitN(data, ":", 3)
@@ -1157,23 +1685,24 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 		s.mu.Unlock()
 		return
 	}
-	// Don't clear pendingClarify yet — we may have more questions
-	s.mu.Unlock()
 
-	_, _ = a.bot.Request(tgbotapi.NewCallback(cq.ID, ""))
-
-	var answer string
-	if choiceIdx == "other" {
-		s.mu.Lock()
-		// Don't clear, just flag that we need text input
+	if choiceIdx == actionOther {
+		log.Printf("chat=%d: clarify 'other' clicked, pendingClarify=%v", chatID, pc != nil)
+		pc.awaitingCustom = true
+		msgID := pc.messageID
 		s.mu.Unlock()
+		a.answerCallback(cq.ID, "")
+		a.removeKeyboard(chatID, msgID)
 		msg := tgbotapi.NewMessage(chatID, "📝 请输入你的回答：")
 		msg.ParseMode = "HTML"
 		msg.ReplyToMessageID = cq.Message.MessageID
-		_, _ = a.bot.Send(msg)
-		_, _ = a.bot.Request(tgbotapi.NewCallbackWithAlert(cq.ID, "请输入你的回答"))
+		a.sendSafe(msg)
 		return
 	}
+
+	// Resolve button choice to answer text.
+	pc.awaitingCustom = false
+	var answer string
 	if idx, err := strconv.Atoi(choiceIdx); err == nil && idx >= 0 && idx < len(pc.choices) {
 		answer = pc.choices[idx]
 	}
@@ -1181,85 +1710,69 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 		answer = choiceIdx
 	}
 
-	// Store this answer
+	// Store answer and advance (all under lock to avoid concurrent-map write).
 	pc.answers[pc.questionID] = []string{answer}
-
-	// Check if there are more questions
 	nextIdx := pc.qIndex + 1
 	if nextIdx < len(pc.allQuestions) {
-		// Show the next question
 		nextQ := pc.allQuestions[nextIdx]
-		s.mu.Lock()
 		pc.qIndex = nextIdx
 		pc.questionID = nextQ.ID
 		pc.choices = nextQ.Options
-		// Generate new clarifyID for the next question
 		cidNum := atomic.AddUint64(&a.clarifySeq, 1)
 		pc.clarifyID = strconv.FormatUint(cidNum, 36)
-		s.mu.Unlock()
-
-		qText := strings.TrimSpace(nextQ.Text)
+		// Snapshot data for message building.
+		qText := htmlEscape(strings.TrimSpace(nextQ.Text))
+		if qText == "" {
+			qText = htmlEscape(strings.TrimSpace(nextQ.ID))
+		}
 		if qText == "" {
 			qText = "请选择："
 		}
+		options := nextQ.Options
+		clarifyID := pc.clarifyID
+		prevMsgID := pc.messageID
+		s.mu.Unlock()
+
+		a.removeKeyboard(chatID, prevMsgID)
+
 		header := fmt.Sprintf("问题 %d/%d\n", nextIdx+1, len(pc.allQuestions))
 		text := "❓ " + header + qText
-		if len(nextQ.Options) > 0 {
-			text += "\n\n" + a.formatChoices(nextQ.Options)
-		}
 		msg := tgbotapi.NewMessage(chatID, text)
 		msg.ParseMode = "HTML"
-		if len(nextQ.Options) > 0 {
+		if len(options) > 0 {
 			var rows [][]tgbotapi.InlineKeyboardButton
-			for i, choice := range nextQ.Options {
-				data := fmt.Sprintf("cl:%s:%d", pc.clarifyID, i)
+			for i, choice := range options {
+				data := fmt.Sprintf("%s%s:%d", prefixClarify, clarifyID, i)
+				btnText := truncateForButton(fmt.Sprintf("%d. %s", i+1, choice))
 				rows = append(rows, []tgbotapi.InlineKeyboardButton{
-					{Text: fmt.Sprintf("%d. %s", i+1, choice), CallbackData: &data},
+					{Text: btnText, CallbackData: &data},
 				})
 			}
-			otherData := fmt.Sprintf("cl:%s:other", pc.clarifyID)
+			otherData := fmt.Sprintf("%s%s:%s", prefixClarify, clarifyID, actionOther)
 			rows = append(rows, []tgbotapi.InlineKeyboardButton{
 				{Text: "✏️ 其他（输入答案）", CallbackData: &otherData},
 			})
 			msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
 		}
-		_, _ = a.bot.Send(msg)
+		if sent, err := a.bot.Send(msg); err != nil {
+			log.Printf("send failed: %v", err)
+		} else {
+			s.mu.Lock()
+			s.pendingClarify.messageID = sent.MessageID
+			s.mu.Unlock()
+		}
+		a.answerCallback(cq.ID, "")
 		return
 	}
 
-	// All questions answered — submit via POST /answer
-	s.mu.Lock()
+	// All questions answered — submit.
+	prevMsgID := pc.messageID
 	s.pendingClarify = nil
 	s.mu.Unlock()
+	a.removeKeyboard(chatID, prevMsgID)
 
-	// Build answers array preserving question order
-	type answerEntry struct {
-		QuestionID string   `json:"questionId"`
-		Selected   []string `json:"selected"`
-	}
-	var answersPayload []answerEntry
-	for _, q := range pc.allQuestions {
-		sel, ok := pc.answers[q.ID]
-		if !ok {
-			sel = []string{""}
-		}
-		answersPayload = append(answersPayload, answerEntry{
-			QuestionID: q.ID,
-			Selected:   sel,
-		})
-	}
-	body, _ := json.Marshal(map[string]any{
-		"id":      pc.askID,
-		"answers": answersPayload,
-	})
-	url := fmt.Sprintf("http://127.0.0.1:%d/answer", pc.port)
-	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
-	if err != nil {
-		log.Printf("chat=%d: post answer failed: %v", chatID, err)
-		return
-	}
-	resp.Body.Close()
-	log.Printf("chat=%d: all %d answers submitted to serve (askID=%s)", chatID, len(pc.allQuestions), pc.askID)
+	a.answerCallback(cq.ID, "")
+	a.submitClarifyAnswers(pc, chatID)
 }
 
 func (a *App) formatChoices(choices []string) string {
@@ -1268,7 +1781,7 @@ func (a *App) formatChoices(choices []string) string {
 		if i > 0 {
 			b.WriteString("\n")
 		}
-		fmt.Fprintf(&b, "%d. %s", i+1, c)
+		fmt.Fprintf(&b, "%d. %s", i+1, htmlEscape(c))
 	}
 	return b.String()
 }
@@ -1344,6 +1857,91 @@ func killDescendants(rootPid int) {
 	walk(rootPid)
 }
 
+
+// sendSafe sends a message and logs any error.
+func (a *App) sendSafe(msg tgbotapi.Chattable) {
+	if _, err := a.bot.Send(msg); err != nil {
+		log.Printf("send failed: %v", err)
+	}
+}
+
+// answerCallback answers a callback query and logs any error.
+func (a *App) answerCallback(id, text string) {
+	if _, err := a.bot.Request(tgbotapi.NewCallback(id, text)); err != nil {
+		log.Printf("callback answer failed: %v", err)
+	}
+}
+
+// removeKeyboard removes the inline keyboard from a message (call after user selects).
+func (a *App) removeKeyboard(chatID int64, messageID int) {
+	edit := tgbotapi.NewEditMessageReplyMarkup(chatID, messageID, tgbotapi.InlineKeyboardMarkup{
+		InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{},
+	})
+	if _, err := a.bot.Request(edit); err != nil {
+		log.Printf("remove keyboard failed: %v", err)
+	}
+}
+
+// editCommentary appends result text to an existing tool dispatch message.
+func (a *App) editCommentary(chatID int64, messageID int, appendText string) error {
+	edit := tgbotapi.NewEditMessageText(chatID, messageID, formatForTelegram(appendText))
+	edit.ParseMode = "HTML"
+	_, err := a.bot.Send(edit)
+	if err != nil {
+		log.Printf("chat=%d: edit commentary failed: %v", chatID, err)
+	}
+	return err
+}
+
+// appendToCommentary is a no-op on success. On error, replace the message with the error.
+func (a *App) appendToCommentary(chatID int64, messageID int, appendText string) error {
+	edit := tgbotapi.NewEditMessageText(chatID, messageID, formatForTelegram(appendText))
+	edit.ParseMode = "HTML"
+	_, err := a.bot.Send(edit)
+	if err != nil {
+		log.Printf("chat=%d: append commentary failed: %v", chatID, err)
+	}
+	return err
+}
+
+// submitClarifyAnswers POSTs accumulated clarify answers to the serve backend.
+func (a *App) submitClarifyAnswers(pc *clarifyState, chatID int64) {
+	type answerEntry struct {
+		QuestionID string   `json:"questionId"`
+		Selected   []string `json:"selected"`
+	}
+	var answersPayload []answerEntry
+	for _, q := range pc.allQuestions {
+		sel, ok := pc.answers[q.ID]
+		if !ok {
+			sel = []string{""}
+		}
+		answersPayload = append(answersPayload, answerEntry{
+			QuestionID: q.ID,
+			Selected:   sel,
+		})
+	}
+	body, _ := json.Marshal(map[string]any{
+		"id":      pc.askID,
+		"answers": answersPayload,
+	})
+	url := fmt.Sprintf("http://127.0.0.1:%d/answer", pc.port)
+	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		log.Printf("chat=%d: post answer failed: %v", chatID, err)
+		return
+	}
+	resp.Body.Close()
+	log.Printf("chat=%d: all %d answers submitted to serve (askID=%s)", chatID, len(pc.allQuestions), pc.askID)
+
+	// Kick the turn pusher: model will continue emitting events on the existing SSE stream.
+	s := a.getOrCreateSession(chatID)
+	s.mu.Lock()
+	if s.wakePusher != nil {
+		s.wakePusher()
+	}
+	s.mu.Unlock()
+}
 
 // userFacingError maps known Reasonix errors to short Chinese for Telegram users.
 func userFacingError(err error) string {
