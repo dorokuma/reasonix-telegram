@@ -363,6 +363,45 @@ func stripLatexDelimiters(s string) string {
 	return s
 }
 
+// toolEmoji returns an emoji for a Reasonix tool name.
+// Mapped from Hermes' tool registry emoji assignments.
+func toolEmoji(name string) string {
+	switch name {
+	case "bash":
+		return "💻"
+	case "python", "python3", "execute_code", "code":
+		return "🐍"
+	case "read_file", "cat":
+		return "📖"
+	case "write_file", "edit_file", "multi_edit":
+		return "✍️"
+	case "grep", "search_files", "codegraph_search":
+		return "🔎"
+	case "glob", "ls", "codegraph_files":
+		return "📁"
+	case "codegraph_callees", "codegraph_callers", "codegraph_context", "codegraph_explore", "codegraph_trace", "codegraph_impact":
+		return "🔍"
+	case "ask":
+		return "❓"
+	case "search_web", "web_search":
+		return "🌐"
+	case "curl", "wget", "web_fetch":
+		return "📄"
+	case "memory_save", "remember", "memory":
+		return "🧠"
+	case "todo", "todo_write":
+		return "📋"
+	case "gh", "git":
+		return "🔀"
+	case "docker":
+		return "🐳"
+	case "systemctl", "service":
+		return "⚙️"
+	default:
+		return "⚡"
+	}
+}
+
 // htmlEscape escapes &, <, > for safe HTML insertion.
 func htmlEscape(s string) string {
 	s = strings.ReplaceAll(s, "&", "&amp;")

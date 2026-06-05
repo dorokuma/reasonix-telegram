@@ -372,7 +372,8 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 					if onToolDispatch != nil {
 						onToolDispatch()
 					}
-					msg := fmt.Sprintf("🔧 工具: %s", ev.Tool.Name)
+					emoji := toolEmoji(ev.Tool.Name)
+					msg := fmt.Sprintf("%s %s", emoji, ev.Tool.Name)
 					if ev.Tool.Args != "" {
 						// Trim long args for display
 						args := trimUTF8Bytes(ev.Tool.Args, 200)
@@ -386,11 +387,14 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 		case "tool_result":
 			if a.cfg.Mode != ModeChat {
 				if ev.Tool != nil {
+					emoji := toolEmoji(ev.Tool.Name)
 					msg := ""
 					if ev.Tool.Err != "" {
-						msg = fmt.Sprintf("❌ 工具错误: %s", trimUTF8Bytes(ev.Tool.Err, 500))
+						msg = fmt.Sprintf("%s ❌: %s", emoji, trimUTF8Bytes(ev.Tool.Err, 500))
 					} else if ev.Tool.Output != "" {
-						msg = fmt.Sprintf("📝 结果: %s", trimUTF8Bytes(ev.Tool.Output, 500))
+						// Brief result preview
+						preview := trimUTF8Bytes(strings.TrimSpace(ev.Tool.Output), 300)
+						msg = fmt.Sprintf("%s ✅: %s", emoji, preview)
 					}
 					if msg != "" && onCommentary != nil {
 						onCommentary(msg)
