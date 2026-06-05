@@ -531,6 +531,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		msgCreatedAt   time.Time // when first draft/stream msg was sent
 		draftFailCount int      // consecutive draft failures in this turn
 		editFailCount  int      // consecutive edit failures in this turn
+		skipDisplay    bool     // set by onAskRequest: discard streaming text from TG
 	)
 	const (
 		maxDraftFailures = 3
@@ -677,7 +678,9 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				bufMu.Lock()
 				appendChunk(&buf, chunk, a.cfg.MaxOutputBytes, &truncated)
 				bufMu.Unlock()
-				wakePush()
+				if !skipDisplay {
+					wakePush()
+				}
 			},
 			signalFlush,
 			func() {
@@ -700,13 +703,18 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			},
 			func(askID, questionID string, options []string) {
 				// onAskRequest: model wants user input (ask tool).
-				// Do NOT signalFlush — the buf contains raw model JSON
-				// ("❓ ask\n{\"questions\":...}") which should never reach the user.
-				// Clear the buf silently and send only the button question.
+				// Suppress any already-streamed text from TG display.
+				skipDisplay = true
 				bufMu.Lock()
 				buf.Reset()
 				truncated = false
 				bufMu.Unlock()
+				// Drain any pending push signal so the pusher goroutine
+				// doesn't send the stale draft to TG.
+				select {
+				case <-pushWake:
+				default:
+				}
 
 				// Set pendingClarify with ask info for answer submission
 				s.mu.Lock()
