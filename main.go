@@ -138,16 +138,23 @@ type clarifyState struct {
 	clarifyID  string
 }
 
+type approvalState struct {
+	approvalID string
+	toolName   string
+	port       int
+}
+
 // session: one per Telegram chat — workdir, Reasonix session file, serve process.
 type session struct {
-	mu             sync.Mutex
-	workdir        string
-	sessionPath    string
-	servePort      int
-	serveCmd       *exec.Cmd
-	task           *runningTask // non-nil while a turn is in flight
-	lastActivity   time.Time    // last message activity, for /sessions
-	pendingClarify *clarifyState // non-nil while awaiting user clarify answer
+	mu               sync.Mutex
+	workdir          string
+	sessionPath      string
+	servePort        int
+	serveCmd         *exec.Cmd
+	task             *runningTask // non-nil while a turn is in flight
+	lastActivity     time.Time    // last message activity, for /sessions
+	pendingClarify   *clarifyState  // non-nil while awaiting user clarify answer
+	pendingApproval  *approvalState // non-nil while awaiting user approval
 }
 
 type runningTask struct {
@@ -740,6 +747,51 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				_, _ = a.bot.Send(msg)
 				replyDelivered = true
 			},
+			func(approvalID, toolName string) {
+				// onApprovalRequest: model needs user approval (plan or tool).
+				// Finalize current stream content first.
+				signalFlush()
+				replyDelivered = true
+
+				// Show approval prompt with inline buttons
+				var label string
+				var emoji string
+				switch toolName {
+				case "plan":
+					label = "执行计划"
+					emoji = "📋"
+				default:
+					label = toolName
+					emoji = "🔧"
+				}
+
+				// Set pendingApproval for callback
+				s.mu.Lock()
+				apID := fmt.Sprintf("ap:%s", approvalID)
+				s.pendingApproval = &approvalState{
+					approvalID: approvalID,
+					toolName:   toolName,
+					port:       s.servePort,
+				}
+				s.mu.Unlock()
+
+				text := fmt.Sprintf("%s 需要批准：%s", emoji, label)
+				onceData := fmt.Sprintf("%s:once", apID)
+				sessionData := fmt.Sprintf("%s:session", apID)
+				denyData := fmt.Sprintf("%s:deny", apID)
+				msg := tgbotapi.NewMessage(chatID, text)
+				msg.ParseMode = "HTML"
+				msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+					[]tgbotapi.InlineKeyboardButton{
+						{Text: "✅ 批准一次", CallbackData: &onceData},
+						{Text: "🔒 始终批准", CallbackData: &sessionData},
+					},
+					[]tgbotapi.InlineKeyboardButton{
+						{Text: "❌ 拒绝", CallbackData: &denyData},
+					},
+				)
+				_, _ = a.bot.Send(msg)
+			},
 		)
 		close(finished)
 	}()
@@ -972,7 +1024,49 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 	chatID := cq.Message.Chat.ID
 	data := strings.TrimSpace(cq.Data)
 
-	// Only handle clarify callbacks: cl:{clarifyID}:{choice}
+	// --- Approval callbacks: ap:{approvalID}:{action} ---
+	if strings.HasPrefix(data, "ap:") {
+		parts := strings.SplitN(data, ":", 3)
+		if len(parts) < 3 {
+			return
+		}
+		approvalID := parts[1]
+		action := parts[2]
+
+		s := a.getOrCreateSession(chatID)
+		s.mu.Lock()
+		pa := s.pendingApproval
+		if pa == nil || pa.approvalID != approvalID {
+			s.mu.Unlock()
+			return
+		}
+		s.pendingApproval = nil
+		s.mu.Unlock()
+
+		_, _ = a.bot.Request(tgbotapi.NewCallback(cq.ID, ""))
+
+		var allow bool
+		var session bool
+		switch action {
+		case "once":
+			allow = true
+			session = false
+		case "session":
+			allow = true
+			session = true
+		default: // deny
+			allow = false
+			session = false
+		}
+
+		_ = postJSON(pa.port, "/approve", map[string]any{
+			"id": approvalID, "allow": allow, "session": session,
+		})
+		log.Printf("chat=%d: approval %s -> allow=%v session=%v", chatID, approvalID, allow, session)
+		return
+	}
+
+	// --- Clarify callbacks: cl:{clarifyID}:{choice} ---
 	if !strings.HasPrefix(data, "cl:") {
 		return
 	}

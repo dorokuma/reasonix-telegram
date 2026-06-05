@@ -295,7 +295,7 @@ func (a *App) lockServeMode(port int) {
 // runServeTurn submits a prompt to the long-lived reasonix serve process and
 // streams SSE events until turn_done. The conversation history stays in the
 // same Reasonix session file across Telegram messages and bridge restarts.
-func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string), onAskRequest func(askID string, questionID string, options []string)) error {
+func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string), onAskRequest func(askID string, questionID string, options []string), onApprovalRequest func(approvalID string, toolName string)) error {
 	s := a.getOrCreateSession(chatID)
 	s.mu.Lock()
 	port := s.servePort
@@ -305,7 +305,7 @@ func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onC
 
 	eventsDone := make(chan turnResult, 1)
 	go func() {
-		eventsDone <- a.consumeServeEvents(ctx, port, onChunk, onComplete, onToolDispatch, onCommentary, onAskRequest)
+		eventsDone <- a.consumeServeEvents(ctx, port, onChunk, onComplete, onToolDispatch, onCommentary, onAskRequest, onApprovalRequest)
 	}()
 
 	if err := postJSON(port, "/submit", map[string]string{"input": prompt}); err != nil {
@@ -326,7 +326,7 @@ func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onC
 	}
 }
 
-func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string), onAskRequest func(askID string, questionID string, options []string)) turnResult {
+func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string), onAskRequest func(askID string, questionID string, options []string), onApprovalRequest func(approvalID string, toolName string)) turnResult {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serveBaseURL(port)+"/events", nil)
 	if err != nil {
 		return turnResult{err: err}
@@ -431,16 +431,12 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 			}
 		case "approval_request":
 			if ev.Approval != nil && ev.Approval.ID != "" {
-				if a.cfg.Mode == ModeTool {
-					// auto-approve in tool mode (no interactive approval via TG)
-					_ = postJSON(port, "/approve", map[string]any{
-						"id": ev.Approval.ID, "allow": true, "session": true,
-					})
-				} else {
-					// chat mode: auto-reject
-					_ = postJSON(port, "/approve", map[string]any{
-						"id": ev.Approval.ID, "allow": false, "session": false,
-					})
+				if onApprovalRequest != nil {
+					toolName := ev.Approval.Tool
+					if toolName == "" {
+						toolName = "plan"
+					}
+					onApprovalRequest(ev.Approval.ID, toolName)
 				}
 			}
 		case "turn_done":
