@@ -161,6 +161,31 @@ func TestFormat_mixed(t *testing.T) {
 	}
 }
 
+func TestFormat_table(t *testing.T) {
+	input := "| 问题 | 核心思想 |\n|---|---|\n| 百钱百鸡 | 公鸡5文、母鸡3文 |\n| 韩信点兵 | n mod 3=2 |"
+	got := formatForTelegram(input)
+	// First column becomes bold heading, second column is bullets
+	if !stringsContains(got, "<b>百钱百鸡</b>") {
+		t.Fatalf("missing row heading in %q", got)
+	}
+	if !stringsContains(got, "核心思想: 公鸡5文") {
+		t.Fatalf("missing cell data in %q", got)
+	}
+}
+
+func TestFormat_tableInsideCodeBlock(t *testing.T) {
+	// Tables inside ``` fences must be left untouched.
+	input := "```\n| a | b |\n|---|---|\n| 1 | 2 |\n```"
+	got := formatForTelegram(input)
+	if !stringsContains(got, "<pre>") {
+		t.Fatalf("expected code block in %q", got)
+	}
+	// The pipe chars should be inside the pre block
+	if stringsContains(got, "•") {
+		t.Fatalf("table inside code block was converted: %q", got)
+	}
+}
+
 func stringsContains(s, substr string) bool {
 	return strings.Contains(s, substr)
 }

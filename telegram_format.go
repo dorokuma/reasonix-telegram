@@ -44,6 +44,153 @@ var (
 	reHr = regexp.MustCompile(`(?m)^\s*[-*_]{3,}\s*$`)
 )
 
+// reTableSep matches a GFM table delimiter row: |---|---|
+var reTableSep = regexp.MustCompile(`^\s*\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*){1,}\|?\s*$`)
+
+// wrapMarkdownTables rewrites GFM pipe tables into Telegram-friendly
+// bold-heading + bullet groups. Based on Hermes _wrap_markdown_tables.
+func wrapMarkdownTables(text string) string {
+	if !strings.Contains(text, "|") || !strings.Contains(text, "-") {
+		return text
+	}
+
+	lines := strings.Split(text, "\n")
+	var out []string
+	inFence := false
+	i := 0
+	for i < len(lines) {
+		line := lines[i]
+		stripped := strings.TrimLeft(line, " \t")
+
+		// Track fenced code blocks — never touch content inside.
+		if strings.HasPrefix(stripped, "```") {
+			inFence = !inFence
+			out = append(out, line)
+			i++
+			continue
+		}
+		if inFence {
+			out = append(out, line)
+			i++
+			continue
+		}
+
+		// Check if this line starts a table block: has '|' AND next line is a separator.
+		if !strings.Contains(line, "|") || i+1 >= len(lines) || !reTableSep.MatchString(lines[i+1]) {
+			out = append(out, line)
+			i++
+			continue
+		}
+
+		// Consume the table block: header, separator, then data rows.
+		header := line
+		sepLine := lines[i+1] // delimiter row (skipped)
+		_ = sepLine
+		var dataRows []string
+		j := i + 2
+		for j < len(lines) {
+			row := lines[j]
+			rowStripped := strings.TrimSpace(row)
+			if rowStripped == "" || !strings.Contains(row, "|") {
+				break
+			}
+			dataRows = append(dataRows, row)
+			j++
+		}
+
+		rendered := renderTableBlock(header, dataRows)
+		out = append(out, rendered)
+		i = j
+	}
+	return strings.Join(out, "\n")
+}
+
+// splitTableRow splits a GFM table row into stripped cell values.
+func splitTableRow(line string) []string {
+	s := strings.TrimSpace(line)
+	if strings.HasPrefix(s, "|") {
+		s = s[1:]
+	}
+	if strings.HasSuffix(s, "|") {
+		s = s[:len(s)-1]
+	}
+	var cells []string
+	for _, cell := range strings.Split(s, "|") {
+		cells = append(cells, strings.TrimSpace(cell))
+	}
+	return cells
+}
+
+// renderTableBlock converts a table header + data rows to bold + bullet format.
+func renderTableBlock(headerLine string, dataRows []string) string {
+	headers := splitTableRow(headerLine)
+	if len(headers) < 2 || len(dataRows) == 0 {
+		return headerLine + "\n" + strings.Join(dataRows, "\n")
+	}
+
+	// Detect row-label column: present when data rows have one more cell.
+	firstCells := splitTableRow(dataRows[0])
+	hasRowLabel := len(firstCells) == len(headers)+1
+
+	var groups []string
+	for _, row := range dataRows {
+		cells := splitTableRow(row)
+		var heading string
+		var dataCells []string
+
+		if hasRowLabel {
+			heading = cells[0]
+			if heading == "" {
+				heading = "Row"
+			}
+			if len(cells) > 1 {
+				dataCells = cells[1:]
+			}
+		} else {
+			heading = ""
+			for _, c := range cells {
+				if c != "" {
+					heading = c
+					break
+				}
+			}
+			if heading == "" {
+				heading = "Row"
+			}
+			dataCells = cells
+		}
+
+		// Pad or trim to match headers length.
+		for len(dataCells) < len(headers) {
+			dataCells = append(dataCells, "")
+		}
+		if len(dataCells) > len(headers) {
+			dataCells = dataCells[:len(headers)]
+		}
+
+		// Build bullets. Skip any bullet whose value duplicates the heading.
+		var bullets []string
+		for idx, val := range dataCells {
+			if !hasRowLabel && val == heading {
+				continue
+			}
+			header := ""
+			if idx < len(headers) {
+				header = headers[idx]
+			}
+			bullets = append(bullets, "• "+header+": "+val)
+		}
+
+		group := "**" + heading + "**"
+		for _, b := range bullets {
+			group += "\n" + b
+		}
+		groups = append(groups, group)
+	}
+
+	return strings.Join(groups, "\n\n")
+}
+
 // formatForTelegram converts standard markdown to Telegram-compatible HTML.
 // Safe to call with any model output; non-markdown text is HTML-escaped.
 func formatForTelegram(content string) string {
@@ -62,8 +209,13 @@ func formatForTelegram(content string) string {
 
 	text := content
 
-	// 0) Horizontal rules → full-width separator
+	// 0a) Horizontal rules → full-width separator
 	text = reHr.ReplaceAllString(text, "\n━━━━━━━━━━━━━━\n")
+
+	// 0b) Convert GFM pipe tables to Telegram-friendly row groups.
+	// Must run before code block protection so **bold** in headers gets
+	// converted later. Table blocks outside fenced code blocks only.
+	text = wrapMarkdownTables(text)
 
 	// 1) Protect fenced code blocks
 	text = reFenced.ReplaceAllStringFunc(text, func(match string) string {
