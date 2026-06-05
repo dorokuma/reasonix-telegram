@@ -29,7 +29,8 @@ var (
 	// Bold: **text** or __text__
 	reBold = regexp.MustCompile(`\*\*(.+?)\*\*`)
 	// Italic: *text* (single asterisk, not across newlines)
-	reItalic = regexp.MustCompile(`\*([^*\n]+)\*`)
+	// Also handles *text** (model sometimes outputs two closing asterisks)
+	reItalic = regexp.MustCompile(`\*([^*\n]+)\*(\*)?`)
 	// Strikethrough: ~~text~~
 	reStrike = regexp.MustCompile(`~~(.+?)~~`)
 	// Spoiler: ||text||

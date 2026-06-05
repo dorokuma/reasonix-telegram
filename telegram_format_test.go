@@ -218,3 +218,23 @@ func TestFormat_latexInsideCodeBlock(t *testing.T) {
 func stringsContains(s, substr string) bool {
 	return strings.Contains(s, substr)
 }
+
+func TestFormat_asteriskEdgeCases(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+	}{
+		{"bold_double", "**解法A（经典）**"},
+		{"italic_one_two", "*解法A（经典）**"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := formatForTelegram(tt.input)
+			t.Logf("input: %q", tt.input)
+			t.Logf("output: %q", got)
+			if stringsContains(got, "**") || stringsContains(got, "*") || stringsContains(got, "&ast;") || stringsContains(got, "&#42;") {
+				t.Fatalf("asterisks leaked in output: %q", got)
+			}
+		})
+	}
+}
