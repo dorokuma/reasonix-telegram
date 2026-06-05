@@ -636,6 +636,17 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				default:
 				}
 			},
+			func(text string) {
+				// onCommentary: send a standalone message (tool progress, result)
+				// Not part of the stream buffer — send immediately as new message.
+				// Don't touch draftMu to avoid contention with pusher goroutine.
+				msg := tgbotapi.NewMessage(chatID, formatForTelegram(text))
+				msg.ParseMode = "HTML"
+				if _, err := a.bot.Send(msg); err != nil {
+					log.Printf("chat=%d: commentary send failed: %v", chatID, err)
+				}
+				replyDelivered = true
+			},
 		)
 		close(finished)
 	}()

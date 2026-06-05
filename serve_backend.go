@@ -279,7 +279,7 @@ func (a *App) lockServeMode(port int) {
 // runServeTurn submits a prompt to the long-lived reasonix serve process and
 // streams SSE events until turn_done. The conversation history stays in the
 // same Reasonix session file across Telegram messages and bridge restarts.
-func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onChunk func(string), onComplete func(), onToolDispatch func()) error {
+func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string)) error {
 	s := a.getOrCreateSession(chatID)
 	s.mu.Lock()
 	port := s.servePort
@@ -289,7 +289,7 @@ func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onC
 
 	eventsDone := make(chan turnResult, 1)
 	go func() {
-		eventsDone <- a.consumeServeEvents(ctx, port, onChunk, onComplete, onToolDispatch)
+		eventsDone <- a.consumeServeEvents(ctx, port, onChunk, onComplete, onToolDispatch, onCommentary)
 	}()
 
 	if err := postJSON(port, "/submit", map[string]string{"input": prompt}); err != nil {
@@ -310,7 +310,7 @@ func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onC
 	}
 }
 
-func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(string), onComplete func(), onToolDispatch func()) turnResult {
+func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string)) turnResult {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serveBaseURL(port)+"/events", nil)
 	if err != nil {
 		return turnResult{err: err}
@@ -367,26 +367,33 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 					})
 				}
 			} else {
-				// tool mode: signal tool boundary, notify user
+				// tool mode: signal tool boundary, then send commentary
 				if ev.Tool != nil && !ev.Tool.Partial && ev.Tool.Name != "" {
 					if onToolDispatch != nil {
 						onToolDispatch()
 					}
-					onChunk(fmt.Sprintf("\n🔧 工具: %s", ev.Tool.Name))
+					msg := fmt.Sprintf("🔧 工具: %s", ev.Tool.Name)
+					if ev.Tool.Args != "" {
+						// Trim long args for display
+						args := trimUTF8Bytes(ev.Tool.Args, 200)
+						msg += "\n" + args
+					}
+					if onCommentary != nil {
+						onCommentary(msg)
+					}
 				}
 			}
 		case "tool_result":
 			if a.cfg.Mode != ModeChat {
-				// tool mode: show tool result to user
 				if ev.Tool != nil {
 					msg := ""
 					if ev.Tool.Err != "" {
-						msg = fmt.Sprintf("\n❌ 工具错误: %s", trimUTF8Bytes(ev.Tool.Err, 500))
+						msg = fmt.Sprintf("❌ 工具错误: %s", trimUTF8Bytes(ev.Tool.Err, 500))
 					} else if ev.Tool.Output != "" {
-						msg = fmt.Sprintf("\n📝 工具结果: %s", trimUTF8Bytes(ev.Tool.Output, 500))
+						msg = fmt.Sprintf("📝 结果: %s", trimUTF8Bytes(ev.Tool.Output, 500))
 					}
-					if msg != "" {
-						onChunk(msg)
+					if msg != "" && onCommentary != nil {
+						onCommentary(msg)
 					}
 				}
 			}
