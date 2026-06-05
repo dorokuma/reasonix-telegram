@@ -158,6 +158,7 @@ type App struct {
 	restarting     bool
 	restartStarted time.Time
 	draftSeq       uint64 // per-process draft_id sequence (avoids same-second collisions)
+	clarifySeq     uint64 // monotonic counter for clarify IDs
 }
 
 func main() {
@@ -772,15 +773,18 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		var askErr *errAskUser
 		if errors.As(procErr, &askErr) {
 			log.Printf("chat=%d: ask tool -> clarify: %s", chatID, askErr.question)
+			cid := atomic.AddUint64(&a.clarifySeq, 1)
+			cidStr := strconv.FormatUint(cid, 36) // short base-36 ID
 			s.mu.Lock()
 			s.pendingClarify = &clarifyState{
 				question:  askErr.question,
 				choices:   askErr.choices,
-				clarifyID: fmt.Sprintf("%s", askErr.question),
+				clarifyID: cidStr,
 			}
 			s.mu.Unlock()
-			// Send the question to the user
-			text := "❓ " + askErr.question
+			// Send the question to the user — HTML-escape the question text
+			// since we send with ParseMode=HTML.
+			text := "❓ " + htmlEscape(askErr.question)
 			if len(askErr.choices) > 0 {
 				text += "\n\n" + a.formatChoices(askErr.choices)
 			} else {
@@ -792,12 +796,13 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				var rows [][]tgbotapi.InlineKeyboardButton
 				for i, choice := range askErr.choices {
 					idx := i
-					data := fmt.Sprintf("cl:%s:%d", askErr.question, idx)
+					// Keep callback_data under TG's 64-byte limit: "cl:<cid36>:<idx>"
+					data := fmt.Sprintf("cl:%s:%d", cidStr, idx)
 					rows = append(rows, []tgbotapi.InlineKeyboardButton{
 						{Text: fmt.Sprintf("%d. %s", i+1, choice), CallbackData: &data},
 					})
 				}
-				otherData := fmt.Sprintf("cl:%s:other", askErr.question)
+				otherData := fmt.Sprintf("cl:%s:other", cidStr)
 				rows = append(rows, []tgbotapi.InlineKeyboardButton{
 					{Text: "✏️ 其他（输入答案）", CallbackData: &otherData},
 				})
