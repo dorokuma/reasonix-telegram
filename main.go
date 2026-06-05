@@ -814,6 +814,15 @@ func (a *App) healthHandler(m *tgbotapi.Message) {
 }
 
 func (a *App) modeHandler(m *tgbotapi.Message, arg string) {
+	// Block during restart, same as handleMessage.
+	a.restartMu.Lock()
+	if a.restarting {
+		a.restartMu.Unlock()
+		a.reply(m.Chat.ID, "🔄 服务重启中，稍后再试。")
+		return
+	}
+	a.restartMu.Unlock()
+
 	arg = strings.ToLower(strings.TrimSpace(arg))
 	var newMode string
 	switch arg {

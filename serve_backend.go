@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -322,6 +323,7 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 
 	var turnErr error
 	var gotTextDelta bool
+	var cancelOnce sync.Once
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
 	for sc.Scan() {
@@ -359,8 +361,10 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 					if ev.Tool.Partial {
 						continue
 					}
-					log.Printf("chat-only: blocked tool %s, cancelling turn", ev.Tool.Name)
-					_ = postJSON(port, "/cancel", map[string]any{})
+					cancelOnce.Do(func() {
+						log.Printf("chat-only: blocked tool %s, cancelling turn", ev.Tool.Name)
+						_ = postJSON(port, "/cancel", map[string]any{})
+					})
 				}
 			} else {
 				// tool mode: signal tool boundary, notify user
