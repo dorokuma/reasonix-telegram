@@ -692,26 +692,21 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				replyDelivered = true
 			},
 			func(askID, questionID string, options []string) {
-				// onAskRequest: finalize current text, show question + buttons
-				// Finalize the streaming text first
-				signalFlush()
-
-				// Read the accumulated text as the question
+				// onAskRequest: model wants user input (ask tool).
+				// Do NOT signalFlush — the buf contains raw model JSON
+				// ("❓ ask\n{\"questions\":...}") which should never reach the user.
+				// Clear the buf silently and send only the button question.
 				bufMu.Lock()
-				questionText := strings.TrimSpace(buf.String())
 				buf.Reset()
 				truncated = false
 				bufMu.Unlock()
 
-				if questionText == "" {
-					questionText = "请选择："
-				}
-
 				// Set pendingClarify with ask info for answer submission
 				s.mu.Lock()
-				cid := fmt.Sprintf("cl:%d", atomic.AddUint64(&a.clarifySeq, 1))
+				cidNum := atomic.AddUint64(&a.clarifySeq, 1)
+				cid := strconv.FormatUint(cidNum, 36) // short base-36, no "cl:" prefix
 				s.pendingClarify = &clarifyState{
-					question:   questionText,
+					question:   "请选择：",
 					choices:    options,
 					askID:      askID,
 					questionID: questionID,
@@ -720,8 +715,8 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				}
 				s.mu.Unlock()
 
-				// Send question + buttons to user
-				text := "❓ " + questionText
+				// Send buttons to user
+				text := "❓ 请选择："
 				if len(options) > 0 {
 					text += "\n\n" + a.formatChoices(options)
 				}
@@ -730,12 +725,13 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				if len(options) > 0 {
 					var rows [][]tgbotapi.InlineKeyboardButton
 					for i, choice := range options {
-						data := fmt.Sprintf("%s:%d", cid, i)
+						// callback_data: "cl:{cid}:{idx}" — "cl:" for routing, cid is base-36
+						data := fmt.Sprintf("cl:%s:%d", cid, i)
 						rows = append(rows, []tgbotapi.InlineKeyboardButton{
 							{Text: fmt.Sprintf("%d. %s", i+1, choice), CallbackData: &data},
 						})
 					}
-					otherData := fmt.Sprintf("%s:other", cid)
+					otherData := fmt.Sprintf("cl:%s:other", cid)
 					rows = append(rows, []tgbotapi.InlineKeyboardButton{
 						{Text: "✏️ 其他（输入答案）", CallbackData: &otherData},
 					})
