@@ -71,6 +71,7 @@ type wireAskOption struct {
 type askQuestionData struct {
 	ID      string
 	Options []string
+	Text    string // question text accumulated from model output
 }
 
 type turnResult struct {
@@ -346,7 +347,8 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 	var turnErr error
 	var gotTextDelta bool
 	var cancelOnce sync.Once
-	var textSuppressed bool // set true when ask-related text should be hidden
+	var bufferingAsk bool // true while accumulating question text for ask tool
+	var askTextBuffer strings.Builder
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
 	for sc.Scan() {
@@ -364,14 +366,16 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 			// Streaming token deltas — append in place (never suffix "\n" per chunk).
 			if ev.Text != "" {
 				gotTextDelta = true
-			if !textSuppressed {
+				if bufferingAsk {
+					askTextBuffer.WriteString(ev.Text)
+				} else {
 					onChunk(ev.Text)
 				}
 			}
 		case "message":
 			// Full answer at end; normally duplicates "text" deltas — use as fallback only.
 			if ev.Text != "" && !gotTextDelta {
-			if !textSuppressed {
+				if !bufferingAsk {
 					onChunk(ev.Text)
 				}
 			}
@@ -396,9 +400,10 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 			} else {
 				// tool mode: signal tool boundary, then send commentary
 				if ev.Tool != nil && !ev.Tool.Partial && ev.Tool.Name != "" {
-					// ask tool: suppress text output, handled by ask_request event
+					// ask tool: buffer text as question, handled by ask_request event
 					if ev.Tool.Name == "ask" {
-						textSuppressed = true
+						bufferingAsk = true
+						askTextBuffer.Reset()
 						continue
 					}
 					if onToolDispatch != nil {
@@ -435,7 +440,9 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 			}
 		case "ask_request":
 			log.Printf("port=%d: ask_request event (%d questions)", port, len(ev.Ask.Questions))
-			textSuppressed = false
+			bufferingAsk = false
+			questionText := strings.TrimSpace(askTextBuffer.String())
+			askTextBuffer.Reset()
 			if ev.Ask != nil && len(ev.Ask.Questions) > 0 && onAskRequest != nil {
 				questions := make([]askQuestionData, len(ev.Ask.Questions))
 				for i, q := range ev.Ask.Questions {
@@ -444,8 +451,10 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 						if opt.Label != "" {
 							labels = append(labels, opt.Label)
 						}
+
+						// Attach question text
 					}
-					questions[i] = askQuestionData{ID: q.ID, Options: labels}
+					questions[i] = askQuestionData{ID: q.ID, Options: labels, Text: questionText}
 				}
 				onAskRequest(ev.Ask.ID, questions)
 			}

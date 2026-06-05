@@ -302,8 +302,12 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 			pc.clarifyID = strconv.FormatUint(cidNum, 36)
 			s.mu.Unlock()
 
-			header := fmt.Sprintf("问题 %d/%d：", nextIdx+1, len(pc.allQuestions))
-			replyText := "❓ " + header
+			qText := strings.TrimSpace(nextQ.Text)
+			if qText == "" {
+				qText = "请选择："
+			}
+			header := fmt.Sprintf("问题 %d/%d\n", nextIdx+1, len(pc.allQuestions))
+			replyText := "❓ " + header + qText
 			if len(nextQ.Options) > 0 {
 				replyText += "\n\n" + a.formatChoices(nextQ.Options)
 			}
@@ -589,7 +593,6 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		msgCreatedAt   time.Time // when first draft/stream msg was sent
 		draftFailCount int      // consecutive draft failures in this turn
 		editFailCount  int      // consecutive edit failures in this turn
-		skipDisplay    bool     // set by onAskRequest: discard streaming text from TG
 	)
 	const (
 		maxDraftFailures = 3
@@ -736,9 +739,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				bufMu.Lock()
 				appendChunk(&buf, chunk, a.cfg.MaxOutputBytes, &truncated)
 				bufMu.Unlock()
-				if !skipDisplay {
-					wakePush()
-				}
+				wakePush()
 			},
 			signalFlush,
 			func() {
@@ -761,17 +762,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			},
 			func(askID string, questions []askQuestionData) {
 				// onAskRequest: model wants user input (ask tool).
-				// Suppress any already-streamed text from TG display.
-				skipDisplay = true
-				bufMu.Lock()
-				buf.Reset()
-				truncated = false
-				bufMu.Unlock()
-				select {
-				case <-pushWake:
-				default:
-				}
-
+				// Text was buffered in consumeServeEvents — use it as question.
 				if len(questions) == 0 {
 					return
 				}
@@ -785,7 +776,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				cid := strconv.FormatUint(cidNum, 36)
 				s.mu.Lock()
 				s.pendingClarify = &clarifyState{
-					question:      "请选择：",
+					question:      q.Text,
 					choices:       q.Options,
 					askID:         askID,
 					questionID:    q.ID,
@@ -798,11 +789,15 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				s.mu.Unlock()
 
 				// Send question with buttons
+				qText := strings.TrimSpace(q.Text)
+				if qText == "" {
+					qText = "请选择："
+				}
 				header := ""
 				if len(questions) > 1 {
-					header = fmt.Sprintf("问题 1/%d：", len(questions))
+					header = fmt.Sprintf("问题 1/%d\n", len(questions))
 				}
-				text := "❓ " + header
+				text := "❓ " + header + qText
 				if len(q.Options) > 0 {
 					text += "\n\n" + a.formatChoices(q.Options)
 				}
@@ -1203,8 +1198,12 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 		pc.clarifyID = strconv.FormatUint(cidNum, 36)
 		s.mu.Unlock()
 
-		header := fmt.Sprintf("问题 %d/%d：", nextIdx+1, len(pc.allQuestions))
-		text := "❓ " + header
+		qText := strings.TrimSpace(nextQ.Text)
+		if qText == "" {
+			qText = "请选择："
+		}
+		header := fmt.Sprintf("问题 %d/%d\n", nextIdx+1, len(pc.allQuestions))
+		text := "❓ " + header + qText
 		if len(nextQ.Options) > 0 {
 			text += "\n\n" + a.formatChoices(nextQ.Options)
 		}
