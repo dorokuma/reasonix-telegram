@@ -8,10 +8,13 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -127,9 +130,12 @@ func atoi(s string) int {
 }
 
 type clarifyState struct {
-	question  string
-	choices   []string
-	clarifyID string
+	question   string
+	choices    []string
+	askID      string
+	questionID string
+	port       int // reasonix serve port for submitting answer
+	clarifyID  string
 }
 
 // session: one per Telegram chat — workdir, Reasonix session file, serve process.
@@ -243,15 +249,6 @@ func registerCommands(bot *tgbotapi.BotAPI) error {
 	return err
 }
 
-// errAskUser is a sentinel error returned by consumeServeEvents when the
-// model calls the ask tool. The question details are carried in the error.
-type errAskUser struct {
-	question string
-	choices  []string
-}
-
-func (e *errAskUser) Error() string { return "ask:" + e.question }
-
 func (a *App) handleMessage(m *tgbotapi.Message) {
 	if m.From == nil {
 		return
@@ -281,9 +278,22 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 		s.mu.Lock()
 		s.pendingClarify = nil
 		s.mu.Unlock()
-		// Submit the user's answer as a new prompt
-		answer := fmt.Sprintf("[用户回答: %s]\n%s", pc.question, text)
-		a.runTask(m.Chat.ID, m.MessageID, answer)
+		// Submit the user's answer via POST /answer to the reasonix serve
+		body, _ := json.Marshal(map[string]any{
+			"id": pc.askID,
+			"answers": []map[string]any{{
+				"questionId": pc.questionID,
+				"selected":   []string{text},
+			}},
+		})
+		url := fmt.Sprintf("http://127.0.0.1:%d/answer", pc.port)
+		resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+		if err != nil {
+			log.Printf("chat=%d: post answer failed: %v", m.Chat.ID, err)
+			return
+		}
+		resp.Body.Close()
+		log.Printf("chat=%d: text answer submitted to serve (askID=%s)", m.Chat.ID, pc.askID)
 		return
 	}
 
@@ -681,6 +691,59 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				}
 				replyDelivered = true
 			},
+			func(askID, questionID string, options []string) {
+				// onAskRequest: finalize current text, show question + buttons
+				// Finalize the streaming text first
+				signalFlush()
+
+				// Read the accumulated text as the question
+				bufMu.Lock()
+				questionText := strings.TrimSpace(buf.String())
+				buf.Reset()
+				truncated = false
+				bufMu.Unlock()
+
+				if questionText == "" {
+					questionText = "请选择："
+				}
+
+				// Set pendingClarify with ask info for answer submission
+				s.mu.Lock()
+				cid := fmt.Sprintf("cl:%d", atomic.AddUint64(&a.clarifySeq, 1))
+				s.pendingClarify = &clarifyState{
+					question:   questionText,
+					choices:    options,
+					askID:      askID,
+					questionID: questionID,
+					port:       s.servePort,
+					clarifyID:  cid,
+				}
+				s.mu.Unlock()
+
+				// Send question + buttons to user
+				text := "❓ " + questionText
+				if len(options) > 0 {
+					text += "\n\n" + a.formatChoices(options)
+				}
+				msg := tgbotapi.NewMessage(chatID, text)
+				msg.ParseMode = "HTML"
+				if len(options) > 0 {
+					var rows [][]tgbotapi.InlineKeyboardButton
+					for i, choice := range options {
+						data := fmt.Sprintf("%s:%d", cid, i)
+						rows = append(rows, []tgbotapi.InlineKeyboardButton{
+							{Text: fmt.Sprintf("%d. %s", i+1, choice), CallbackData: &data},
+						})
+					}
+					otherData := fmt.Sprintf("%s:other", cid)
+					rows = append(rows, []tgbotapi.InlineKeyboardButton{
+						{Text: "✏️ 其他（输入答案）", CallbackData: &otherData},
+					})
+					msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
+				}
+				_, _ = a.bot.Send(msg)
+				replyDelivered = true
+			},
 		)
 		close(finished)
 	}()
@@ -767,48 +830,6 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		draftMu.Unlock()
 		if replyDelivered && errors.Is(procErr, context.Canceled) {
 			log.Printf("chat=%d prompt=%q: canceled after reply delivered", chatID, logPreview(prompt, 80))
-			return
-		}
-		// Handle clarify (ask tool) — send question to user, set pendingClarify.
-		var askErr *errAskUser
-		if errors.As(procErr, &askErr) {
-			log.Printf("chat=%d: ask tool -> clarify: %s", chatID, askErr.question)
-			cid := atomic.AddUint64(&a.clarifySeq, 1)
-			cidStr := strconv.FormatUint(cid, 36) // short base-36 ID
-			s.mu.Lock()
-			s.pendingClarify = &clarifyState{
-				question:  askErr.question,
-				choices:   askErr.choices,
-				clarifyID: cidStr,
-			}
-			s.mu.Unlock()
-			// Send the question to the user — HTML-escape the question text
-			// since we send with ParseMode=HTML.
-			text := "❓ " + htmlEscape(askErr.question)
-			if len(askErr.choices) > 0 {
-				text += "\n\n" + a.formatChoices(askErr.choices)
-			} else {
-				text += "\n\n📝 请直接回复你的回答。"
-			}
-			msg := tgbotapi.NewMessage(chatID, text)
-			msg.ParseMode = "HTML"
-			if len(askErr.choices) > 0 {
-				var rows [][]tgbotapi.InlineKeyboardButton
-				for i, choice := range askErr.choices {
-					idx := i
-					// Keep callback_data under TG's 64-byte limit: "cl:<cid36>:<idx>"
-					data := fmt.Sprintf("cl:%s:%d", cidStr, idx)
-					rows = append(rows, []tgbotapi.InlineKeyboardButton{
-						{Text: fmt.Sprintf("%d. %s", i+1, choice), CallbackData: &data},
-					})
-				}
-				otherData := fmt.Sprintf("cl:%s:other", cidStr)
-				rows = append(rows, []tgbotapi.InlineKeyboardButton{
-					{Text: "✏️ 其他（输入答案）", CallbackData: &otherData},
-				})
-				msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
-			}
-			_, _ = a.bot.Send(msg)
 			return
 		}
 		msg := fmt.Sprintf("请求失败：%s", userFacingError(procErr))
@@ -999,9 +1020,25 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 	// Answer the callback so TG stops the loading spinner
 	_, _ = a.bot.Request(tgbotapi.NewCallback(cq.ID, ""))
 
-	// Submit the answer as a new prompt
-	prompt := fmt.Sprintf("[用户选择了: %s]\n%s", pc.question, answer)
-	a.runTask(chatID, cq.Message.MessageID, prompt)
+	// Submit answer via POST /answer to the reasonix serve
+	body, _ := json.Marshal(map[string]any{
+		"id": pc.askID,
+		"answers": []map[string]any{{
+			"questionId": pc.questionID,
+			"selected":   []string{answer},
+		}},
+	})
+	url := fmt.Sprintf("http://127.0.0.1:%d/answer", pc.port)
+	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		log.Printf("chat=%d: post answer failed: %v", chatID, err)
+		return
+	}
+	resp.Body.Close()
+
+	// The turn continues on the same SSE connection — wait for it to finish.
+	// runServeTurn is already running, consuming the SSE stream.
+	log.Printf("chat=%d: answer submitted to serve (askID=%s)", chatID, pc.askID)
 }
 
 func (a *App) formatChoices(choices []string) string {

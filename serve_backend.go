@@ -49,6 +49,22 @@ type wireEvent struct {
 		ID   string `json:"id"`
 		Tool string `json:"tool"`
 	} `json:"approval,omitempty"`
+	Ask *wireAsk `json:"ask,omitempty"`
+}
+
+// wireAsk mirrors reasonix serve's ask_request event (internal/serve/wire.go).
+type wireAsk struct {
+	ID        string            `json:"id"`
+	Questions []wireAskQuestion `json:"questions"`
+}
+
+type wireAskQuestion struct {
+	ID      string          `json:"id"`
+	Options []wireAskOption `json:"options"`
+}
+
+type wireAskOption struct {
+	Label string `json:"label"`
 }
 
 type turnResult struct {
@@ -279,7 +295,7 @@ func (a *App) lockServeMode(port int) {
 // runServeTurn submits a prompt to the long-lived reasonix serve process and
 // streams SSE events until turn_done. The conversation history stays in the
 // same Reasonix session file across Telegram messages and bridge restarts.
-func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string)) error {
+func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string), onAskRequest func(askID string, questionID string, options []string)) error {
 	s := a.getOrCreateSession(chatID)
 	s.mu.Lock()
 	port := s.servePort
@@ -289,7 +305,7 @@ func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onC
 
 	eventsDone := make(chan turnResult, 1)
 	go func() {
-		eventsDone <- a.consumeServeEvents(ctx, port, onChunk, onComplete, onToolDispatch, onCommentary)
+		eventsDone <- a.consumeServeEvents(ctx, port, onChunk, onComplete, onToolDispatch, onCommentary, onAskRequest)
 	}()
 
 	if err := postJSON(port, "/submit", map[string]string{"input": prompt}); err != nil {
@@ -310,7 +326,7 @@ func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onC
 	}
 }
 
-func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string)) turnResult {
+func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string), onAskRequest func(askID string, questionID string, options []string)) turnResult {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serveBaseURL(port)+"/events", nil)
 	if err != nil {
 		return turnResult{err: err}
@@ -369,25 +385,6 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 			} else {
 				// tool mode: signal tool boundary, then send commentary
 				if ev.Tool != nil && !ev.Tool.Partial && ev.Tool.Name != "" {
-					// ask tool: intercept for clarify flow
-					if ev.Tool.Name == "ask" {
-						log.Printf("port=%d: ask tool dispatched, pausing for user input", port)
-						// Parse the question from args
-						var askArgs struct {
-							Question string   `json:"question"`
-							Choices  []string `json:"choices"`
-						}
-						if ev.Tool.Args != "" {
-							json.Unmarshal([]byte(ev.Tool.Args), &askArgs)
-						}
-						// Cancel the current turn so the user can respond
-						_ = postJSON(port, "/cancel", map[string]any{})
-						return turnResult{err: &errAskUser{
-							question: askArgs.Question,
-							choices:  askArgs.Choices,
-						}}
-					}
-
 					if onToolDispatch != nil {
 						onToolDispatch()
 					}
@@ -419,6 +416,18 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 						onCommentary(msg)
 					}
 				}
+			}
+		case "ask_request":
+			log.Printf("port=%d: ask_request event", port)
+			if ev.Ask != nil && len(ev.Ask.Questions) > 0 && onAskRequest != nil {
+				q := ev.Ask.Questions[0]
+				var labels []string
+				for _, opt := range q.Options {
+					if opt.Label != "" {
+						labels = append(labels, opt.Label)
+					}
+				}
+				onAskRequest(ev.Ask.ID, q.ID, labels)
 			}
 		case "approval_request":
 			if ev.Approval != nil && ev.Approval.ID != "" {
