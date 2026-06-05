@@ -73,6 +73,12 @@ func isReasonixNoise(line string) bool {
 }
 
 // Config: env-driven. Copy `.env.example` and fill in.
+const (
+	ModeChat = "chat"
+	ModeTool = "tool"
+)
+
+// Config: env-driven. Copy `.env.example` and fill in.
 type Config struct {
 	BotToken       string  // TG_BOT_TOKEN
 	ReasonixBin  string  // REASONIX_BIN, default "reasonix"
@@ -81,9 +87,14 @@ type Config struct {
 	MaxDuration    int     // MAX_DURATION_MIN, default 30
 	Model          string  // MODEL, default "" (reasonix default)
 	StateDir string // STATE_DIR, default /var/lib/reasonix-telegram
+	Mode     string // MODE: "chat" (default, tools locked) or "tool" (full agent access)
 }
 
 func loadConfig() Config {
+	mode := getenv("MODE", ModeChat)
+	if mode != ModeChat && mode != ModeTool {
+		mode = ModeChat
+	}
 	c := Config{
 		BotToken:       os.Getenv("TG_BOT_TOKEN"),
 		ReasonixBin:    getenv("REASONIX_BIN", "reasonix"),
@@ -91,6 +102,7 @@ func loadConfig() Config {
 		MaxDuration:    atoi(getenv("MAX_DURATION_MIN", "30")),
 		Model:          os.Getenv("MODEL"),
 		StateDir: getenv("STATE_DIR", defaultStateDir),
+		Mode:           mode,
 	}
 	if s := os.Getenv("ALLOWED_USERS"); s != "" {
 		for _, p := range strings.Split(s, ",") {
@@ -116,12 +128,13 @@ func atoi(s string) int {
 
 // session: one per Telegram chat — workdir, Reasonix session file, serve process.
 type session struct {
-	mu          sync.Mutex
-	workdir     string
-	sessionPath string
-	servePort   int
-	serveCmd    *exec.Cmd
-	task        *runningTask // non-nil while a turn is in flight
+	mu           sync.Mutex
+	workdir      string
+	sessionPath  string
+	servePort    int
+	serveCmd     *exec.Cmd
+	task         *runningTask // non-nil while a turn is in flight
+	lastActivity time.Time    // last message activity, for /sessions
 }
 
 type runningTask struct {
@@ -171,7 +184,7 @@ func main() {
 	if err := app.ensureChatWorkdir(); err != nil {
 		log.Fatalf("chat workdir: %v", err)
 	}
-	log.Printf("chat-only mode: workdir=%s (tools disabled in reasonix.toml)", app.chatWorkdir())
+	log.Printf("mode=%s workdir=%s", app.cfg.Mode, app.chatWorkdir())
 	log.Printf("telegram stream: sendMessageDraft + sendMessage finalize (TelePi/Hermes pattern)")
 	app.startRestartWatchdog()
 	app.restorePersistedSessions()
@@ -212,6 +225,8 @@ func registerCommands(bot *tgbotapi.BotAPI) error {
 		{Command: "new", Description: "开启新对话"},
 		{Command: "clear", Description: "同 /new，开启新对话"},
 		{Command: "restart", Description: "重启桥接"},
+		{Command: "health", Description: "所有 serve 进程状态"},
+		{Command: "sessions", Description: "活跃会话列表"},
 	}
 	_, err := bot.Request(tgbotapi.NewSetMyCommands(cmds...))
 	return err
@@ -240,15 +255,23 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 	// Slash commands.
 	switch {
 	case text == "/start" || text == "/help":
+		modeLabel := "纯对话（工具关闭）"
+		if a.cfg.Mode == ModeTool {
+			modeLabel = "全能编程（工具可用）"
+		}
 		a.reply(m.Chat.ID, strings.Join([]string{
-			"🤖 *Reasonix Telegram* · 纯对话",
+			"🤖 Reasonix Telegram",
+			"",
+			fmt.Sprintf("模式：%s", modeLabel),
 			"",
 			"指令：",
 			"• `/stop` — 中止当前回复",
 			"• `/status` — 是否在生成中",
 			"• `/new`、`/clear` — 新对话",
 			"• `/restart` — 重启桥接",
-			"• 直接发消息 — 纯文字聊天",
+			"• `/health` — 所有服务状态",
+			"• `/sessions` — 活跃会话",
+			"• 直接发消息 — 开始对话",
 			"",
 			fmt.Sprintf("单条最多 %d 字，超长自动连发；缓冲约 %d 字节，超时 %d 分钟",
 				telegramMaxMessageRunes, a.cfg.MaxOutputBytes, a.cfg.MaxDuration),
@@ -280,7 +303,11 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 		if busy {
 			stateCN = "生成中"
 		}
-		a.reply(m.Chat.ID, fmt.Sprintf("状态：%s\n模式：纯对话（工具已关闭）", stateCN))
+		modeLabel := "纯对话（工具关闭）"
+		if a.cfg.Mode == ModeTool {
+			modeLabel = "全能编程（工具可用）"
+		}
+		a.reply(m.Chat.ID, fmt.Sprintf("状态：%s\n模式：%s", stateCN, modeLabel))
 		return
 
 	case text == "/new" || text == "/clear":
@@ -292,6 +319,13 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 		go a.gracefulServiceRestart(m.Chat.ID)
 		return
 
+	case text == "/health":
+		a.healthHandler(m)
+		return
+
+	case text == "/sessions":
+		a.sessionsHandler(m)
+		return
 	}
 
 	// If this is a reply, include the original message as context.
@@ -381,6 +415,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 	s := a.getOrCreateSession(chatID)
 
 	s.mu.Lock()
+	s.lastActivity = time.Now()
 	if t := s.task; t != nil {
 		log.Printf("chat=%d: pre-empting running turn", chatID)
 		t.cancel()
@@ -662,6 +697,51 @@ func (a *App) sendDraft(chatID int64, draftID int64, text string) bool {
 		return false
 	}
 	return true
+}
+
+func (a *App) healthHandler(m *tgbotapi.Message) {
+	a.sessMu.Lock()
+	defer a.sessMu.Unlock()
+	lines := []string{fmt.Sprintf("模式: %s", a.cfg.Mode)}
+	if len(a.sess) == 0 {
+		lines = append(lines, "暂无活跃会话")
+	} else {
+		for chatID, s := range a.sess {
+			s.mu.Lock()
+			busy := s.task != nil
+			running := s.serveCmd != nil && s.serveCmd.Process != nil && s.serveCmd.ProcessState == nil
+			s.mu.Unlock()
+			status := "🟢 运行中"
+			if !running {
+				status = "🔴 已停止"
+			} else if busy {
+				status = "🟡 生成中"
+			}
+			lines = append(lines, fmt.Sprintf("聊天 %d: %s", chatID, status))
+		}
+	}
+	a.reply(m.Chat.ID, strings.Join(lines, "\n"))
+}
+
+func (a *App) sessionsHandler(m *tgbotapi.Message) {
+	a.sessMu.Lock()
+	defer a.sessMu.Unlock()
+	var lines []string
+	if len(a.sess) == 0 {
+		lines = append(lines, "暂无活跃会话")
+	} else {
+		for chatID, s := range a.sess {
+			s.mu.Lock()
+			la := s.lastActivity
+			s.mu.Unlock()
+			line := fmt.Sprintf("聊天 %d", chatID)
+			if !la.IsZero() {
+				line += fmt.Sprintf(" · 最后活跃 %s 前", time.Since(la).Round(time.Second))
+			}
+			lines = append(lines, line)
+		}
+	}
+	a.reply(m.Chat.ID, strings.Join(lines, "\n"))
 }
 
 // killDescendants SIGKILLs any process whose ppid is the given pid, walking

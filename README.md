@@ -21,7 +21,7 @@ flowchart LR
   Bot --> Serve[reasonix serve per chat]
   Serve --> Model[DeepSeek via Reasonix]
   Bot --> State[(STATE_DIR sessions cache)]
-  Serve --> WD[chat-wd AGENTS.md]
+  Serve --> WD[chat-wd REASONIX.md]
 ```
 
 ---
@@ -33,7 +33,7 @@ flowchart LR
 - **Streaming UX** — live draft preview, then final message(s); typing indicator while generating
 - **Long replies** — auto-split at Telegram’s 4096-character limit (no `…[cut]…` in user-visible text)
 - **Chat-only lockdown** — plan/bypass off; tool dispatches cancelled; no “agent work” surface in TG
-- **User rules** — symlink your `AGENTS.md` / `REASONIX.md` into `chat-wd` (bridge does not embed persona text)
+- **User rules** — `~/.config/reasonix/REASONIX.md` (Reasonix global); bridged into `chat-wd/REASONIX.md` (not `AGENTS.md`, so Hermes won't pick it up from `$HOME`)
 - **Slash commands** — `/stop`, `/status`, `/new`, `/restart`, `/help`, …
 
 ---
@@ -77,9 +77,9 @@ For production, see [Deployment](#deployment).
 | `MAX_OUTPUT_BYTES` | no | `524288` | Stream buffer cap before split-send; tail truncated if exceeded |
 | `MAX_DURATION_MIN` | no | `30` | Per-turn timeout (minutes) |
 | `MODEL` | no | Reasonix default | e.g. `deepseek-v4-flash` |
-| `CHAT_RULES_FILE` | no | `/root/AGENTS.md` then `/root/REASONIX.md` | Symlinked into `$STATE_DIR/chat-wd/` |
+| `CHAT_RULES_FILE` | no | `~/.config/reasonix/REASONIX.md` | Override path; symlinked into `$STATE_DIR/chat-wd/REASONIX.md` |
 
-**Persona / rules:** Put project memory in `AGENTS.md` or `REASONIX.md`. The bridge only symlinks it into `chat-wd`; it does not inject character prompts. After rule changes, send **`/new`** in Telegram so the active session reloads system context (restart alone is not enough for an existing JSONL session).
+**Persona / rules:** Use Reasonix's user-global **`~/.config/reasonix/REASONIX.md`** (not `$HOME/AGENTS.md` — that file is shared with Hermes and other agents). The bridge symlinks it into `chat-wd`; it does not inject character prompts. After rule changes, send **`/new`** in Telegram so the active session reloads system context (restart alone is not enough for an existing JSONL session).
 
 **Limits (user-visible):**
 
@@ -167,7 +167,7 @@ Upstream: [esengine/DeepSeek-Reasonix](https://github.com/esengine/DeepSeek-Reas
 | Symptom | Check |
 |---------|--------|
 | No typing indicator | Logs for `sendChatAction`; must use `Request`, not `Send` (fixed in recent versions) |
-| Rules not applied | `chat-wd/AGENTS.md` symlink; send **`/new`** |
+| Rules not applied | `~/.config/reasonix/REASONIX.md` + `chat-wd/REASONIX.md` symlink; send **`/new`** |
 | Reply truncated mid-sentence with `…[cut]…` | Old build; upgrade — user text uses split-send, not cut markers |
 | `Reasonix 服务启动失败` | `reasonix` on PATH, `DEEPSEEK_API_KEY`, port range ~18780+ |
 | Stuck after `/restart` | Wait for 🟢 connected message; watchdog clears “restarting” after ~45s |
@@ -204,7 +204,7 @@ Add a `LICENSE` file when publishing publicly; until then, follow your deploymen
 - **流式体验** — 草稿预览 + 正式消息；生成时显示「正在输入」
 - **长文回复** — 超过 Telegram 单条 **4096 字** 自动连发多条，用户可见正文无 `…[cut]…`
 - **纯聊天加固** — 关闭 plan/bypass；拦截工具调度，不在 TG 里干「工程师活」
-- **用户规则** — 将 `AGENTS.md` / `REASONIX.md` 软链到 `chat-wd`（桥接不写人设）
+- **用户规则** — 使用 `~/.config/reasonix/REASONIX.md`，桥接软链到 `chat-wd/REASONIX.md`（勿放 `$HOME/AGENTS.md`，会被 Hermes 读取）
 - **斜杠命令** — `/stop`、`/status`、`/new`、`/restart`、`/help` 等
 
 ---
@@ -250,7 +250,7 @@ export $(grep -v '^#' /etc/reasonix-telegram.env | xargs)
 | `MODEL` | 否 | Reasonix 默认 | 如 `deepseek-v4-flash` |
 | `CHAT_RULES_FILE` | 否 | 见 `.env.example` | 软链到 `chat-wd` 的规则文件 |
 
-**人设 / 规则：** 规则写在 `AGENTS.md` 或 `REASONIX.md`，桥接只负责软链，不内置角色 Prompt。改规则后请在 Telegram 发 **`/new`** 开新会话（仅重启服务不会替换已 resume 的 JSONL system）。
+**人设 / 规则：** 写在 **`~/.config/reasonix/REASONIX.md`**（Reasonix 官方用户级记忆路径）。桥接只软链到 `chat-wd`，不内置角色 Prompt。改规则后请在 Telegram 发 **`/new`** 开新会话（仅重启服务不会替换已 resume 的 JSONL system）。
 
 **用户可见限制：**
 

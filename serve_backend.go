@@ -65,8 +65,10 @@ func (a *App) reasonixEnv() []string {
 	env = append(env,
 		"REASONIX_CACHE_DIR="+cacheBase,
 		"XDG_CACHE_HOME="+cacheBase,
-		"NO_COLOR=1", "FORCE_COLOR=0", "CI=1", "TERM=dumb",
 	)
+	if a.cfg.Mode == ModeChat {
+		env = append(env, "NO_COLOR=1", "FORCE_COLOR=0", "CI=1", "TERM=dumb")
+	}
 	return env
 }
 
@@ -178,10 +180,9 @@ func (a *App) startServe(chatID int64) error {
 		a.stopServe(chatID)
 		return err
 	}
-	// Chat-only: plan must stay off — plan mode explores the tree and emits project plans.
-	_ = postJSON(port, "/plan", map[string]bool{"on": false})
-	_ = postJSON(port, "/bypass", map[string]bool{"on": false})
-	log.Printf("chat=%d: serve cwd=%s (tools disabled via reasonix.toml)", chatID, wd)
+	// Lock plan/bypass in chat mode (tool mode leaves them on).
+	a.lockServeMode(port)
+	log.Printf("chat=%d: serve cwd=%s mode=%s", chatID, wd, a.cfg.Mode)
 	if err := a.state.upsert(chatRecord{
 		ChatID: chatID, Workdir: wd, SessionPath: sessionPath, Port: port,
 	}); err != nil {
@@ -267,9 +268,12 @@ func postJSON(port int, path string, body any) error {
 	return nil
 }
 
-func (a *App) lockServeChatOnly(port int) {
-	_ = postJSON(port, "/plan", map[string]bool{"on": false})
-	_ = postJSON(port, "/bypass", map[string]bool{"on": false})
+func (a *App) lockServeMode(port int) {
+	if a.cfg.Mode == ModeChat {
+		_ = postJSON(port, "/plan", map[string]bool{"on": false})
+		_ = postJSON(port, "/bypass", map[string]bool{"on": false})
+	}
+	// tool mode: leave plan/bypass as-is so the agent can use tools
 }
 
 // runServeTurn submits a prompt to the long-lived reasonix serve process and
@@ -281,7 +285,7 @@ func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onC
 	port := s.servePort
 	s.mu.Unlock()
 
-	a.lockServeChatOnly(port)
+	a.lockServeMode(port)
 
 	eventsDone := make(chan turnResult, 1)
 	go func() {
@@ -352,22 +356,54 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 			// Hidden in Telegram — reasoning is verbose and also arrives as deltas.
 			continue
 		case "tool_dispatch":
-			if ev.Tool != nil {
-				if ev.Tool.Partial {
-					continue
+			if a.cfg.Mode == ModeChat {
+				if ev.Tool != nil {
+					if ev.Tool.Partial {
+						continue
+					}
+					toolCancel.Do(func() {
+						log.Printf("chat-only: blocked tool %s, cancelling turn", ev.Tool.Name)
+						_ = postJSON(port, "/cancel", map[string]any{})
+					})
 				}
-				toolCancel.Do(func() {
-					log.Printf("chat-only: blocked tool %s, cancelling turn", ev.Tool.Name)
-					_ = postJSON(port, "/cancel", map[string]any{})
-				})
+			} else {
+				// tool mode: notify user about tool usage
+				if ev.Tool != nil && !ev.Tool.Partial && ev.Tool.Name != "" {
+					msg := fmt.Sprintf("\n🔧 工具: %s", ev.Tool.Name)
+					if ev.Tool.Args != "" {
+						msg += "(" + ev.Tool.Args + ")"
+					}
+					onChunk(msg)
+				}
 			}
 		case "tool_result":
-			continue
+			if a.cfg.Mode != ModeChat {
+				// tool mode: show tool result to user
+				if ev.Tool != nil {
+					msg := ""
+					if ev.Tool.Err != "" {
+						msg = fmt.Sprintf("\n❌ 工具错误: %s", trimUTF8Bytes(ev.Tool.Err, 500))
+					} else if ev.Tool.Output != "" {
+						msg = fmt.Sprintf("\n📝 工具结果: %s", trimUTF8Bytes(ev.Tool.Output, 500))
+					}
+					if msg != "" {
+						onChunk(msg)
+					}
+				}
+			}
 		case "approval_request":
 			if ev.Approval != nil && ev.Approval.ID != "" {
-				_ = postJSON(port, "/approve", map[string]any{
-					"id": ev.Approval.ID, "allow": false, "session": false,
-				})
+				if a.cfg.Mode == ModeTool {
+					// auto-approve in tool mode (no interactive approval via TG)
+					_ = postJSON(port, "/approve", map[string]any{
+						"id": ev.Approval.ID, "allow": true, "session": true,
+					})
+				} else {
+					// chat mode: auto-reject
+					_ = postJSON(port, "/approve", map[string]any{
+						"id": ev.Approval.ID, "allow": false, "session": false,
+					})
+				}
 			}
 		case "turn_done":
 			if ev.Err != "" {
