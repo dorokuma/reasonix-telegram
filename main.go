@@ -136,6 +136,10 @@ type clarifyState struct {
 	questionID string
 	port       int // reasonix serve port for submitting answer
 	clarifyID  string
+	// Multi-question tracking
+	allQuestions []askQuestionData // all questions in the ask
+	qIndex       int               // which question we're on (0-based)
+	answers      map[string][]string // questionID -> selected answers
 }
 
 type approvalState struct {
@@ -282,16 +286,70 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 	pc := s.pendingClarify
 	s.mu.Unlock()
 	if pc != nil {
+		// Store this text answer
+		pc.answers[pc.questionID] = []string{text}
+
+		// Check if there are more questions
+		nextIdx := pc.qIndex + 1
+		if nextIdx < len(pc.allQuestions) {
+			// Show the next question
+			nextQ := pc.allQuestions[nextIdx]
+			s.mu.Lock()
+			pc.qIndex = nextIdx
+			pc.questionID = nextQ.ID
+			pc.choices = nextQ.Options
+			cidNum := atomic.AddUint64(&a.clarifySeq, 1)
+			pc.clarifyID = strconv.FormatUint(cidNum, 36)
+			s.mu.Unlock()
+
+			header := fmt.Sprintf("问题 %d/%d：", nextIdx+1, len(pc.allQuestions))
+			replyText := "❓ " + header
+			if len(nextQ.Options) > 0 {
+				replyText += "\n\n" + a.formatChoices(nextQ.Options)
+			}
+			msg := tgbotapi.NewMessage(m.Chat.ID, replyText)
+			msg.ParseMode = "HTML"
+			if len(nextQ.Options) > 0 {
+				var rows [][]tgbotapi.InlineKeyboardButton
+				for i, choice := range nextQ.Options {
+					data := fmt.Sprintf("cl:%s:%d", pc.clarifyID, i)
+					rows = append(rows, []tgbotapi.InlineKeyboardButton{
+						{Text: fmt.Sprintf("%d. %s", i+1, choice), CallbackData: &data},
+					})
+				}
+				otherData := fmt.Sprintf("cl:%s:other", pc.clarifyID)
+				rows = append(rows, []tgbotapi.InlineKeyboardButton{
+					{Text: "✏️ 其他（输入答案）", CallbackData: &otherData},
+				})
+				msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
+			}
+			_, _ = a.bot.Send(msg)
+			return
+		}
+
+		// All answered — submit
 		s.mu.Lock()
 		s.pendingClarify = nil
 		s.mu.Unlock()
-		// Submit the user's answer via POST /answer to the reasonix serve
+
+		type answerEntry struct {
+			QuestionID string   `json:"questionId"`
+			Selected   []string `json:"selected"`
+		}
+		var answersPayload []answerEntry
+		for _, q := range pc.allQuestions {
+			sel, ok := pc.answers[q.ID]
+			if !ok {
+				sel = []string{""}
+			}
+			answersPayload = append(answersPayload, answerEntry{
+				QuestionID: q.ID,
+				Selected:   sel,
+			})
+		}
 		body, _ := json.Marshal(map[string]any{
-			"id": pc.askID,
-			"answers": []map[string]any{{
-				"questionId": pc.questionID,
-				"selected":   []string{text},
-			}},
+			"id":      pc.askID,
+			"answers": answersPayload,
 		})
 		url := fmt.Sprintf("http://127.0.0.1:%d/answer", pc.port)
 		resp, err := http.Post(url, "application/json", bytes.NewReader(body))
@@ -300,7 +358,7 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 			return
 		}
 		resp.Body.Close()
-		log.Printf("chat=%d: text answer submitted to serve (askID=%s)", m.Chat.ID, pc.askID)
+		log.Printf("chat=%d: all %d text answers submitted to serve (askID=%s)", m.Chat.ID, len(pc.allQuestions), pc.askID)
 		return
 	}
 
@@ -701,7 +759,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				}
 				replyDelivered = true
 			},
-			func(askID, questionID string, options []string) {
+			func(askID string, questions []askQuestionData) {
 				// onAskRequest: model wants user input (ask tool).
 				// Suppress any already-streamed text from TG display.
 				skipDisplay = true
@@ -709,38 +767,50 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				buf.Reset()
 				truncated = false
 				bufMu.Unlock()
-				// Drain any pending push signal so the pusher goroutine
-				// doesn't send the stale draft to TG.
 				select {
 				case <-pushWake:
 				default:
 				}
 
-				// Set pendingClarify with ask info for answer submission
-				s.mu.Lock()
+				if len(questions) == 0 {
+					return
+				}
+
+				// Build answers map and store all questions for multi-question tracking
+				answers := make(map[string][]string, len(questions))
+
+				// Show the FIRST question with buttons
+				q := questions[0]
 				cidNum := atomic.AddUint64(&a.clarifySeq, 1)
-				cid := strconv.FormatUint(cidNum, 36) // short base-36, no "cl:" prefix
+				cid := strconv.FormatUint(cidNum, 36)
+				s.mu.Lock()
 				s.pendingClarify = &clarifyState{
-					question:   "请选择：",
-					choices:    options,
-					askID:      askID,
-					questionID: questionID,
-					port:       s.servePort,
-					clarifyID:  cid,
+					question:      "请选择：",
+					choices:       q.Options,
+					askID:         askID,
+					questionID:    q.ID,
+					port:          s.servePort,
+					clarifyID:     cid,
+					allQuestions:  questions,
+					qIndex:        0,
+					answers:       answers,
 				}
 				s.mu.Unlock()
 
-				// Send buttons to user
-				text := "❓ 请选择："
-				if len(options) > 0 {
-					text += "\n\n" + a.formatChoices(options)
+				// Send question with buttons
+				header := ""
+				if len(questions) > 1 {
+					header = fmt.Sprintf("问题 1/%d：", len(questions))
+				}
+				text := "❓ " + header
+				if len(q.Options) > 0 {
+					text += "\n\n" + a.formatChoices(q.Options)
 				}
 				msg := tgbotapi.NewMessage(chatID, text)
 				msg.ParseMode = "HTML"
-				if len(options) > 0 {
+				if len(q.Options) > 0 {
 					var rows [][]tgbotapi.InlineKeyboardButton
-					for i, choice := range options {
-						// callback_data: "cl:{cid}:{idx}" — "cl:" for routing, cid is base-36
+					for i, choice := range q.Options {
 						data := fmt.Sprintf("cl:%s:%d", cid, i)
 						rows = append(rows, []tgbotapi.InlineKeyboardButton{
 							{Text: fmt.Sprintf("%d. %s", i+1, choice), CallbackData: &data},
@@ -1092,14 +1162,15 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 		s.mu.Unlock()
 		return
 	}
-	s.pendingClarify = nil
+	// Don't clear pendingClarify yet — we may have more questions
 	s.mu.Unlock()
+
+	_, _ = a.bot.Request(tgbotapi.NewCallback(cq.ID, ""))
 
 	var answer string
 	if choiceIdx == "other" {
-		// User wants to type their own answer — re-set pendingClarify and ask
 		s.mu.Lock()
-		s.pendingClarify = pc
+		// Don't clear, just flag that we need text input
 		s.mu.Unlock()
 		msg := tgbotapi.NewMessage(chatID, "📝 请输入你的回答：")
 		msg.ParseMode = "HTML"
@@ -1115,16 +1186,72 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 		answer = choiceIdx
 	}
 
-	// Answer the callback so TG stops the loading spinner
-	_, _ = a.bot.Request(tgbotapi.NewCallback(cq.ID, ""))
+	// Store this answer
+	pc.answers[pc.questionID] = []string{answer}
 
-	// Submit answer via POST /answer to the reasonix serve
+	// Check if there are more questions
+	nextIdx := pc.qIndex + 1
+	if nextIdx < len(pc.allQuestions) {
+		// Show the next question
+		nextQ := pc.allQuestions[nextIdx]
+		s.mu.Lock()
+		pc.qIndex = nextIdx
+		pc.questionID = nextQ.ID
+		pc.choices = nextQ.Options
+		// Generate new clarifyID for the next question
+		cidNum := atomic.AddUint64(&a.clarifySeq, 1)
+		pc.clarifyID = strconv.FormatUint(cidNum, 36)
+		s.mu.Unlock()
+
+		header := fmt.Sprintf("问题 %d/%d：", nextIdx+1, len(pc.allQuestions))
+		text := "❓ " + header
+		if len(nextQ.Options) > 0 {
+			text += "\n\n" + a.formatChoices(nextQ.Options)
+		}
+		msg := tgbotapi.NewMessage(chatID, text)
+		msg.ParseMode = "HTML"
+		if len(nextQ.Options) > 0 {
+			var rows [][]tgbotapi.InlineKeyboardButton
+			for i, choice := range nextQ.Options {
+				data := fmt.Sprintf("cl:%s:%d", pc.clarifyID, i)
+				rows = append(rows, []tgbotapi.InlineKeyboardButton{
+					{Text: fmt.Sprintf("%d. %s", i+1, choice), CallbackData: &data},
+				})
+			}
+			otherData := fmt.Sprintf("cl:%s:other", pc.clarifyID)
+			rows = append(rows, []tgbotapi.InlineKeyboardButton{
+				{Text: "✏️ 其他（输入答案）", CallbackData: &otherData},
+			})
+			msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
+		}
+		_, _ = a.bot.Send(msg)
+		return
+	}
+
+	// All questions answered — submit via POST /answer
+	s.mu.Lock()
+	s.pendingClarify = nil
+	s.mu.Unlock()
+
+	// Build answers array preserving question order
+	type answerEntry struct {
+		QuestionID string   `json:"questionId"`
+		Selected   []string `json:"selected"`
+	}
+	var answersPayload []answerEntry
+	for _, q := range pc.allQuestions {
+		sel, ok := pc.answers[q.ID]
+		if !ok {
+			sel = []string{""}
+		}
+		answersPayload = append(answersPayload, answerEntry{
+			QuestionID: q.ID,
+			Selected:   sel,
+		})
+	}
 	body, _ := json.Marshal(map[string]any{
-		"id": pc.askID,
-		"answers": []map[string]any{{
-			"questionId": pc.questionID,
-			"selected":   []string{answer},
-		}},
+		"id":      pc.askID,
+		"answers": answersPayload,
 	})
 	url := fmt.Sprintf("http://127.0.0.1:%d/answer", pc.port)
 	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
@@ -1133,10 +1260,7 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 		return
 	}
 	resp.Body.Close()
-
-	// The turn continues on the same SSE connection — wait for it to finish.
-	// runServeTurn is already running, consuming the SSE stream.
-	log.Printf("chat=%d: answer submitted to serve (askID=%s)", chatID, pc.askID)
+	log.Printf("chat=%d: all %d answers submitted to serve (askID=%s)", chatID, len(pc.allQuestions), pc.askID)
 }
 
 func (a *App) formatChoices(choices []string) string {

@@ -67,6 +67,12 @@ type wireAskOption struct {
 	Label string `json:"label"`
 }
 
+// askQuestionData is a simplified question passed to the onAskRequest callback.
+type askQuestionData struct {
+	ID      string
+	Options []string
+}
+
 type turnResult struct {
 	err error
 }
@@ -295,7 +301,7 @@ func (a *App) lockServeMode(port int) {
 // runServeTurn submits a prompt to the long-lived reasonix serve process and
 // streams SSE events until turn_done. The conversation history stays in the
 // same Reasonix session file across Telegram messages and bridge restarts.
-func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string), onAskRequest func(askID string, questionID string, options []string), onApprovalRequest func(approvalID string, toolName string)) error {
+func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string), onAskRequest func(askID string, questions []askQuestionData), onApprovalRequest func(approvalID string, toolName string)) error {
 	s := a.getOrCreateSession(chatID)
 	s.mu.Lock()
 	port := s.servePort
@@ -326,7 +332,7 @@ func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onC
 	}
 }
 
-func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string), onAskRequest func(askID string, questionID string, options []string), onApprovalRequest func(approvalID string, toolName string)) turnResult {
+func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string), onAskRequest func(askID string, questions []askQuestionData), onApprovalRequest func(approvalID string, toolName string)) turnResult {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serveBaseURL(port)+"/events", nil)
 	if err != nil {
 		return turnResult{err: err}
@@ -340,6 +346,7 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 	var turnErr error
 	var gotTextDelta bool
 	var cancelOnce sync.Once
+	var textSuppressed bool // set true when ask-related text should be hidden
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
 	for sc.Scan() {
@@ -357,12 +364,16 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 			// Streaming token deltas — append in place (never suffix "\n" per chunk).
 			if ev.Text != "" {
 				gotTextDelta = true
-				onChunk(ev.Text)
+			if !textSuppressed {
+					onChunk(ev.Text)
+				}
 			}
 		case "message":
 			// Full answer at end; normally duplicates "text" deltas — use as fallback only.
 			if ev.Text != "" && !gotTextDelta {
-				onChunk(ev.Text)
+			if !textSuppressed {
+					onChunk(ev.Text)
+				}
 			}
 			// Finalize UI as soon as the full message is known (often before turn_done).
 			if ev.Text != "" && onComplete != nil {
@@ -385,6 +396,11 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 			} else {
 				// tool mode: signal tool boundary, then send commentary
 				if ev.Tool != nil && !ev.Tool.Partial && ev.Tool.Name != "" {
+					// ask tool: suppress text output, handled by ask_request event
+					if ev.Tool.Name == "ask" {
+						textSuppressed = true
+						continue
+					}
 					if onToolDispatch != nil {
 						onToolDispatch()
 					}
@@ -418,16 +434,20 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 				}
 			}
 		case "ask_request":
-			log.Printf("port=%d: ask_request event", port)
+			log.Printf("port=%d: ask_request event (%d questions)", port, len(ev.Ask.Questions))
+			textSuppressed = false
 			if ev.Ask != nil && len(ev.Ask.Questions) > 0 && onAskRequest != nil {
-				q := ev.Ask.Questions[0]
-				var labels []string
-				for _, opt := range q.Options {
-					if opt.Label != "" {
-						labels = append(labels, opt.Label)
+				questions := make([]askQuestionData, len(ev.Ask.Questions))
+				for i, q := range ev.Ask.Questions {
+					var labels []string
+					for _, opt := range q.Options {
+						if opt.Label != "" {
+							labels = append(labels, opt.Label)
+						}
 					}
+					questions[i] = askQuestionData{ID: q.ID, Options: labels}
 				}
-				onAskRequest(ev.Ask.ID, q.ID, labels)
+				onAskRequest(ev.Ask.ID, questions)
 			}
 		case "approval_request":
 			if ev.Approval != nil && ev.Approval.ID != "" {
