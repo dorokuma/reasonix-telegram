@@ -186,6 +186,35 @@ func TestFormat_tableInsideCodeBlock(t *testing.T) {
 	}
 }
 
+func TestFormat_stripLatexInline(t *testing.T) {
+	got := formatForTelegram("公式 \\(f-2h\\) 的结果")
+	want := "公式 f-2h 的结果"
+	if got != want {
+		t.Fatalf("want %q, got %q", want, got)
+	}
+}
+
+func TestFormat_stripLatexDisplay(t *testing.T) {
+	got := formatForTelegram("\\[\\frac{n(n+1)}{2}\\]")
+	// The formula content is preserved, just the delimiters are stripped
+	if stringsContains(got, "\\[") || stringsContains(got, "\\]") {
+		t.Fatalf("LaTeX delimiters not stripped: %q", got)
+	}
+	if !stringsContains(got, "\\frac") {
+		t.Fatalf("formula content lost: %q", got)
+	}
+}
+
+func TestFormat_latexInsideCodeBlock(t *testing.T) {
+	// LaTeX inside code blocks should have delimiters stripped too
+	// (code block protection runs after latex stripping)
+	input := "`\\(x^2\\)`"
+	got := formatForTelegram(input)
+	if !stringsContains(got, "<code>") {
+		t.Fatalf("expected code block in %q", got)
+	}
+}
+
 func stringsContains(s, substr string) bool {
 	return strings.Contains(s, substr)
 }

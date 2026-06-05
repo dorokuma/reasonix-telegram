@@ -217,6 +217,11 @@ func formatForTelegram(content string) string {
 	// converted later. Table blocks outside fenced code blocks only.
 	text = wrapMarkdownTables(text)
 
+	// 0c) Strip LaTeX math delimiters \( \) and \[ \].
+	// Telegram doesn't render LaTeX; remove the wrappers so users see
+	// the formula text directly instead of raw backslash-wrapped noise.
+	text = stripLatexDelimiters(text)
+
 	// 1) Protect fenced code blocks
 	text = reFenced.ReplaceAllStringFunc(text, func(match string) string {
 		// Extract language if present
@@ -345,6 +350,16 @@ func formatForTelegram(content string) string {
 	}
 
 	return text
+}
+
+// stripLatexDelimiters removes \( \) \[ \] wrappers from LaTeX math.
+// The formula content between them is preserved as plain text.
+func stripLatexDelimiters(s string) string {
+	// \[ ... \] → content
+	s = regexp.MustCompile(`\\\[([\s\S]*?)\\\]`).ReplaceAllString(s, "$1")
+	// \( ... \) → content
+	s = regexp.MustCompile(`\\\(([\s\S]*?)\\\)`).ReplaceAllString(s, "$1")
+	return s
 }
 
 // htmlEscape escapes &, <, > for safe HTML insertion.
