@@ -227,6 +227,7 @@ func registerCommands(bot *tgbotapi.BotAPI) error {
 		{Command: "restart", Description: "重启桥接"},
 		{Command: "health", Description: "所有 serve 进程状态"},
 		{Command: "sessions", Description: "活跃会话列表"},
+		{Command: "mode", Description: "切换模式：/mode chat 或 /mode tool"},
 	}
 	_, err := bot.Request(tgbotapi.NewSetMyCommands(cmds...))
 	return err
@@ -271,6 +272,7 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 			"• `/restart` — 重启桥接",
 			"• `/health` — 所有服务状态",
 			"• `/sessions` — 活跃会话",
+			"• `/mode chat|tool` — 切换模式",
 			"• 直接发消息 — 开始对话",
 			"",
 			fmt.Sprintf("单条最多 %d 字，超长自动连发；缓冲约 %d 字节，超时 %d 分钟",
@@ -325,6 +327,10 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 
 	case text == "/sessions":
 		a.sessionsHandler(m)
+		return
+
+	case strings.HasPrefix(text, "/mode"):
+		a.modeHandler(m, strings.TrimSpace(strings.TrimPrefix(text, "/mode")))
 		return
 	}
 
@@ -721,6 +727,37 @@ func (a *App) healthHandler(m *tgbotapi.Message) {
 		}
 	}
 	a.reply(m.Chat.ID, strings.Join(lines, "\n"))
+}
+
+func (a *App) modeHandler(m *tgbotapi.Message, arg string) {
+	arg = strings.ToLower(strings.TrimSpace(arg))
+	var newMode string
+	switch arg {
+	case "chat", "":
+		newMode = ModeChat
+	case "tool":
+		newMode = ModeTool
+	default:
+		a.reply(m.Chat.ID, "可用模式：`chat`（纯对话，工具关闭）或 `tool`（全能编程）\n用法：/mode chat 或 /mode tool")
+		return
+	}
+	if a.cfg.Mode == newMode {
+		a.reply(m.Chat.ID, fmt.Sprintf("当前已经是 %s 模式", newMode))
+		return
+	}
+	// Stop existing serve, switch mode, rewrite toml, restart.
+	a.stopServe(m.Chat.ID)
+	a.cfg.Mode = newMode
+	_ = a.ensureChatWorkdir()
+	if err := a.startServe(m.Chat.ID); err != nil {
+		a.reply(m.Chat.ID, fmt.Sprintf("切换模式失败: %v", err))
+		return
+	}
+	modeLabel := "纯对话（工具关闭）"
+	if newMode == ModeTool {
+		modeLabel = "全能编程（工具可用）"
+	}
+	a.reply(m.Chat.ID, fmt.Sprintf("已切换到 %s 模式\n%s", newMode, modeLabel))
 }
 
 func (a *App) sessionsHandler(m *tgbotapi.Message) {
