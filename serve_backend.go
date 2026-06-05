@@ -13,7 +13,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 )
@@ -279,7 +278,7 @@ func (a *App) lockServeMode(port int) {
 // runServeTurn submits a prompt to the long-lived reasonix serve process and
 // streams SSE events until turn_done. The conversation history stays in the
 // same Reasonix session file across Telegram messages and bridge restarts.
-func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onChunk func(string), onComplete func()) error {
+func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onChunk func(string), onComplete func(), onToolDispatch func()) error {
 	s := a.getOrCreateSession(chatID)
 	s.mu.Lock()
 	port := s.servePort
@@ -289,7 +288,7 @@ func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onC
 
 	eventsDone := make(chan turnResult, 1)
 	go func() {
-		eventsDone <- a.consumeServeEvents(ctx, port, onChunk, onComplete)
+		eventsDone <- a.consumeServeEvents(ctx, port, onChunk, onComplete, onToolDispatch)
 	}()
 
 	if err := postJSON(port, "/submit", map[string]string{"input": prompt}); err != nil {
@@ -310,7 +309,7 @@ func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onC
 	}
 }
 
-func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(string), onComplete func()) turnResult {
+func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(string), onComplete func(), onToolDispatch func()) turnResult {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serveBaseURL(port)+"/events", nil)
 	if err != nil {
 		return turnResult{err: err}
@@ -322,7 +321,6 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 	defer resp.Body.Close()
 
 	var turnErr error
-	var toolCancel sync.Once
 	var gotTextDelta bool
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
@@ -361,19 +359,16 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 					if ev.Tool.Partial {
 						continue
 					}
-					toolCancel.Do(func() {
-						log.Printf("chat-only: blocked tool %s, cancelling turn", ev.Tool.Name)
-						_ = postJSON(port, "/cancel", map[string]any{})
-					})
+					log.Printf("chat-only: blocked tool %s, cancelling turn", ev.Tool.Name)
+					_ = postJSON(port, "/cancel", map[string]any{})
 				}
 			} else {
-				// tool mode: notify user about tool usage
+				// tool mode: signal tool boundary, notify user
 				if ev.Tool != nil && !ev.Tool.Partial && ev.Tool.Name != "" {
-					msg := fmt.Sprintf("\n🔧 工具: %s", ev.Tool.Name)
-					if ev.Tool.Args != "" {
-						msg += "(" + ev.Tool.Args + ")"
+					if onToolDispatch != nil {
+						onToolDispatch()
 					}
-					onChunk(msg)
+					onChunk(fmt.Sprintf("\n🔧 工具: %s", ev.Tool.Name))
 				}
 			}
 		case "tool_result":
@@ -425,9 +420,64 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 	return turnResult{err: ctx.Err()}
 }
 
+// openThinkTags and closeThinkTags for stripping reasoning blocks.
+var openThinkTags = []string{
+	"<REASONING_SCRATCHPAD>", "<think>", "<reasoning>",
+	"<THINKING>", "<thinking>", "<thought>",
+}
+var closeThinkTags = []string{
+	"</REASONING_SCRATCHPAD>", "</think>", "</reasoning>",
+	"</THINKING>", "</thinking>", "</thought>",
+}
+
+// stripThinkBlocks removes content between known think/reasoning tags.
+func stripThinkBlocks(s string) string {
+	for i, open := range openThinkTags {
+		close := closeThinkTags[i]
+		for {
+			start := strings.Index(s, open)
+			if start < 0 {
+				break
+			}
+			end := strings.Index(s[start+len(open):], close)
+			if end < 0 {
+				// No closing tag — remove from open to end
+				s = s[:start]
+				break
+			}
+			end = start + len(open) + end + len(close)
+			s = s[:start] + s[end:]
+		}
+	}
+	return s
+}
+
+// isSilenceOnly returns true if the string is just a "silence" narration
+// (model telling itself to be quiet). Used to suppress empty-looking replies.
+func isSilenceOnly(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" || len(s) > 64 {
+		return false
+	}
+	cleaned := strings.Trim(s, "*_~` \t")
+	cleaned = strings.Trim(cleaned, ".…·•")
+	cleaned = strings.TrimSpace(cleaned)
+	if cleaned == "" || cleaned == "." || cleaned == "…" {
+		return true
+	}
+	lower := strings.ToLower(cleaned)
+	for _, p := range []string{"silent", "silence", "no response", "no reply"} {
+		if lower == p {
+			return true
+		}
+	}
+	return false
+}
+
 // appendChunk accumulates streamed assistant text (full buffer; finalize may split across messages).
 func appendChunk(buf *strings.Builder, chunk string, maxBytes int, truncated *bool) {
 	clean := stripANSI(chunk)
+	clean = stripThinkBlocks(clean)
 	if clean == "" || isReasonixNoise(clean) {
 		return
 	}

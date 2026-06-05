@@ -464,25 +464,36 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 	}()
 
 	var (
-		buf           strings.Builder
-		bufMu         sync.Mutex
-		draftMu       sync.Mutex
-		truncated     bool
-		finished      = make(chan struct{})
-		flushNow      = make(chan struct{}, 1) // reasonix "message" / turn_done — finalize early
-		pushWake      = make(chan struct{}, 1)
-		streamMsgID   int
-		draftID       = a.nextDraftID()
-		useDraft      = true
-		streamDone    bool
-		lastDraftBody string
+		buf            strings.Builder
+		bufMu          sync.Mutex
+		draftMu        sync.Mutex
+		truncated      bool
+		finished       = make(chan struct{})
+		flushNow       = make(chan struct{}, 1) // reasonix "message" / turn_done — finalize early
+		pushWake       = make(chan struct{}, 1)
+		newSegment     = make(chan struct{}, 1) // tool boundary: finalize + reset
+		streamMsgID    int
+		draftID        = a.nextDraftID()
+		useDraft       = true
+		streamDone     bool
+		lastDraftBody  string
+		msgCreatedAt   time.Time // when first draft/stream msg was sent
+		draftFailCount int      // consecutive draft failures in this turn
+		editFailCount  int      // consecutive edit failures in this turn
 	)
-	const streamDebounce = 50 * time.Millisecond
+	const (
+		maxDraftFailures = 3
+		maxEditFailures  = 3
+		freshFinalAfter  = 30 * time.Second
+		streamDebounce   = 50 * time.Millisecond
+	)
 	var procErr error
 	replyDelivered := false
 
 	// endStream mirrors TelePi finalizeResponse: set streamDone first, flush last
 	// draft frame, then sendMessage so no late sendMessageDraft lands after the real message.
+	// Fresh final: if the first preview was sent >30s ago, create a new message
+	// instead of editing the stale preview (so TG timestamp reflects completion time).
 	endStream := func() {
 		draftMu.Lock()
 		defer draftMu.Unlock()
@@ -506,12 +517,18 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		if tr {
 			body += "\n\n（内容过长，已截断尾部）"
 		}
+		// Fresh final: if msgCreatedAt is set and old, send as new message
+		// instead of editing the stale one.
+		useFreshFinal := !msgCreatedAt.IsZero() && time.Since(msgCreatedAt) > freshFinalAfter
 		var n int
-		if useDraft {
+		if useDraft && !useFreshFinal {
 			n = a.finalizeDraft(chatID, draftID, body)
 			log.Printf("chat=%d draftID=%d: finalize %d part(s) total=%d runes", chatID, draftID, n, utf8.RuneCountInString(body))
 		} else {
-			n = a.sendTextParts(chatID, body, &streamMsgID)
+			if useFreshFinal && streamMsgID > 0 {
+				log.Printf("chat=%d: fresh final (stale preview >%ds), sending new message", chatID, int(freshFinalAfter.Seconds()))
+			}
+			n = a.sendTextParts(chatID, body, nil)
 			if n == 0 {
 				log.Printf("chat=%d: finalize send failed (0 parts)", chatID)
 			}
@@ -539,19 +556,34 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				return
 			}
 			if a.sendDraft(chatID, draftID, preview) {
+				draftFailCount = 0
 				lastDraftBody = preview
+				if msgCreatedAt.IsZero() {
+					msgCreatedAt = time.Now()
+				}
 				return
 			}
-			useDraft = false
+			// Draft failed
+			draftFailCount++
+			if draftFailCount >= maxDraftFailures {
+				log.Printf("chat=%d: disabling draft stream after %d failures", chatID, draftFailCount)
+				useDraft = false
+			}
+			// Fall through to edit path for this frame
 		}
 		if streamMsgID == 0 {
 			sent, err := a.bot.Send(tgbotapi.NewMessage(chatID, preview))
 			if err != nil {
 				log.Printf("chat=%d: stream send failed: %v", chatID, err)
+				editFailCount++
 				return
 			}
+			editFailCount = 0
 			streamMsgID = sent.MessageID
 			lastDraftBody = preview
+			if msgCreatedAt.IsZero() {
+				msgCreatedAt = time.Now()
+			}
 			return
 		}
 		if preview == lastDraftBody {
@@ -559,7 +591,13 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		}
 		edit := tgbotapi.NewEditMessageText(chatID, streamMsgID, preview)
 		if _, err := a.bot.Send(edit); err == nil {
+			editFailCount = 0
 			lastDraftBody = preview
+			return
+		}
+		editFailCount++
+		if editFailCount >= maxEditFailures {
+			log.Printf("chat=%d: edit flood-silenced after %d failures", chatID, editFailCount)
 		}
 	}
 
@@ -586,6 +624,13 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				wakePush()
 			},
 			signalFlush,
+			func() {
+				// onToolDispatch: finalize current text segment and start fresh
+				select {
+				case newSegment <- struct{}{}:
+				default:
+				}
+			},
 		)
 		close(finished)
 	}()
@@ -608,6 +653,34 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			pushDraft()
 			endStream()
 		}
+		// newSegmentHandler finalizes the current text as a complete message,
+		// resets the buffer, and continues streaming in a new bubble.
+		// Used at tool boundaries (tool mode only).
+		newSegmentHandler := func() {
+			stopDebounce()
+			pushDraft()
+			draftMu.Lock()
+			bufMu.Lock()
+			body := strings.TrimSpace(buf.String())
+			buf.Reset()
+			truncated = false
+			bufMu.Unlock()
+			if body != "" {
+				if useDraft {
+					a.finalizeDraft(chatID, draftID, body)
+				} else {
+					a.sendTextParts(chatID, body, nil)
+				}
+				replyDelivered = true
+			}
+			// Reset draft/send state for next segment
+			draftID = a.nextDraftID()
+			useDraft = true
+			lastDraftBody = ""
+			streamMsgID = 0
+			msgCreatedAt = time.Now()
+			draftMu.Unlock()
+		}
 		for {
 			select {
 			case <-pushWake:
@@ -615,6 +688,8 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				debounce.Reset(streamDebounce)
 			case <-debounce.C:
 				pushDraft()
+			case <-newSegment:
+				newSegmentHandler()
 			case <-flushNow:
 				flushAndEnd()
 			case <-finished:
@@ -658,9 +733,18 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 	bufMu.Lock()
 	empty := strings.TrimSpace(buf.String()) == ""
 	bufMu.Unlock()
+
+	// Silence detection: if the only reply was silence narration, suppress it.
+	if !empty && isSilenceOnly(buf.String()) {
+		log.Printf("chat=%d: suppressed silence-only reply", chatID)
+		empty = true
+	}
+
 	if empty && streamMsgID == 0 && useDraft {
 		// sendMessage dismisses the native draft preview; never clearDraft(empty) here.
-		a.reply(chatID, "（模型没有返回文字）")
+		if !replyDelivered {
+			a.reply(chatID, "（模型没有返回文字）")
+		}
 	}
 	bufMu.Lock()
 	finalBody := strings.TrimSpace(buf.String())
