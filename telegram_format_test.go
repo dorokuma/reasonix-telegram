@@ -226,6 +226,8 @@ func TestFormat_asteriskEdgeCases(t *testing.T) {
 	}{
 		{"bold_double", "**解法A（经典）**"},
 		{"italic_one_two", "*解法A（经典）**"},
+		{"bold_code_placeholder", "**`turn_done`事件处理**"},
+		{"bold_code_placeholder_mid", "第一，**`turn_done`是唯一触发终结的信号**"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

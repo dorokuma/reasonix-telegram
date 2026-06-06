@@ -120,6 +120,16 @@ func telegramErrorIsMessageTooLong(err error) bool {
 	return strings.Contains(err.Error(), "MESSAGE_TOO_LONG")
 }
 
+func telegramErrorIsParseEntities(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "can't parse entities") ||
+		strings.Contains(s, "cant parse entities") ||
+		strings.Contains(s, "can't find end tag")
+}
+
 // telegramEditOK reports whether an edit failure can be treated as success.
 func telegramEditOK(err error) bool {
 	return err == nil || telegramErrorIsNotModified(err)
@@ -144,11 +154,22 @@ func capTelegramMessage(text string) string {
 }
 
 // sendTextParts delivers text as one or more Telegram messages (≤4096 runes each).
-// Text is automatically converted from markdown to Telegram HTML format.
+// Tries Telegram HTML first; on entity-parse failure retries as plain text (Hermes pattern).
 // If editFirstMsgID != nil and *editFirstMsgID > 0, the first part updates that message.
 func (a *App) sendTextParts(chatID int64, text string, editFirstMsgID *int) int {
-	text = formatForTelegram(text)
-	parts := splitTelegramText(text, telegramMaxMessageRunes)
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return 0
+	}
+	if n := a.sendFormattedParts(chatID, formatForTelegram(text), editFirstMsgID, "HTML"); n > 0 {
+		return n
+	}
+	log.Printf("chat=%d: HTML delivery failed, retrying plain text (%d runes)", chatID, utf8.RuneCountInString(text))
+	return a.sendFormattedParts(chatID, capTelegramMessage(text), editFirstMsgID, "")
+}
+
+func (a *App) sendFormattedParts(chatID int64, displayText string, editFirstMsgID *int, parseMode string) int {
+	parts := splitTelegramText(displayText, telegramMaxMessageRunes)
 	if len(parts) == 0 {
 		return 0
 	}
@@ -156,21 +177,28 @@ func (a *App) sendTextParts(chatID int64, text string, editFirstMsgID *int) int 
 	for i, part := range parts {
 		if i == 0 && editFirstMsgID != nil && *editFirstMsgID != 0 {
 			edit := tgbotapi.NewEditMessageText(chatID, *editFirstMsgID, part)
-			edit.ParseMode = "HTML"
-			if _, err := a.bot.Send(edit); err != nil {
-				if telegramErrorIsNotModified(err) {
-					return 1
-				}
-				log.Printf("chat=%d: edit part 1/%d failed: %v", chatID, len(parts), err)
-				return sent
+			if parseMode != "" {
+				edit.ParseMode = parseMode
 			}
-			sent++
-			continue
+			_, err := a.bot.Send(edit)
+			if telegramEditOK(err) {
+				return sent + 1
+			}
+			if telegramErrorIsParseEntities(err) {
+				return 0
+			}
+			log.Printf("chat=%d: edit part 1/%d failed: %v", chatID, len(parts), err)
+			return sent
 		}
 		msg := tgbotapi.NewMessage(chatID, part)
-		msg.ParseMode = "HTML"
+		if parseMode != "" {
+			msg.ParseMode = parseMode
+		}
 		m, err := a.bot.Send(msg)
 		if err != nil {
+			if telegramErrorIsParseEntities(err) {
+				return 0
+			}
 			log.Printf("chat=%d: send part %d/%d failed: %v", chatID, i+1, len(parts), err)
 			return sent
 		}

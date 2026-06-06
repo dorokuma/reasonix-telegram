@@ -302,9 +302,6 @@ func formatForTelegram(content string) string {
 		if len(parts) < 2 {
 			return match
 		}
-		if strings.Contains(parts[1], "§") {
-			return match
-		}
 		return ph("<b>" + htmlEscape(parts[1]) + "</b>")
 	})
 

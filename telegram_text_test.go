@@ -88,3 +88,13 @@ func TestTelegramEditOK(t *testing.T) {
 		t.Fatal("too long is not ok")
 	}
 }
+
+func TestTelegramErrorIsParseEntities(t *testing.T) {
+	err := errors.New(`Bad Request: can't parse entities: Can't find end tag corresponding to start tag "pre"`)
+	if !telegramErrorIsParseEntities(err) {
+		t.Fatal("expected parse entities detection")
+	}
+	if telegramErrorIsParseEntities(errors.New("MESSAGE_TOO_LONG")) {
+		t.Fatal("too long is not parse entities")
+	}
+}
