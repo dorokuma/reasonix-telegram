@@ -825,11 +825,12 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		body = strings.TrimSpace(body)
 		log.Printf("chat=%d: endStream bodyLen=%d bodyPreview=%q", chatID, len(body), logPreview(body, 100))
 		if body == "" {
-			// Dismiss any open draft (sendMessageDraft native preview).
-			log.Printf("chat=%d: endStream body empty, dismissing draft useDraft=%v", chatID, useDraft)
-			if useDraft {
-				a.dismissDraft(chatID, draftID)
-			}
+			// Do NOT call dismissDraft. An empty sendMessageDraft(text="")
+			// creates a "ghost bubble" in Telegram that is auto-revoked
+			// a few seconds later (see finalizeDraft comment). Let the
+			// old preview — if any — age out naturally; the next turn
+			// reuses/overwrites the same draftID.
+			log.Printf("chat=%d: endStream body empty, skip dismiss (would create ghost) useDraft=%v", chatID, useDraft)
 			return
 		}
 		if len(body) > maxFinalizeBytes {
@@ -1176,8 +1177,16 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				}
 				replyDelivered = true
 			}
-			// Reset draft/send state for next segment
-			draftID = a.nextDraftID()
+			// Decide whether to allocate a fresh draftID for the next segment.
+			// Only allocate if the previous segment actually emitted a draft
+			// (lastDraftBody != "" means pushDraft called sendMessageDraft
+			// successfully). If the previous segment was empty / no preview
+			// was ever sent to Telegram, reusing the current draftID is
+			// safer — a new draftID with no follow-up sendMessageDraft
+			// would leave a stale entry on Telegram and confuse finalize.
+			if lastDraftBody != "" || streamMsgID != 0 {
+				draftID = a.nextDraftID()
+			}
 			useDraft = true
 			lastDraftBody = ""
 			streamMsgID = 0

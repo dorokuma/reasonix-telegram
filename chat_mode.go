@@ -54,15 +54,24 @@ func (a *App) chatWorkdir() string {
 	return filepath.Join(a.cfg.StateDir, chatWorkdirSubdir)
 }
 
-// defaultReasonixTomlPath returns the path to the default reasonix.toml template.
+// ensureChatWorkdir prepares the per-chat reasonix workdir and writes a
+// per-mode reasonix.toml that overrides the global config (reasonix.toml
+// in the cwd wins over ~/.config/reasonix/config.toml). Without this, the
+// chat-mode tool lockdown defined in reasonixTomlContent() is dead code.
 func (a *App) ensureChatWorkdir() error {
 	wd := a.chatWorkdir()
 	if err := os.MkdirAll(wd, 0o755); err != nil {
 		return err
 	}
-	// Don't write reasonix.toml — serve reads global ~/.config/reasonix/config.toml.
-	// User edits config there directly; no hardcoded overrides in bridge code.
-	_ = os.Remove(filepath.Join(wd, "reasonix.toml"))
+	// Write per-mode reasonix.toml. reasonix resolves config in this order:
+	//   flag > ./reasonix.toml > ~/.config/reasonix/config.toml > defaults
+	// Without a local toml the global config (which has the full toolset
+	// enabled) wins and the chat-mode lockdown in reasonixTomlContent()
+	// is dead code. Writing it here makes chat-mode truly tool-free.
+	tomlPath := filepath.Join(wd, "reasonix.toml")
+	if err := os.WriteFile(tomlPath, []byte(a.reasonixTomlContent()), 0o644); err != nil {
+		return err
+	}
 	a.linkUserRulesIntoChatWD(wd)
 	return nil
 }
