@@ -97,6 +97,15 @@ func trimUTF8Bytes(s string, maxBytes int) string {
 	return s
 }
 
+// truncateForButton ensures text fits Telegram's 64-byte inline keyboard button text limit.
+func truncateForButton(text string) string {
+	const maxBtnBytes = 64
+	if len(text) <= maxBtnBytes {
+		return text
+	}
+	return trimUTF8Bytes(text, maxBtnBytes-3) + "…"
+}
+
 // sendTextParts delivers text as one or more Telegram messages (≤4096 runes each).
 // Text is automatically converted from markdown to Telegram HTML format.
 // If editFirstMsgID != nil and *editFirstMsgID > 0, the first part updates that message.

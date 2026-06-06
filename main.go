@@ -240,6 +240,12 @@ type session struct {
 	wakePusher       func() // signal the turn pusher to check for new content
 	model            string // per-session model override (empty = use global)
 	lastUsage        wireUsage // latest usage data from serve
+	// Cumulative session totals (accumulated across turns).
+	cumPrompt     int
+	cumCompletion int
+	cumTotal      int
+	cumCost       float64
+	cumCurrency   string
 }
 
 type runningTask struct {
@@ -318,11 +324,6 @@ func main() {
 	log.Printf("mode=%s workdir=%s", app.cfg.Mode, app.chatWorkdir())
 	log.Printf("telegram stream: sendMessageDraft + sendMessage finalize (TelePi/Hermes pattern)")
 
-	// Log restart reason on startup.
-	reason := app.detectRestartReason()
-	log.Printf("restart reason: %s", reason)
-	app.saveStartInfo(reason)
-
 	app.startRestartWatchdog()
 	app.restorePersistedSessions()
 	app.notifyBridgeRestarted()
@@ -336,7 +337,9 @@ func main() {
 		app.restartMu.Lock()
 		app.restarting = true
 		app.restartMu.Unlock()
-		// Wait for running tasks to finish naturally (max 5 min).
+		// Cancel running tasks so they exit cleanly (no "unexpected EOF").
+		app.cancelAllTasks()
+		// Wait for running tasks to finish (max 5 min).
 		app.waitTasksDone(5 * time.Minute)
 		log.Printf("shutdown: all tasks done, stopping serves…")
 		app.stopAllServes()
@@ -390,7 +393,7 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 	restarting := a.restarting
 	a.restartMu.Unlock()
 	if restarting {
-		a.reply(m.Chat.ID, "🔄 服务重启中，完成后会发 🟢 已连接 提示。")
+		a.reply(m.Chat.ID, "🔄 桥接重启中，完成后会自动通知。")
 		return
 	}
 	text := strings.TrimSpace(m.Text)
@@ -521,7 +524,6 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 		s := a.getOrCreateSession(m.Chat.ID)
 		s.mu.Lock()
 		busy := s.task != nil
-		u := s.lastUsage
 		model := s.model
 		s.mu.Unlock()
 		if model == "" {
@@ -530,6 +532,13 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 		modelName, _ := modelByID(model)
 		if modelName == "" {
 			modelName = model
+		}
+		// Strip provider prefix: keep only the model name.
+		// "custom-opencode-ai: deepseek-v4-flash ⭐" → "deepseek-v4-flash ⭐"
+		if idx := strings.LastIndex(modelName, ": "); idx >= 0 {
+			modelName = modelName[idx+2:]
+		} else if idx := strings.LastIndex(modelName, "/"); idx >= 0 {
+			modelName = modelName[idx+1:]
 		}
 		stateCN := "空闲"
 		if busy {
@@ -540,25 +549,52 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 			fmt.Sprintf("模式：%s", a.modeLabel()),
 			fmt.Sprintf("模型：%s", modelName),
 		}
-		// Last start info.
-		if si := loadStartInfo(a.cfg.StateDir); si != nil {
-			lines = append(lines, fmt.Sprintf("启动：%s", si.Time))
-			lines = append(lines, fmt.Sprintf("原因：%s (PID %d)", si.Reason, si.PID))
-		}
-		// Usage stats (only if we have data from the last turn).
-		if u.TotalTokens > 0 {
-			hitRate := 0.0
-			total := u.CacheHitTokens + u.CacheMissTokens
-			if total > 0 {
-				hitRate = float64(u.CacheHitTokens) / float64(total) * 100
-			}
+		// Usage stats — cumulative session totals.
+		s.mu.Lock()
+		cumPrompt := s.cumPrompt
+		cumCompletion := s.cumCompletion
+		cumTotal := s.cumTotal
+		cumCost := s.cumCost
+		cumCurrency := s.cumCurrency
+		// Session-cumulative cache from serve (if available).
+		sessHit := s.lastUsage.SessionCacheHitTokens
+		sessMiss := s.lastUsage.SessionCacheMissTokens
+		sessTotal := sessHit + sessMiss
+		s.mu.Unlock()
+
+		if cumTotal > 0 || sessTotal > 0 {
 			lines = append(lines, "")
-			lines = append(lines, fmt.Sprintf("输入 %d / 输出 %d / 共 %d tokens", u.PromptTokens, u.CompletionTokens, u.TotalTokens))
-			if total > 0 {
-				lines = append(lines, fmt.Sprintf("缓存命中：%d / %d（%.2f%%）", u.CacheHitTokens, total, hitRate))
+			if cumTotal > 0 {
+				lines = append(lines, fmt.Sprintf("输入 %d / 输出 %d / 共 %d tokens", cumPrompt, cumCompletion, cumTotal))
 			}
-			if u.Cost > 0 {
-				lines = append(lines, fmt.Sprintf("本轮花费：%.4f %s", u.Cost, u.Currency))
+			if sessTotal > 0 {
+				hitRate := float64(sessHit) / float64(sessTotal) * 100
+				lines = append(lines, fmt.Sprintf("缓存命中：%d / %d（%.2f%%）", sessHit, sessTotal, hitRate))
+			}
+			if cumCost > 0 {
+				lines = append(lines, fmt.Sprintf("总花费：%.4f %s", cumCost, cumCurrency))
+			}
+		}
+		// Context usage from serve.
+		s.mu.Lock()
+		port := s.servePort
+		s.mu.Unlock()
+		if port > 0 {
+			if used, window := fetchContext(port); window > 0 {
+				pct := used * 100 / window
+				threshold := 80 // default compact ratio
+				left := threshold - pct
+				if left < 0 {
+					left = 0
+				}
+				shortUsed := shortTokens(used)
+				shortWindow := shortTokens(window)
+				lines = append(lines, "")
+				if left > 0 {
+					lines = append(lines, fmt.Sprintf("上下文：%s / %s（%d%%）· %d%%后压缩", shortUsed, shortWindow, pct, left))
+				} else {
+					lines = append(lines, fmt.Sprintf("上下文：%s / %s（%d%%）· 即将压缩", shortUsed, shortWindow, pct))
+				}
 			}
 		}
 		a.reply(m.Chat.ID, strings.Join(lines, "\n"))
@@ -647,6 +683,13 @@ func (a *App) resetReasonixSession(chatID int64) {
 	if path == "" {
 		path = a.state.sessionPathForChat(chatID)
 	}
+	// Reset cumulative usage counters for the new session.
+	s.cumPrompt = 0
+	s.cumCompletion = 0
+	s.cumTotal = 0
+	s.cumCost = 0
+	s.cumCurrency = ""
+	s.lastUsage = wireUsage{}
 	s.mu.Unlock()
 	_ = os.Remove(path)
 	_ = a.state.remove(chatID)
@@ -772,7 +815,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			log.Printf("chat=%d: endStream called but streamDone already true", chatID)
 			return
 		}
-		log.Printf("chat=%d: endStream setting streamDone=true", chatID)
+		log.Printf("chat=%d: endStream setting streamDone=true useDraft=%v draftID=%d", chatID, useDraft, draftID)
 		streamDone = true
 
 		bufMu.Lock()
@@ -780,8 +823,10 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		tr := truncated
 		bufMu.Unlock()
 		body = strings.TrimSpace(body)
+		log.Printf("chat=%d: endStream bodyLen=%d bodyPreview=%q", chatID, len(body), logPreview(body, 100))
 		if body == "" {
 			// Dismiss any open draft (sendMessageDraft native preview).
+			log.Printf("chat=%d: endStream body empty, dismissing draft useDraft=%v", chatID, useDraft)
 			if useDraft {
 				a.dismissDraft(chatID, draftID)
 			}
@@ -1077,9 +1122,16 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				a.sendSafe(msg)
 			},
 			func(u wireUsage) {
-				// onUsage: store latest usage data for /status display.
+				// onUsage: accumulate session totals + store latest for /status.
 				s.mu.Lock()
 				s.lastUsage = u
+				s.cumPrompt += u.PromptTokens
+				s.cumCompletion += u.CompletionTokens
+				s.cumTotal += u.TotalTokens
+				s.cumCost += u.Cost
+				if u.Currency != "" {
+					s.cumCurrency = u.Currency
+				}
 				s.mu.Unlock()
 			},
 		)
@@ -1196,6 +1248,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		empty = true
 	}
 
+	log.Printf("chat=%d: finalCheck empty=%v replyDelivered=%v procErr=%v", chatID, empty, replyDelivered, procErr)
 	if empty && !replyDelivered {
 		a.reply(chatID, "（模型没有返回文字）")
 	}
@@ -1283,7 +1336,7 @@ func (a *App) modeHandler(m *tgbotapi.Message, arg string) {
 	a.restartMu.Lock()
 	if a.restarting {
 		a.restartMu.Unlock()
-		a.reply(m.Chat.ID, "🔄 服务重启中，稍后再试。")
+		a.reply(m.Chat.ID, "🔄 桥接重启中，稍后再试。")
 		return
 	}
 	a.restartMu.Unlock()
@@ -1318,7 +1371,7 @@ func (a *App) modelHandler(m *tgbotapi.Message, arg string) {
 	a.restartMu.Lock()
 	if a.restarting {
 		a.restartMu.Unlock()
-		a.reply(m.Chat.ID, "🔄 服务重启中，稍后再试。")
+		a.reply(m.Chat.ID, "🔄 桥接重启中，稍后再试。")
 		return
 	}
 	a.restartMu.Unlock()
@@ -1416,6 +1469,68 @@ func (a *App) sendModelPicker(chatID int64, page int) {
 	a.sendSafe(msg)
 }
 
+// editModelPicker edits an existing picker message with a new page of models.
+func (a *App) editModelPicker(chatID int64, messageID int, page int) {
+	total := len(availableModels)
+	totalPages := (total + modelsPerPage - 1) / modelsPerPage
+	if page < 0 {
+		page = 0
+	}
+	if page >= totalPages {
+		page = totalPages - 1
+	}
+
+	start := page * modelsPerPage
+	end := start + modelsPerPage
+	if end > total {
+		end = total
+	}
+
+	s := a.getOrCreateSession(chatID)
+	s.mu.Lock()
+	current := s.model
+	if current == "" {
+		current = a.cfg.Model
+	}
+	s.mu.Unlock()
+
+	var rows [][]tgbotapi.InlineKeyboardButton
+	for i := start; i < end; i++ {
+		m := availableModels[i]
+		label := m.Name
+		if m.ID == current {
+			label = "✅ " + label
+		}
+		data := fmt.Sprintf("%s%s", prefixModel, m.ID)
+		rows = append(rows, []tgbotapi.InlineKeyboardButton{
+			{Text: label, CallbackData: &data},
+		})
+	}
+
+	// Pagination row
+	if totalPages > 1 {
+		var nav []tgbotapi.InlineKeyboardButton
+		if page > 0 {
+			pdata := fmt.Sprintf("%s%s:%d", prefixModel, actionPage, page-1)
+			nav = append(nav, tgbotapi.InlineKeyboardButton{Text: "◀️ 上一页", CallbackData: &pdata})
+		}
+		nav = append(nav, tgbotapi.InlineKeyboardButton{Text: fmt.Sprintf("%d/%d", page+1, totalPages), CallbackData: strPtr("_")})
+		if page < totalPages-1 {
+			pdata := fmt.Sprintf("%s%s:%d", prefixModel, actionPage, page+1)
+			nav = append(nav, tgbotapi.InlineKeyboardButton{Text: "下一页 ▶️", CallbackData: &pdata})
+		}
+		rows = append(rows, nav)
+	}
+
+	text := fmt.Sprintf("🤖 选择模型（当前：%s）", a.modelDisplayName(current))
+	edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
+	edit.ParseMode = "HTML"
+	edit.ReplyMarkup = &tgbotapi.InlineKeyboardMarkup{InlineKeyboard: rows}
+	if _, err := a.bot.Request(edit); err != nil {
+		log.Printf("edit model picker failed: %v", err)
+	}
+}
+
 func strPtr(s string) *string { return &s }
 
 func (a *App) modelDisplayName(id string) string {
@@ -1423,6 +1538,35 @@ func (a *App) modelDisplayName(id string) string {
 		return name
 	}
 	return id
+}
+
+// fetchContext queries the reasonix serve /context endpoint for used/window tokens.
+func fetchContext(port int) (used, window int) {
+	resp, err := http.Get(serveBaseURL(port) + "/context")
+	if err != nil {
+		return 0, 0
+	}
+	defer resp.Body.Close()
+	var c struct {
+		Used   int `json:"used"`
+		Window int `json:"window"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&c); err != nil {
+		return 0, 0
+	}
+	return c.Used, c.Window
+}
+
+// shortTokens formats a token count as 1.2K, 142.0K, 1.0M, etc.
+func shortTokens(n int) string {
+	switch {
+	case n >= 1_000_000:
+		return fmt.Sprintf("%.1fM", float64(n)/1_000_000)
+	case n >= 1_000:
+		return fmt.Sprintf("%.1fK", float64(n)/1_000)
+	default:
+		return itoa(n)
+	}
 }
 
 func (a *App) switchModel(chatID int64, modelID, modelName string) {
@@ -1457,7 +1601,7 @@ func (a *App) effortHandler(m *tgbotapi.Message, arg string) {
 	a.restartMu.Lock()
 	if a.restarting {
 		a.restartMu.Unlock()
-		a.reply(m.Chat.ID, "🔄 服务重启中，稍后再试。")
+		a.reply(m.Chat.ID, "🔄 桥接重启中，稍后再试。")
 		return
 	}
 	a.restartMu.Unlock()
@@ -1613,10 +1757,10 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 			return // no-op (page indicator)
 		}
 		if strings.HasPrefix(payload, actionPage+":") {
-			// Pagination
+			// Pagination — edit current message instead of sending a new one
 			pageStr := strings.TrimPrefix(payload, actionPage+":")
 			page, _ := strconv.Atoi(pageStr)
-			a.sendModelPicker(chatID, page)
+			a.editModelPicker(chatID, cq.Message.MessageID, page)
 			return
 		}
 		// Model selection
@@ -1632,11 +1776,12 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 			current = a.cfg.Model
 		}
 		s.mu.Unlock()
+		// Delete the picker message entirely — bubble + buttons both gone.
+		a.deleteMessage(chatID, cq.Message.MessageID)
 		if modelID == current {
 			a.reply(chatID, fmt.Sprintf("当前已经是 %s", name))
 			return
 		}
-		a.removeKeyboard(chatID, cq.Message.MessageID)
 		a.switchModel(chatID, modelID, name)
 		return
 	}
@@ -1879,6 +2024,13 @@ func (a *App) removeKeyboard(chatID int64, messageID int) {
 	})
 	if _, err := a.bot.Request(edit); err != nil {
 		log.Printf("remove keyboard failed: %v", err)
+	}
+}
+
+// deleteMessage deletes a message entirely.
+func (a *App) deleteMessage(chatID int64, messageID int) {
+	if _, err := a.bot.Request(tgbotapi.NewDeleteMessage(chatID, messageID)); err != nil {
+		log.Printf("delete message failed: %v", err)
 	}
 }
 

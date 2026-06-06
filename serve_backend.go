@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -30,6 +31,21 @@ func serveAddr(port int) string {
 
 func serveBaseURL(port int) string {
 	return fmt.Sprintf("http://%s", serveAddr(port))
+}
+
+// wireUsage mirrors usage stats from the reasonix serve SSE stream.
+type wireUsage struct {
+	PromptTokens     int     `json:"promptTokens"`
+	CompletionTokens int     `json:"completionTokens"`
+	TotalTokens      int     `json:"totalTokens"`
+	CacheHitTokens   int     `json:"cacheHitTokens,omitempty"`
+	CacheMissTokens  int     `json:"cacheMissTokens,omitempty"`
+	Cost             float64 `json:"cost,omitempty"`
+	Currency         string  `json:"currency,omitempty"`
+	CostUSD          float64 `json:"costUsd,omitempty"`
+	// Session-cumulative cache stats (sent by serve, per-turn fields dropped).
+	SessionCacheHitTokens  int `json:"sessionCacheHitTokens,omitempty"`
+	SessionCacheMissTokens int `json:"sessionCacheMissTokens,omitempty"`
 }
 
 // wireEvent mirrors reasonix serve SSE JSON (internal/serve/wire.go).
@@ -49,7 +65,8 @@ type wireEvent struct {
 		ID   string `json:"id"`
 		Tool string `json:"tool"`
 	} `json:"approval,omitempty"`
-	Ask *wireAsk `json:"ask,omitempty"`
+	Ask   *wireAsk    `json:"ask,omitempty"`
+	Usage *wireUsage  `json:"usage,omitempty"`
 }
 
 // wireAsk mirrors reasonix serve's ask_request event (internal/serve/wire.go).
@@ -60,6 +77,8 @@ type wireAsk struct {
 
 type wireAskQuestion struct {
 	ID      string          `json:"id"`
+	Prompt  string          `json:"prompt,omitempty"`
+	Multi   bool            `json:"multi,omitempty"`
 	Options []wireAskOption `json:"options"`
 }
 
@@ -80,6 +99,22 @@ type turnResult struct {
 
 func (a *App) reasonixEnv() []string {
 	env := os.Environ()
+	// Ensure /root/.local/bin is in PATH (rtk lives there).
+	hasLocalBin := false
+	for _, e := range env {
+		if strings.HasPrefix(e, "PATH=") && strings.Contains(e, "/root/.local/bin") {
+			hasLocalBin = true
+			break
+		}
+	}
+	if !hasLocalBin {
+		for i, e := range env {
+			if strings.HasPrefix(e, "PATH=") {
+				env[i] = e + ":/root/.local/bin"
+				break
+			}
+		}
+	}
 	if k := os.Getenv("DEEPSEEK_API_KEY"); k != "" {
 		env = append(env, "DEEPSEEK_API_KEY="+k)
 	}
@@ -89,7 +124,7 @@ func (a *App) reasonixEnv() []string {
 		"REASONIX_CACHE_DIR="+cacheBase,
 		"XDG_CACHE_HOME="+cacheBase,
 	)
-	if a.cfg.Mode == ModeChat {
+	if a.getMode() == ModeChat {
 		env = append(env, "NO_COLOR=1", "FORCE_COLOR=0", "CI=1", "TERM=dumb")
 	}
 	return env
@@ -107,11 +142,19 @@ func (a *App) serveRunning(s *session) bool {
 
 func (a *App) stopServe(chatID int64) {
 	s := a.getOrCreateSession(chatID)
+	a.stopSessionServe(s, chatID)
+}
+
+// stopSessionServe stops the serve command for an already-looked-up session.
+// Used by stopServe and stopAllServes (which holds sessMu). Does NOT lock sessMu.
+func (a *App) stopSessionServe(s *session, chatID int64) {
 	s.mu.Lock()
 	cmd := s.serveCmd
 	s.serveCmd = nil
 	s.mu.Unlock()
 	if cmd != nil && cmd.Process != nil {
+		// Send SIGTERM and wait for serve to flush session data.
+		log.Printf("chat=%d: stopping serve (pid %d), waiting for session flush…", chatID, cmd.Process.Pid)
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 		waitDone := make(chan struct{})
 		go func() {
@@ -120,7 +163,8 @@ func (a *App) stopServe(chatID int64) {
 		}()
 		select {
 		case <-waitDone:
-		case <-time.After(5 * time.Second):
+			log.Printf("chat=%d: serve exited cleanly", chatID)
+		case <-time.After(10 * time.Second):
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 			<-waitDone
 		}
@@ -141,6 +185,7 @@ func (a *App) startServe(chatID int64) error {
 	s.workdir = wd
 	sessionPath := s.sessionPath
 	port := s.servePort
+	model := s.model // per-session model override
 	s.mu.Unlock()
 
 	if sessionPath == "" {
@@ -165,8 +210,12 @@ func (a *App) startServe(chatID int64) error {
 	}
 
 	args := []string{"serve", "--addr", serveAddr(port)}
-	if a.cfg.Model != "" {
-		args = append(args, "--model", a.cfg.Model)
+	// Use per-session model if set, otherwise fall back to global config.
+	if model == "" {
+		model = a.cfg.Model
+	}
+	if model != "" {
+		args = append(args, "--model", model)
 	}
 	// Always --resume so auto-save stays on sessionPath (not ~/.config, which is
 	// read-only under systemd ProtectHome).
@@ -205,7 +254,7 @@ func (a *App) startServe(chatID int64) error {
 	}
 	// Lock plan/bypass in chat mode (tool mode leaves them on).
 	a.lockServeMode(port)
-	log.Printf("chat=%d: serve cwd=%s mode=%s", chatID, wd, a.cfg.Mode)
+	log.Printf("chat=%d: serve cwd=%s mode=%s", chatID, wd, a.getMode())
 	if err := a.state.upsert(chatRecord{
 		ChatID: chatID, Workdir: wd, SessionPath: sessionPath, Port: port,
 	}); err != nil {
@@ -292,7 +341,7 @@ func postJSON(port int, path string, body any) error {
 }
 
 func (a *App) lockServeMode(port int) {
-	if a.cfg.Mode == ModeChat {
+	if a.getMode() == ModeChat {
 		_ = postJSON(port, "/plan", map[string]bool{"on": false})
 		_ = postJSON(port, "/bypass", map[string]bool{"on": false})
 	}
@@ -302,7 +351,7 @@ func (a *App) lockServeMode(port int) {
 // runServeTurn submits a prompt to the long-lived reasonix serve process and
 // streams SSE events until turn_done. The conversation history stays in the
 // same Reasonix session file across Telegram messages and bridge restarts.
-func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string), onAskRequest func(askID string, questions []askQuestionData), onApprovalRequest func(approvalID string, toolName string)) error {
+func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string) int, onAskRequest func(askID string, questions []askQuestionData), onApprovalRequest func(approvalID string, toolName string), onUsage func(wireUsage)) error {
 	s := a.getOrCreateSession(chatID)
 	s.mu.Lock()
 	port := s.servePort
@@ -312,7 +361,7 @@ func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onC
 
 	eventsDone := make(chan turnResult, 1)
 	go func() {
-		eventsDone <- a.consumeServeEvents(ctx, port, onChunk, onComplete, onToolDispatch, onCommentary, onAskRequest, onApprovalRequest)
+		eventsDone <- a.consumeServeEvents(ctx, chatID, port, onChunk, onComplete, onToolDispatch, onCommentary, onAskRequest, onApprovalRequest, onUsage)
 	}()
 
 	if err := postJSON(port, "/submit", map[string]string{"input": prompt}); err != nil {
@@ -333,7 +382,7 @@ func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onC
 	}
 }
 
-func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string), onAskRequest func(askID string, questions []askQuestionData), onApprovalRequest func(approvalID string, toolName string)) turnResult {
+func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string) int, onAskRequest func(askID string, questions []askQuestionData), onApprovalRequest func(approvalID string, toolName string), onUsage func(wireUsage)) turnResult {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serveBaseURL(port)+"/events", nil)
 	if err != nil {
 		return turnResult{err: err}
@@ -347,11 +396,32 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 	var turnErr error
 	var gotTextDelta bool
 	var cancelOnce sync.Once
+	var lastToolMsgID int
+	var lastToolText string // raw text of last tool dispatch (for appending result)
+	var lastToolName string // last dispatched tool name (for consolidation)
+	var toolCount int      // consecutive same-tool calls
 	var bufferingAsk bool // true while accumulating question text for ask tool
 	var askTextBuffer strings.Builder
+
+	// SSE idle watchdog: close body if no data for 5 min (Hermes-inspired).
+	var lastActivityUnix int64 = time.Now().Unix()
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			elapsed := time.Now().Unix() - atomic.LoadInt64(&lastActivityUnix)
+			if elapsed > 300 {
+				log.Printf("port=%d: SSE idle for %ds, closing stream", port, elapsed)
+				resp.Body.Close()
+				return
+			}
+		}
+	}()
+
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
 	for sc.Scan() {
+		atomic.StoreInt64(&lastActivityUnix, time.Now().Unix())
 		line := sc.Text()
 		if !strings.HasPrefix(line, "data: ") {
 			continue
@@ -379,15 +449,18 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 					onChunk(ev.Text)
 				}
 			}
-			// Finalize UI as soon as the full message is known (often before turn_done).
-			if ev.Text != "" && onComplete != nil {
+			// Only signal flush if we actually added new text.
+			// If gotTextDelta is true, text was already streamed and pushed
+			// by the debounce timer — signaling again would send a duplicate.
+			if ev.Text != "" && !gotTextDelta && onComplete != nil {
+				log.Printf("chat=%d: onComplete via message event", chatID)
 				onComplete()
 			}
 		case "reasoning":
 			// Hidden in Telegram — reasoning is verbose and also arrives as deltas.
 			continue
 		case "tool_dispatch":
-			if a.cfg.Mode == ModeChat {
+			if a.getMode() == ModeChat {
 				if ev.Tool != nil {
 					if ev.Tool.Partial {
 						continue
@@ -410,38 +483,73 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 						onToolDispatch()
 					}
 					emoji := toolEmoji(ev.Tool.Name)
-					msg := fmt.Sprintf("%s %s", emoji, ev.Tool.Name)
+					newLine := fmt.Sprintf("%s %s", emoji, ev.Tool.Name)
 					if ev.Tool.Args != "" {
-						// Trim long args for display
-						args := trimUTF8Bytes(ev.Tool.Args, 200)
-						msg += "\n" + args
+						summary := formatToolArgs(ev.Tool.Name, ev.Tool.Args)
+						if summary != "" {
+							newLine = summary
+						}
 					}
-					if onCommentary != nil {
-						onCommentary(msg)
+
+					// Consolidate consecutive same-tool calls into one line with count.
+					if ev.Tool.Name == lastToolName && lastToolMsgID != 0 && toolCount > 0 {
+						toolCount++
+						var updated string
+						if toolCount == 2 {
+							// First consolidation: append (x2)
+							updated = lastToolText + fmt.Sprintf(" (x%d)", toolCount)
+						} else {
+							// Subsequent: replace (xN) with (xN+1)
+							oldSuffix := fmt.Sprintf(" (x%d)", toolCount-1)
+							newSuffix := fmt.Sprintf(" (x%d)", toolCount)
+							updated = strings.Replace(lastToolText, oldSuffix, newSuffix, 1)
+						}
+						_ = a.editCommentary(chatID, lastToolMsgID, updated)
+						lastToolText = updated
+						continue
 					}
+					// Different tool (or first tool): start a new line.
+					toolCount = 1
+					lastToolName = ev.Tool.Name
+					if lastToolMsgID != 0 {
+						// Append to existing progress message.
+						fullText := lastToolText + "\n" + newLine
+						_ = a.editCommentary(chatID, lastToolMsgID, fullText)
+						lastToolText = fullText
+					} else if onCommentary != nil {
+						lastToolMsgID = onCommentary(newLine)
+						lastToolText = newLine
+					}
+					continue
 				}
 			}
 		case "tool_result":
-			if a.cfg.Mode != ModeChat {
+			if a.getMode() != ModeChat {
 				if ev.Tool != nil {
-					emoji := toolEmoji(ev.Tool.Name)
-					msg := ""
-					if ev.Tool.Err != "" {
-						msg = fmt.Sprintf("%s ❌: %s", emoji, trimUTF8Bytes(ev.Tool.Err, 500))
-					} else if ev.Tool.Output != "" {
-						// Brief result preview
-						preview := trimUTF8Bytes(strings.TrimSpace(ev.Tool.Output), 300)
-						msg = fmt.Sprintf("%s ✅: %s", emoji, preview)
+					// Skip hook-only noise.
+					if isHookOnlyOutput(ev.Tool.Err) || isHookOnlyOutput(ev.Tool.Output) {
+						continue
 					}
-					if msg != "" && onCommentary != nil {
-						onCommentary(msg)
+					if lastToolMsgID != 0 {
+						if ev.Tool.Err != "" {
+							errMsg := stripHookMessages(ev.Tool.Err)
+							if errMsg != "" {
+								newText := lastToolText + "\n❌ " + trimUTF8Bytes(errMsg, 300)
+								_ = a.editCommentary(chatID, lastToolMsgID, newText)
+								lastToolText = newText
+							}
+						}
+						// Keep lastToolMsgID alive so next tool appends to this bubble.
 					}
 				}
 			}
 		case "ask_request":
-			log.Printf("port=%d: ask_request event (%d questions)", port, len(ev.Ask.Questions))
+			if ev.Ask != nil {
+				for _, q := range ev.Ask.Questions {
+					log.Printf("port=%d: ask_request q.id=%s q.prompt=%q", port, q.ID, q.Prompt)
+				}
+			}
 			bufferingAsk = false
-			questionText := strings.TrimSpace(askTextBuffer.String())
 			askTextBuffer.Reset()
 			if ev.Ask != nil && len(ev.Ask.Questions) > 0 && onAskRequest != nil {
 				questions := make([]askQuestionData, len(ev.Ask.Questions))
@@ -454,7 +562,7 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 
 						// Attach question text
 					}
-					questions[i] = askQuestionData{ID: q.ID, Options: labels, Text: questionText}
+					questions[i] = askQuestionData{ID: q.ID, Options: labels, Text: q.Prompt}
 				}
 				onAskRequest(ev.Ask.ID, questions)
 			}
@@ -468,11 +576,18 @@ func (a *App) consumeServeEvents(ctx context.Context, port int, onChunk func(str
 					onApprovalRequest(ev.Approval.ID, toolName)
 				}
 			}
+		case "usage":
+			if ev.Usage != nil && onUsage != nil {
+				log.Printf("port=%d: usage prompt=%d completion=%d total=%d cost=$%.4f", port, ev.Usage.PromptTokens, ev.Usage.CompletionTokens, ev.Usage.TotalTokens, ev.Usage.CostUSD)
+				onUsage(*ev.Usage)
+			}
 		case "turn_done":
+			log.Printf("chat=%d: turn_done err=%q", chatID, ev.Err)
 			if ev.Err != "" {
 				turnErr = fmt.Errorf("%s", ev.Err)
 			}
 			if onComplete != nil {
+				log.Printf("chat=%d: onComplete via turn_done", chatID)
 				onComplete()
 			}
 			return turnResult{err: turnErr}

@@ -12,7 +12,7 @@ const chatWorkdirSubdir = "chat-wd"
 // In chat mode: lock down tools/LSP/codegraph.
 // In tool mode: open config with permissions=allow + codegraph/LSP on.
 func (a *App) reasonixTomlContent() string {
-	if a.cfg.Mode == ModeTool {
+	if a.getMode() == ModeTool {
 		return `# reasonix-telegram: tool mode (managed by the bridge)
 [agent]
 auto_plan = "ask"
@@ -26,6 +26,12 @@ auto_install = true
 
 [permissions]
 mode = "allow"
+
+[sandbox]
+workspace_root = "/"
+allow_write = ["/**"]
+bash = "off"
+network = true
 `
 	}
 	return `# reasonix-telegram: chat mode — tool lockdown (managed by the bridge)
@@ -48,14 +54,15 @@ func (a *App) chatWorkdir() string {
 	return filepath.Join(a.cfg.StateDir, chatWorkdirSubdir)
 }
 
+// defaultReasonixTomlPath returns the path to the default reasonix.toml template.
 func (a *App) ensureChatWorkdir() error {
 	wd := a.chatWorkdir()
 	if err := os.MkdirAll(wd, 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(wd, "reasonix.toml"), []byte(a.reasonixTomlContent()), 0o644); err != nil {
-		return err
-	}
+	// Don't write reasonix.toml — serve reads global ~/.config/reasonix/config.toml.
+	// User edits config there directly; no hardcoded overrides in bridge code.
+	_ = os.Remove(filepath.Join(wd, "reasonix.toml"))
 	a.linkUserRulesIntoChatWD(wd)
 	return nil
 }

@@ -12,8 +12,8 @@ import (
 )
 
 const (
-	msgRestarting = "🔄 服务重启中，请稍候…"
-	msgConnected  = "🟢 服务已连接，桥接已恢复。"
+	msgRestarting = "🔄 桥接重启中，请稍候..."
+	msgConnected  = "✅ 桥接已重新就绪"
 )
 
 type restartNotifyFile struct {
@@ -96,15 +96,28 @@ func clearRestartNotify(stateDir string) {
 }
 
 func (a *App) notifyBridgeRestarted() {
+	// Collect chats to notify: those saved via graceful /restart + all restored sessions.
+	notified := map[int64]bool{}
+
 	chats, err := loadRestartNotify(a.cfg.StateDir)
 	if err != nil {
 		log.Printf("restart notify load: %v", err)
+	}
+	for _, c := range chats {
+		notified[c] = true
+	}
+
+	// Also notify all active sessions (covers SIGTERM/systemctl restart).
+	a.sessMu.Lock()
+	for chatID := range a.sess {
+		notified[chatID] = true
+	}
+	a.sessMu.Unlock()
+
+	if len(notified) == 0 {
 		return
 	}
-	if len(chats) == 0 {
-		return
-	}
-	for _, chatID := range chats {
+	for chatID := range notified {
 		a.reply(chatID, msgConnected)
 		log.Printf("chat=%d: sent post-restart connected notice", chatID)
 	}
@@ -146,9 +159,9 @@ func (a *App) stopAllServes() {
 		}
 	}
 	a.sessMu.Lock()
-	for chatID := range a.sess {
+	for chatID, s := range a.sess {
 		if _, ok := seen[chatID]; !ok {
-			a.stopServe(chatID)
+			a.stopSessionServe(s, chatID)
 		}
 	}
 	a.sessMu.Unlock()
@@ -181,7 +194,7 @@ func (a *App) gracefulServiceRestart(chatID int64) {
 	a.restartMu.Lock()
 	if a.restarting {
 		a.restartMu.Unlock()
-		a.reply(chatID, "⏳ 已在重启中，请稍候…")
+		a.reply(chatID, "⏳ 已在重启中，请稍候...")
 		return
 	}
 	a.restarting = true
@@ -201,7 +214,7 @@ func (a *App) gracefulServiceRestart(chatID int64) {
 
 	go func() {
 		a.cancelAllTasks()
-		a.waitTasksDone(5 * time.Second)
+		a.waitTasksDone(30 * time.Second)
 		a.stopAllServes()
 		time.Sleep(500 * time.Millisecond)
 

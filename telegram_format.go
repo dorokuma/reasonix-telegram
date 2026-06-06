@@ -12,9 +12,18 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
 	"regexp"
 	"strings"
 )
+
+// _MDV2_ESCAPE_RE matches characters that need escaping in Telegram MarkdownV2.
+var _MDV2_ESCAPE_RE = regexp.MustCompile(`([_*\[\]()~` + "`" + `>#\+\-=|{}.!\\])`)
+
+func _escape_mdv2(s string) string {
+	return _MDV2_ESCAPE_RE.ReplaceAllString(s, `\$1`)
+}
 
 // markdown formatting regexps — compiled once.
 var (
@@ -26,8 +35,8 @@ var (
 	reLink = regexp.MustCompile(`\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)`)
 	// Header: # ... up to ######
 	reHeader = regexp.MustCompile(`(?m)^#{1,6}\s+(.+)$`)
-	// Bold: **text** or __text__
-	reBold = regexp.MustCompile(`\*\*(.+?)\*\*`)
+	// Bold: **text** (content cannot contain *, avoids *** conflicts)
+	reBold = regexp.MustCompile(`\*\*([^*\n]+)\*\*`)
 	// Italic: *text* (single asterisk, not across newlines)
 	// Also handles *text** (model sometimes outputs two closing asterisks)
 	reItalic = regexp.MustCompile(`\*([^*\n]+)\*(\*)?`)
@@ -37,7 +46,7 @@ var (
 	reSpoiler = regexp.MustCompile(`\|\|(.+?)\|\|`)
 	// Unordered list item: - or * at line start
 	reUlItem = regexp.MustCompile(`(?m)^\s*[-*+]\s+(.+)$`)
-	// Ordered list item: 1. at line start
+	// Ordered list item: 1. at line start (skip lines with | — those are table rows)
 	reOlItem = regexp.MustCompile(`(?m)^\s*\d+\.\s+(.+)$`)
 	// Blockquote: > at line start
 	reBlockquote = regexp.MustCompile(`(?m)^>\s?(.*)$`)
@@ -182,7 +191,7 @@ func renderTableBlock(headerLine string, dataRows []string) string {
 			bullets = append(bullets, "• "+header+": "+val)
 		}
 
-		group := "**" + heading + "**"
+		group := heading
 		for _, b := range bullets {
 			group += "\n" + b
 		}
@@ -198,37 +207,49 @@ func formatForTelegram(content string) string {
 	if content == "" {
 		return content
 	}
+	content = stripHookMessages(content)
+	if content == "" {
+		return ""
+	}
 
+	// Hermes-style placeholder: \x00PH{counter}\x00
+	// Null bytes survive Telegram's text processing.
+	// Ordered slice + map: insertion order tracked so restoration runs in
+	// reverse order (same as Hermes), guaranteeing nested placeholders resolve.
 	placeholders := map[string]string{}
+	var phOrder []string
 	counter := 0
 	ph := func(value string) string {
-		key := "\x00PH\x00" + itoa(counter) + "\x00"
+		key := fmt.Sprintf("\x00PH%d\x00", counter)
 		counter++
 		placeholders[key] = value
+		phOrder = append(phOrder, key)
 		return key
+	}
+
+	// Inline code: extracted to list, NOT using ph().
+	type codeEntry struct{ html string }
+	var inlineCodes []codeEntry
+	extractInlineCode := func(html string) string {
+		idx := len(inlineCodes)
+		inlineCodes = append(inlineCodes, codeEntry{html: html})
+		return fmt.Sprintf("§%d§", idx)
 	}
 
 	text := content
 
-	// 0a) Horizontal rules → full-width separator
+	// 0a) Horizontal rules
 	text = reHr.ReplaceAllString(text, "\n━━━━━━━━━━━━━━\n")
-
-	// 0b) Convert GFM pipe tables to Telegram-friendly row groups.
-	// Must run before code block protection so **bold** in headers gets
-	// converted later. Table blocks outside fenced code blocks only.
+	// 0b) GFM pipe tables
 	text = wrapMarkdownTables(text)
-
-	// 0c) Strip LaTeX math delimiters \( \) and \[ \].
-	// Telegram doesn't render LaTeX; remove the wrappers so users see
-	// the formula text directly instead of raw backslash-wrapped noise.
+	// 0c) Strip LaTeX delimiters
 	text = stripLatexDelimiters(text)
 
 	// 1) Protect fenced code blocks
 	text = reFenced.ReplaceAllStringFunc(text, func(match string) string {
-		// Extract language if present
 		inner := match
 		if idx := strings.Index(inner, "\n"); idx >= 0 {
-			_ = strings.TrimSpace(inner[3:idx]) // lang hint, unused for now
+			_ = strings.TrimSpace(inner[3:idx])
 			inner = inner[idx+1:]
 		} else {
 			inner = inner[3:]
@@ -236,53 +257,58 @@ func formatForTelegram(content string) string {
 		if strings.HasSuffix(inner, "```") {
 			inner = inner[:len(inner)-3]
 		}
-		// Trim trailing newline from the code body
 		inner = strings.TrimRight(inner, "\n")
 		inner = htmlEscape(inner)
 		return ph("<pre>" + inner + "</pre>")
 	})
 
-	// 2) Protect inline code
+	// 2) Extract inline code
 	text = reInlineCode.ReplaceAllStringFunc(text, func(match string) string {
 		inner := match[1 : len(match)-1]
-		return ph("<code>" + htmlEscape(inner) + "</code>")
+		return extractInlineCode("<code>" + htmlEscape(inner) + "</code>")
 	})
 
-	// 3) Convert links [text](url) → <a href="url">text</a>
+	// 3) Links
 	text = reLink.ReplaceAllStringFunc(text, func(match string) string {
 		parts := reLink.FindStringSubmatch(match)
 		if len(parts) < 3 {
 			return match
 		}
 		display := htmlEscape(parts[1])
-		url := htmlEscape(parts[2])
+		rawURL := parts[2]
+		if strings.HasPrefix(strings.ToLower(rawURL), "javascript:") || strings.HasPrefix(strings.ToLower(rawURL), "data:") {
+			return display
+		}
+		url := htmlEscape(rawURL)
 		return ph("<a href=\"" + url + "\">" + display + "</a>")
 	})
 
-	// 4) Convert headers → <b>header</b> (strip inner markdown markers)
+	// 4) Headers
 	text = reHeader.ReplaceAllStringFunc(text, func(match string) string {
 		parts := reHeader.FindStringSubmatch(match)
 		if len(parts) < 2 {
 			return match
 		}
 		inner := strings.TrimSpace(parts[1])
-		// Strip bold/italic markers from header text
 		inner = strings.ReplaceAll(inner, "**", "")
 		inner = strings.ReplaceAll(inner, "__", "")
 		inner = strings.ReplaceAll(inner, "*", "")
 		return ph("<b>" + htmlEscape(inner) + "</b>")
 	})
 
-	// 5) Convert bold **text**
+	// 5) Bold — content cannot contain * (avoids conflicts with *** and italic)
 	text = reBold.ReplaceAllStringFunc(text, func(match string) string {
 		parts := reBold.FindStringSubmatch(match)
 		if len(parts) < 2 {
 			return match
 		}
+		if strings.Contains(parts[1], "§") {
+			return match
+		}
 		return ph("<b>" + htmlEscape(parts[1]) + "</b>")
 	})
 
-	// 6) Convert italic *text* (single asterisk)
+	// 6) Italic
 	text = reItalic.ReplaceAllStringFunc(text, func(match string) string {
 		parts := reItalic.FindStringSubmatch(match)
 		if len(parts) < 2 {
@@ -291,7 +317,8 @@ func formatForTelegram(content string) string {
 		return ph("<i>" + htmlEscape(parts[1]) + "</i>")
 	})
 
-	// 7) Convert strikethrough ~~text~~
+
+	// 7) Strikethrough
 	text = reStrike.ReplaceAllStringFunc(text, func(match string) string {
 		parts := reStrike.FindStringSubmatch(match)
 		if len(parts) < 2 {
@@ -300,7 +327,7 @@ func formatForTelegram(content string) string {
 		return ph("<s>" + htmlEscape(parts[1]) + "</s>")
 	})
 
-	// 8) Convert spoiler ||text||
+	// 8) Spoiler
 	text = reSpoiler.ReplaceAllStringFunc(text, func(match string) string {
 		parts := reSpoiler.FindStringSubmatch(match)
 		if len(parts) < 2 {
@@ -309,7 +336,7 @@ func formatForTelegram(content string) string {
 		return ph(`<span class="tg-spoiler">` + htmlEscape(parts[1]) + `</span>`)
 	})
 
-	// 9) Convert unordered list items
+	// 9) Unordered list
 	text = reUlItem.ReplaceAllStringFunc(text, func(match string) string {
 		parts := reUlItem.FindStringSubmatch(match)
 		if len(parts) < 2 {
@@ -318,8 +345,11 @@ func formatForTelegram(content string) string {
 		return ph("• " + htmlEscape(strings.TrimSpace(parts[1])))
 	})
 
-	// 10) Convert ordered list items
+	// 10) Ordered list (skip table rows with |)
 	text = reOlItem.ReplaceAllStringFunc(text, func(match string) string {
+		if strings.Contains(match, "|") {
+			return match
+		}
 		parts := reOlItem.FindStringSubmatch(match)
 		if len(parts) < 2 {
 			return match
@@ -327,39 +357,43 @@ func formatForTelegram(content string) string {
 		return ph(htmlEscape(strings.TrimSpace(parts[1])))
 	})
 
-	// 11) Convert blockquotes
+	// 11) Blockquotes
 	text = reBlockquote.ReplaceAllStringFunc(text, func(match string) string {
 		parts := reBlockquote.FindStringSubmatch(match)
 		if len(parts) < 2 {
 			return match
 		}
-		inner := htmlEscape(strings.TrimSpace(parts[1]))
-		return ph("<blockquote>" + inner + "</blockquote>")
+		return ph("<blockquote>" + htmlEscape(strings.TrimSpace(parts[1])) + "</blockquote>")
 	})
 
-	// 12) HTML-escape remaining plain text (&, <, >)
+	// 12) HTML-escape remaining plain text
 	text = htmlEscape(text)
 
-	// 13) Restore placeholders (reverse order so nested resolve correctly)
-	keys := make([]string, 0, len(placeholders))
-	for k := range placeholders {
-		keys = append(keys, k)
+	// 13) Restore ph() placeholders in reverse insertion order (Hermes-style)
+	//     Ordered slice guarantees nested placeholders resolve correctly.
+	for i := len(phOrder) - 1; i >= 0; i-- {
+		text = strings.ReplaceAll(text, phOrder[i], placeholders[phOrder[i]])
 	}
-	// Reverse for safe nesting
-	for i := len(keys) - 1; i >= 0; i-- {
-		text = strings.ReplaceAll(text, keys[i], placeholders[keys[i]])
+
+	// 14) Restore inline code
+	for i, entry := range inlineCodes {
+		text = strings.ReplaceAll(text, fmt.Sprintf("§%d§", i), entry.html)
 	}
 
 	return text
 }
 
-// stripLatexDelimiters removes \( \) \[ \] wrappers from LaTeX math.
-// The formula content between them is preserved as plain text.
+	// Placeholder system for fenced code blocks, links, headers, bold, italic, etc.
+	// Uses «N» delimiters that survive Telegram.
+// reLatexDisplay and reLatexInline match LaTeX math delimiters.
+var (
+	reLatexDisplay = regexp.MustCompile(`\\\[([\s\S]*?)\\\]`)
+	reLatexInline  = regexp.MustCompile(`\\\(([\s\S]*?)\\\)`)
+)
+
 func stripLatexDelimiters(s string) string {
-	// \[ ... \] → content
-	s = regexp.MustCompile(`\\\[([\s\S]*?)\\\]`).ReplaceAllString(s, "$1")
-	// \( ... \) → content
-	s = regexp.MustCompile(`\\\(([\s\S]*?)\\\)`).ReplaceAllString(s, "$1")
+	s = reLatexDisplay.ReplaceAllString(s, "$1")
+	s = reLatexInline.ReplaceAllString(s, "$1")
 	return s
 }
 
@@ -421,4 +455,184 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return digits
+}
+
+// stripHookMessages removes RTK hook interception messages from tool output.
+func stripHookMessages(output string) string {
+	var lines []string
+	for _, line := range strings.Split(output, "\n") {
+		if strings.Contains(line, "blocked: hook") || strings.Contains(line, "[project/PreToolUse]") || strings.Contains(line, "RTK supports this command") || strings.Contains(line, "Please add 'rtk' prefix") {
+			continue
+		}
+		lines = append(lines, line)
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
+}
+
+// isHookOnlyOutput returns true if the output contains only hook block messages.
+func isHookOnlyOutput(output string) bool {
+	if output == "" {
+		return false
+	}
+	return strings.TrimSpace(stripHookMessages(output)) == ""
+}
+
+// formatToolArgs extracts a human-readable summary from tool JSON args.
+func formatToolArgs(toolName, argsJSON string) string {
+	var m map[string]any
+	if err := json.Unmarshal([]byte(argsJSON), &m); err != nil {
+		return trimUTF8Bytes(argsJSON, 100)
+	}
+	// Extract the most meaningful field per tool type.
+	switch toolName {
+	case "grep", "codegraph_search":
+		if q, ok := m["pattern"].(string); ok && q != "" && len(q) > 1 {
+			return "💬 " + trimUTF8Bytes(q, 80)
+		}
+		return ""
+	case "codegraph_explore":
+		// No args usually
+		return ""
+	case "codegraph_callees", "codegraph_callers", "codegraph_impact":
+		if q, ok := m["name"].(string); ok && q != "" {
+			return "🏷 " + q
+		}
+	case "codegraph_context":
+		if f, ok := m["file"].(string); ok && f != "" {
+			line := ""
+			if l, ok := m["line"].(float64); ok && l > 0 {
+				line = fmt.Sprintf(":%d", int(l))
+			}
+			return "📄 " + trimUTF8Bytes(f, 60) + line
+		}
+	case "codegraph_files":
+		if p, ok := m["pattern"].(string); ok && p != "" {
+			return "📁 " + p
+		}
+	case "read_file":
+		if p, ok := m["path"].(string); ok && p != "" && len(p) > 3 {
+			return "📄 " + trimUTF8Bytes(p, 80)
+		}
+		return ""
+	case "write_file", "edit_file", "multi_edit":
+		if p, ok := m["path"].(string); ok && p != "" && len(p) > 3 {
+			return "📄 " + trimUTF8Bytes(p, 80)
+		}
+		return ""
+	case "bash":
+		if cmd, ok := m["command"].(string); ok && cmd != "" {
+			return "💻 " + trimUTF8Bytes(cmd, 100)
+		}
+	case "ls":
+		if p, ok := m["path"].(string); ok && p != "" && len(p) > 2 {
+			return "📁 " + trimUTF8Bytes(p, 80)
+		}
+		return ""
+	case "glob":
+		if p, ok := m["pattern"].(string); ok && p != "" && len(p) > 2 {
+			return "📁 " + p
+		}
+		return ""
+	case "search_web":
+		if q, ok := m["query"].(string); ok && q != "" {
+			return "🔍 " + trimUTF8Bytes(q, 80)
+		}
+	case "web_fetch", "read_url":
+		if u, ok := m["url"].(string); ok && u != "" {
+			return "🌐 " + trimUTF8Bytes(u, 80)
+		}
+	case "remember":
+		if t, ok := m["title"].(string); ok && t != "" {
+			return "🧠 " + t
+		}
+	case "ask":
+		// Don't show args for ask tool
+		return ""
+	}
+	// Fallback: show first short string value.
+	for _, v := range m {
+		if s, ok := v.(string); ok && len(s) > 0 && len(s) < 100 {
+			return "💬 " + trimUTF8Bytes(s, 80)
+		}
+	}
+	return ""
+}
+
+// formatToolResult formats tool output for compact Telegram display.
+func formatToolResult(toolName, output string) string {
+	output = strings.TrimSpace(output)
+	if output == "" {
+		return "(empty)"
+	}
+	// Directory listing tools: format as compact grid.
+	switch toolName {
+	case "ls", "glob", "codegraph_files":
+		return formatDirListing(output)
+	case "grep", "codegraph_search", "codegraph_trace":
+		return formatSearchResult(output)
+	}
+	// General: truncate with ellipsis.
+	return trimUTF8Bytes(output, 300)
+}
+
+// formatDirListing renders a vertical file list as a compact 2-3 column grid.
+func formatDirListing(output string) string {
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	var items []string
+	for _, l := range lines {
+		l = strings.TrimSpace(l)
+		if l != "" {
+			items = append(items, l)
+		}
+	}
+	if len(items) == 0 {
+		return "(empty)"
+	}
+	if len(items) <= 6 {
+		// Few items: simple bullet list.
+		var b strings.Builder
+		for i, item := range items {
+			if i > 0 {
+				b.WriteString("  ")
+			}
+			b.WriteString(item)
+		}
+		return b.String()
+	}
+	// Many items: compact grid, 3 columns.
+	var b strings.Builder
+	cols := 3
+	for i, item := range items {
+		if i > 0 {
+			if i%cols == 0 {
+				b.WriteString("\n")
+			} else {
+				b.WriteString("  ")
+			}
+		}
+		b.WriteString(item)
+	}
+	total := len(items)
+	if total > 30 {
+		b.WriteString(fmt.Sprintf("\n… 共 %d 项", total))
+	}
+	return b.String()
+}
+
+// formatSearchResult formats grep/search output for compact display.
+func formatSearchResult(output string) string {
+	lines := strings.Split(strings.TrimSpace(output), "\n")
+	if len(lines) <= 5 {
+		return trimUTF8Bytes(output, 300)
+	}
+	// Show first 3 matches + count.
+	var b strings.Builder
+	for i := 0; i < 3 && i < len(lines); i++ {
+		if i > 0 {
+			b.WriteString("\n")
+		}
+		b.WriteString(trimUTF8Bytes(lines[i], 80))
+	}
+	b.WriteString(fmt.Sprintf("\n… 共 %d 条匹配", len(lines)))
+	return b.String()
 }
