@@ -196,16 +196,13 @@ func (a *App) startServe(chatID int64) error {
 		s.mu.Unlock()
 	}
 
-	if _, err := os.Stat(sessionPath); os.IsNotExist(err) {
-		if err := os.WriteFile(sessionPath, nil, 0o644); err != nil {
-			return err
-		}
-	}
 	msgs, users, _ := sessionStats(sessionPath)
-	resume := users > 0
-	if resume {
+	if users > 0 {
 		log.Printf("chat=%d: resume session %s (%d messages, %d user turns)", chatID, sessionPath, msgs, users)
 	} else {
+		// No pre-created empty JSONL — an empty --resume file used to replace the
+		// boot-time system prompt and drop global REASONIX.md from the model context.
+		_ = os.Remove(sessionPath)
 		log.Printf("chat=%d: new session at %s", chatID, sessionPath)
 	}
 
@@ -217,8 +214,8 @@ func (a *App) startServe(chatID int64) error {
 	if model != "" {
 		args = append(args, "--model", model)
 	}
-	// Always --resume so auto-save stays on sessionPath (not ~/.config, which is
-	// read-only under systemd ProtectHome).
+	// Always --resume so auto-save stays on sessionPath (not ~/.config/reasonix/sessions).
+	// Reasonix Resume now re-applies the boot system prompt even when the file is empty.
 	args = append(args, "--resume", sessionPath)
 
 	cmd := exec.Command(a.cfg.ReasonixBin, args...)
@@ -395,6 +392,8 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 
 	var turnErr error
 	var gotTextDelta bool
+	var sawToolDispatch bool
+	var reasoningBuf strings.Builder
 	var cancelOnce sync.Once
 	var lastToolMsgID int
 	var lastToolText string // raw text of last tool dispatch (for appending result)
@@ -417,6 +416,22 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 			}
 		}
 	}()
+
+	// Hermes handles reasoning-only turns in the agent loop (prefill continuation
+	// + retries). Reasonix accepts them as a successful final answer, so the bridge
+	// must recover visible text from accumulated reasoning when no text deltas arrive.
+	flushReasoningFallback := func() {
+		if !shouldFlushReasoningFallback(gotTextDelta, sawToolDispatch) {
+			return
+		}
+		body, ok := reasoningFallbackBody(reasoningBuf.String())
+		if !ok {
+			return
+		}
+		gotTextDelta = true
+		log.Printf("chat=%d: reasoning-only fallback len=%d runes=%d", chatID, len(body), utf8RuneCount(body))
+		onChunk(body)
+	}
 
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
@@ -443,21 +458,26 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 				}
 			}
 		case "message":
-			// Full answer at end; normally duplicates "text" deltas — use as fallback only.
+			// Full answer at end of an agent sub-step; normally duplicates "text" deltas.
+			// Never signal onComplete here — only turn_done ends the Telegram stream.
+			// Mid-turn message events (tool rounds, prefill) used to finalize early and
+			// drop the real answer after web_search / multi-step tools.
+			if ev.Reasoning != "" {
+				reasoningBuf.WriteString(ev.Reasoning)
+			}
 			if ev.Text != "" && !gotTextDelta {
+				gotTextDelta = true
 				if !bufferingAsk {
 					onChunk(ev.Text)
 				}
 			}
-			// Only signal flush if we actually added new text.
-			// If gotTextDelta is true, text was already streamed and pushed
-			// by the debounce timer — signaling again would send a duplicate.
-			if ev.Text != "" && !gotTextDelta && onComplete != nil {
-				log.Printf("chat=%d: onComplete via message event", chatID)
-				onComplete()
-			}
 		case "reasoning":
-			// Hidden in Telegram — reasoning is verbose and also arrives as deltas.
+			// Accumulate for end-of-turn fallback; do not stream live (too verbose).
+			if ev.Text != "" {
+				reasoningBuf.WriteString(ev.Text)
+			} else if ev.Reasoning != "" {
+				reasoningBuf.WriteString(ev.Reasoning)
+			}
 			continue
 		case "tool_dispatch":
 			if a.getMode() == ModeChat {
@@ -473,6 +493,7 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 			} else {
 				// tool mode: signal tool boundary, then send commentary
 				if ev.Tool != nil && !ev.Tool.Partial && ev.Tool.Name != "" {
+					sawToolDispatch = true
 					// ask tool: buffer text as question, handled by ask_request event
 					if ev.Tool.Name == "ask" {
 						bufferingAsk = true
@@ -586,6 +607,7 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 			if ev.Err != "" {
 				turnErr = fmt.Errorf("%s", ev.Err)
 			}
+			flushReasoningFallback()
 			if onComplete != nil {
 				log.Printf("chat=%d: onComplete via turn_done", chatID)
 				onComplete()
@@ -633,6 +655,23 @@ func stripThinkBlocks(s string) string {
 		}
 	}
 	return s
+}
+
+func shouldFlushReasoningFallback(gotTextDelta, sawToolDispatch bool) bool {
+	return !gotTextDelta && !sawToolDispatch
+}
+
+// reasoningFallbackBody returns visible text when a turn produced only reasoning.
+func reasoningFallbackBody(reasoning string) (string, bool) {
+	body := strings.TrimSpace(stripThinkBlocks(stripANSI(reasoning)))
+	if body == "" || isReasonixNoise(body) || isSilenceOnly(body) {
+		return "", false
+	}
+	return body, true
+}
+
+func utf8RuneCount(s string) int {
+	return len([]rune(s))
 }
 
 // isSilenceOnly returns true if the string is just a "silence" narration

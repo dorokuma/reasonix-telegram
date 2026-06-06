@@ -191,7 +191,7 @@ func renderTableBlock(headerLine string, dataRows []string) string {
 			bullets = append(bullets, "• "+header+": "+val)
 		}
 
-		group := heading
+		group := "**" + heading + "**"
 		for _, b := range bullets {
 			group += "\n" + b
 		}

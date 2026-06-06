@@ -78,14 +78,14 @@ func (a *App) ensureChatWorkdir() error {
 
 // linkUserRulesIntoChatWD symlinks the user's existing rules file into chat-wd so
 // Reasonix memory load picks them up. Does not write or edit rule content.
-// CHAT_RULES_FILE env overrides; else tries /root/AGENTS.md then /root/REASONIX.md.
+// CHAT_RULES_FILE env overrides; else ~/.config/reasonix/REASONIX.md (same as TUI).
 func (a *App) linkUserRulesIntoChatWD(wd string) {
 	src := strings.TrimSpace(os.Getenv("CHAT_RULES_FILE"))
 	if src == "" {
-		for _, c := range []string{"/root/AGENTS.md", "/root/REASONIX.md"} {
-			if st, err := os.Stat(c); err == nil && !st.IsDir() {
-				src = c
-				break
+		if dir, err := os.UserConfigDir(); err == nil {
+			candidate := filepath.Join(dir, "reasonix", "REASONIX.md")
+			if st, err := os.Stat(candidate); err == nil && !st.IsDir() {
+				src = candidate
 			}
 		}
 	}

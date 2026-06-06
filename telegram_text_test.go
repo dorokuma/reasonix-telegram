@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -49,4 +50,14 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func TestTelegramErrorIsNotModified(t *testing.T) {
+	err := errors.New(`Bad Request: message is not modified: specified new message content and reply markup are exactly the same`)
+	if !telegramErrorIsNotModified(err) {
+		t.Fatal("expected not-modified detection")
+	}
+	if telegramErrorIsNotModified(nil) {
+		t.Fatal("nil should be false")
+	}
 }

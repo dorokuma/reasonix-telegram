@@ -106,6 +106,13 @@ func truncateForButton(text string) string {
 	return trimUTF8Bytes(text, maxBtnBytes-3) + "…"
 }
 
+func telegramErrorIsNotModified(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "message is not modified")
+}
+
 // sendTextParts delivers text as one or more Telegram messages (≤4096 runes each).
 // Text is automatically converted from markdown to Telegram HTML format.
 // If editFirstMsgID != nil and *editFirstMsgID > 0, the first part updates that message.
@@ -121,6 +128,9 @@ func (a *App) sendTextParts(chatID int64, text string, editFirstMsgID *int) int 
 			edit := tgbotapi.NewEditMessageText(chatID, *editFirstMsgID, part)
 			edit.ParseMode = "HTML"
 			if _, err := a.bot.Send(edit); err != nil {
+				if telegramErrorIsNotModified(err) {
+					return 1
+				}
 				log.Printf("chat=%d: edit part 1/%d failed: %v", chatID, len(parts), err)
 				return sent
 			}
