@@ -421,10 +421,9 @@ func toolEmoji(name string) string {
 		"mcp__jina__search_web", "mcp__jina__search",
 		"mcp__brave__search", "mcp__tavily__search",
 		"mcp__kagi__search", "mcp__serpapi__search":
-		// Spider web — visually distinct from 💬/🗨️ speech balloons, and the
-		// "web" in "web search" + the "crawling the web" metaphor make it
-		// unambiguous even to users seeing it for the first time.
-		return "🕸️"
+		// Globe with meridians — the canonical "the web" symbol. User found
+		// this far more recognizable than the spider-web alternative.
+		return "🌐"
 
 	case "read_url", "mcp__jina__read_url":
 		// Same family as web_fetch — fetch a URL and read it. Share the
