@@ -27,6 +27,12 @@ auto_install = true
 [permissions]
 mode = "allow"
 
+[tools]
+enabled = []   # all built-ins; do not inherit a partial global whitelist
+
+[tools.search]
+engine = "rtk"
+
 [sandbox]
 workspace_root = "/"
 allow_write = ["/**"]

@@ -71,6 +71,12 @@ func isReasonixNoise(line string) bool {
 	if strings.TrimSpace(line) == "" {
 		return false // preserve blank lines; the scanner trims these implicitly
 	}
+	if strings.Contains(line, "回复未向用户展示正文") {
+		return true // agent visibility-recovery operator notice, not user content
+	}
+	if strings.HasPrefix(line, "background ") {
+		return true // background job start/finish/kill notices
+	}
 	return reTokenStats.MatchString(line) ||
 		reStatusDot.MatchString(line) ||
 		reThinkingBar.MatchString(line)
@@ -428,9 +434,9 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 			cidNum := atomic.AddUint64(&a.clarifySeq, 1)
 			pc.clarifyID = strconv.FormatUint(cidNum, 36)
 			// Snapshot data needed outside lock.
-			qText := htmlEscape(strings.TrimSpace(nextQ.Text))
+			qText := _escapeMdv2(strings.TrimSpace(nextQ.Text))
 			if qText == "" {
-				qText = htmlEscape(strings.TrimSpace(nextQ.ID))
+				qText = _escapeMdv2(strings.TrimSpace(nextQ.ID))
 			}
 			if qText == "" {
 				qText = "请选择："
@@ -444,7 +450,7 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 			a.removeKeyboard(m.Chat.ID, prevMsgID)
 			replyText := "❓ " + header + qText
 			msg := tgbotapi.NewMessage(m.Chat.ID, replyText)
-			msg.ParseMode = "HTML"
+			msg.ParseMode = "MarkdownV2"
 			if len(options) > 0 {
 				var rows [][]tgbotapi.InlineKeyboardButton
 				for i, choice := range options {
@@ -744,7 +750,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 	s.mu.Unlock()
 	a.dismissSessionDraft(chatID)
 
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(3 * time.Second)
 	for {
 		s.mu.Lock()
 		busy := s.task != nil
@@ -753,10 +759,10 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			break
 		}
 		if time.Now().After(deadline) {
-			log.Printf("WARN: chat=%d previous turn didn't exit in 10s", chatID)
+			log.Printf("WARN: chat=%d previous turn didn't exit in 3s", chatID)
 			break
 		}
-		time.Sleep(100 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
 
 	if err := a.ensureServe(chatID); err != nil {
@@ -810,6 +816,12 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 	)
 	var procErr error
 	replyDelivered := false
+	releaseTask := func() {
+		s.mu.Lock()
+		s.task = nil
+		s.wakePusher = nil
+		s.mu.Unlock()
+	}
 	// endStream mirrors TelePi finalizeResponse: set streamDone first, flush last
 	// draft frame, then sendMessage so no late sendMessageDraft lands after the real message.
 	// Fresh final: if the first preview was sent >30s ago, create a new message
@@ -819,6 +831,11 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		defer draftMu.Unlock()
 		if streamDone {
 			return
+		}
+		if draftShown || liveDraftEver {
+			a.clearDraftPreview(chatID, draftID)
+			draftShown = false
+			liveDraftEver = false
 		}
 
 		bufMu.Lock()
@@ -839,6 +856,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				lastDraftBody = ""
 			}
 			streamDone = true
+			releaseTask()
 			log.Printf("chat=%d: endStream body empty, clearedDraft=%v useDraft=%v", chatID, hadPreview, useDraft)
 			return
 		}
@@ -902,6 +920,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		if n > 0 {
 			replyDelivered = true
 			streamDone = true
+			releaseTask()
 		}
 	}
 
@@ -960,7 +979,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		if streamMsgID == 0 {
 			previewHTML := formatForTelegram(preview)
 			msg := tgbotapi.NewMessage(chatID, previewHTML)
-			msg.ParseMode = "HTML"
+			msg.ParseMode = "MarkdownV2"
 			sent, err := a.bot.Send(msg)
 			if err != nil {
 				log.Printf("chat=%d: stream send failed: %v", chatID, err)
@@ -984,7 +1003,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		}
 		previewHTML := formatForTelegram(preview)
 		edit := tgbotapi.NewEditMessageText(chatID, streamMsgID, previewHTML)
-		edit.ParseMode = "HTML"
+		edit.ParseMode = "MarkdownV2"
 		_, err := a.bot.Send(edit)
 		if telegramEditOK(err) {
 			editFailCount = 0
@@ -1001,6 +1020,9 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 	}
 
 	signalFlush := func() {
+		// Native sendMessageDraft holds the Telegram composer until dismissed — do not
+		// wait for finalize/sendMessage; unblock the user as soon as the model finishes.
+		a.dismissSessionDraft(chatID)
 		select {
 		case flushNow <- struct{}{}:
 		default:
@@ -1047,7 +1069,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				// Don't touch draftMu to avoid contention with pusher goroutine.
 				text = capTelegramMessage(text)
 				msg := tgbotapi.NewMessage(chatID, formatForTelegram(text))
-				msg.ParseMode = "HTML"
+				msg.ParseMode = "MarkdownV2"
 				sent, err := a.bot.Send(msg)
 				if err != nil {
 					log.Printf("chat=%d: commentary send failed: %v", chatID, err)
@@ -1103,9 +1125,9 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				s.mu.Unlock()
 
 				// Send question with header + question text + options with descriptions
-				qText := htmlEscape(strings.TrimSpace(q.Text))
+				qText := _escapeMdv2(strings.TrimSpace(q.Text))
 				if qText == "" {
-					qText = htmlEscape(strings.TrimSpace(q.ID))
+					qText = _escapeMdv2(strings.TrimSpace(q.ID))
 				}
 				if qText == "" {
 					qText = "请选择："
@@ -1116,7 +1138,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				}
 				text := "❓ " + header + qText
 				msg := tgbotapi.NewMessage(chatID, text)
-				msg.ParseMode = "HTML"
+				msg.ParseMode = "MarkdownV2"
 				if len(q.Options) > 0 {
 					var rows [][]tgbotapi.InlineKeyboardButton
 					for i, choice := range q.Options {
@@ -1188,12 +1210,12 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				}
 				s.mu.Unlock()
 
-				text := fmt.Sprintf("%s 需要批准：%s", emoji, htmlEscape(label))
+				text := fmt.Sprintf("%s 需要批准：%s", emoji, _escapeMdv2(label))
 				onceData := fmt.Sprintf("%s:%s", apID, actionOnce)
 				sessionData := fmt.Sprintf("%s:%s", apID, actionSession)
 				denyData := fmt.Sprintf("%s:%s", apID, actionDeny)
 				msg := tgbotapi.NewMessage(chatID, text)
-				msg.ParseMode = "HTML"
+				msg.ParseMode = "MarkdownV2"
 				msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
 					[]tgbotapi.InlineKeyboardButton{
 						{Text: "✅ 批准一次", CallbackData: &onceData},
@@ -1422,7 +1444,8 @@ func draftHadPreview(lastDraftBody string) bool {
 }
 
 func draftNeedsCleanup(draftShown, liveDraftEver bool, lastDraftBody string) bool {
-	return draftShown || liveDraftEver || draftHadPreview(lastDraftBody)
+	_ = lastDraftBody // edit-in-place preview; not a native sendMessageDraft
+	return draftShown || liveDraftEver
 }
 
 // clearDraftPreview retires a live sendMessageDraft bubble. Only safe when a
@@ -1447,11 +1470,10 @@ func (a *App) finalizeDraft(chatID int64, draftID int64, text string, hadLiveDra
 		}
 		return 0
 	}
-	n := a.sendTextParts(chatID, text, nil)
-	if n > 0 && hadLiveDraft {
+	if hadLiveDraft {
 		a.clearDraftPreview(chatID, draftID)
 	}
-	return n
+	return a.sendTextParts(chatID, text, nil)
 }
 
 func (a *App) trackSessionDraft(chatID int64, draftID int64) {
@@ -1495,7 +1517,7 @@ func (a *App) sendDraft(chatID int64, draftID int64, text string) bool {
 		"chat_id":    strconv.FormatInt(chatID, 10),
 		"draft_id":   strconv.FormatInt(draftID, 10),
 		"text":       text,
-		"parse_mode": "HTML",
+		"parse_mode": "MarkdownV2",
 	})
 	if err != nil {
 		log.Printf("sendMessageDraft failed (fallback to edit): %v", err)
@@ -1670,7 +1692,7 @@ func (a *App) sendModelPicker(chatID int64, page int) {
 
 	text := fmt.Sprintf("🤖 选择模型（当前：%s）", a.modelDisplayName(current))
 	msg := tgbotapi.NewMessage(chatID, text)
-	msg.ParseMode = "HTML"
+	msg.ParseMode = "MarkdownV2"
 	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
 	a.sendSafe(msg)
 }
@@ -1730,7 +1752,7 @@ func (a *App) editModelPicker(chatID int64, messageID int, page int) {
 
 	text := fmt.Sprintf("🤖 选择模型（当前：%s）", a.modelDisplayName(current))
 	edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
-	edit.ParseMode = "HTML"
+	edit.ParseMode = "MarkdownV2"
 	edit.ReplyMarkup = &tgbotapi.InlineKeyboardMarkup{InlineKeyboard: rows}
 	if _, err := a.bot.Request(edit); err != nil {
 		log.Printf("edit model picker failed: %v", err)
@@ -1771,7 +1793,7 @@ func shortTokens(n int) string {
 	case n >= 1_000:
 		return fmt.Sprintf("%.1fK", float64(n)/1_000)
 	default:
-		return itoa(n)
+		return strconv.Itoa(n)
 	}
 }
 
@@ -1872,7 +1894,7 @@ func (a *App) sendEffortPicker(chatID int64, _ int) {
 		})
 	}
 	msg := tgbotapi.NewMessage(chatID, "🤔 选择推理深度")
-	msg.ParseMode = "HTML"
+	msg.ParseMode = "MarkdownV2"
 	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
 	a.sendSafe(msg)
 	_ = port // keep port reference for future use
@@ -2045,7 +2067,7 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 		a.answerCallback(cq.ID, "")
 		a.removeKeyboard(chatID, msgID)
 		msg := tgbotapi.NewMessage(chatID, "📝 请输入你的回答：")
-		msg.ParseMode = "HTML"
+		msg.ParseMode = "MarkdownV2"
 		msg.ReplyToMessageID = cq.Message.MessageID
 		a.sendSafe(msg)
 		return
@@ -2072,9 +2094,9 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 		cidNum := atomic.AddUint64(&a.clarifySeq, 1)
 		pc.clarifyID = strconv.FormatUint(cidNum, 36)
 		// Snapshot data for message building.
-		qText := htmlEscape(strings.TrimSpace(nextQ.Text))
+		qText := _escapeMdv2(strings.TrimSpace(nextQ.Text))
 		if qText == "" {
-			qText = htmlEscape(strings.TrimSpace(nextQ.ID))
+			qText = _escapeMdv2(strings.TrimSpace(nextQ.ID))
 		}
 		if qText == "" {
 			qText = "请选择："
@@ -2089,7 +2111,7 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 		header := fmt.Sprintf("问题 %d/%d\n", nextIdx+1, len(pc.allQuestions))
 		text := "❓ " + header + qText
 		msg := tgbotapi.NewMessage(chatID, text)
-		msg.ParseMode = "HTML"
+		msg.ParseMode = "MarkdownV2"
 		if len(options) > 0 {
 			var rows [][]tgbotapi.InlineKeyboardButton
 			for i, choice := range options {
@@ -2132,7 +2154,7 @@ func (a *App) formatChoices(choices []string) string {
 		if i > 0 {
 			b.WriteString("\n")
 		}
-		fmt.Fprintf(&b, "%d. %s", i+1, htmlEscape(c))
+		fmt.Fprintf(&b, "%d. %s", i+1, _escapeMdv2(c))
 	}
 	return b.String()
 }
@@ -2245,7 +2267,7 @@ func (a *App) deleteMessage(chatID int64, messageID int) {
 func (a *App) editCommentary(chatID int64, messageID int, appendText string) error {
 	text := capTelegramMessage(appendText)
 	edit := tgbotapi.NewEditMessageText(chatID, messageID, formatForTelegram(text))
-	edit.ParseMode = "HTML"
+	edit.ParseMode = "MarkdownV2"
 	_, err := a.bot.Send(edit)
 	if telegramEditOK(err) {
 		return nil

@@ -26,7 +26,7 @@ func TestDraftNeedsCleanup(t *testing.T) {
 	if !draftNeedsCleanup(true, false, "") {
 		t.Fatal("draftShown alone should need cleanup")
 	}
-	if !draftNeedsCleanup(false, false, "preview") {
-		t.Fatal("lastDraftBody should need cleanup")
+	if draftNeedsCleanup(false, false, "preview") {
+		t.Fatal("edit preview alone must not trigger native draft dismiss")
 	}
 }

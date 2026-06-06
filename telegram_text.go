@@ -182,18 +182,20 @@ func capTelegramMessage(text string) string {
 }
 
 // sendTextParts delivers text as one or more Telegram messages (≤4096 runes each).
-// Tries Telegram HTML first; on entity-parse failure retries as plain text (Hermes pattern).
-// If editFirstMsgID != nil and *editFirstMsgID > 0, the first part updates that message.
+// Tries Telegram MarkdownV2 first; on entity-parse failure retries as plain text
+// (with the MDV2 escape backslashes and formatting markers stripped via _stripMdv2,
+// Hermes pattern). If editFirstMsgID != nil and *editFirstMsgID > 0, the first
+// part updates that message.
 func (a *App) sendTextParts(chatID int64, text string, editFirstMsgID *int) int {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return 0
 	}
-	if n := a.sendFormattedParts(chatID, formatForTelegram(text), editFirstMsgID, "HTML"); n > 0 {
+	if n := a.sendFormattedParts(chatID, formatForTelegram(text), editFirstMsgID, "MarkdownV2"); n > 0 {
 		return n
 	}
-	log.Printf("chat=%d: HTML delivery failed, retrying plain text (%d runes)", chatID, utf8.RuneCountInString(text))
-	return a.sendFormattedParts(chatID, capTelegramMessage(text), editFirstMsgID, "")
+	log.Printf("chat=%d: MarkdownV2 delivery failed, retrying plain text (%d runes)", chatID, utf8.RuneCountInString(text))
+	return a.sendFormattedParts(chatID, _stripMdv2(capTelegramMessage(text)), editFirstMsgID, "")
 }
 
 func (a *App) sendFormattedParts(chatID int64, displayText string, editFirstMsgID *int, parseMode string) int {

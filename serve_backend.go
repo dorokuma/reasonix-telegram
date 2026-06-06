@@ -133,11 +133,17 @@ func (a *App) reasonixEnv() []string {
 func (a *App) serveRunning(s *session) bool {
 	s.mu.Lock()
 	cmd := s.serveCmd
+	port := s.servePort
 	s.mu.Unlock()
-	if cmd == nil || cmd.Process == nil {
+	if cmd != nil && cmd.Process != nil && cmd.ProcessState == nil {
+		return true
+	}
+	if port == 0 {
 		return false
 	}
-	return cmd.ProcessState == nil
+	// Adopt an already-listening serve (e.g. after an out-of-band restart) so the
+	// bridge does not try to bind the same port again.
+	return waitServeReady(port, 2*time.Second) == nil
 }
 
 func (a *App) stopServe(chatID int64) {
@@ -218,9 +224,16 @@ func (a *App) startServe(chatID int64) error {
 	// Reasonix Resume now re-applies the boot system prompt even when the file is empty.
 	args = append(args, "--resume", sessionPath)
 
+	if err := waitServeReady(port, 2*time.Second); err == nil {
+		log.Printf("chat=%d: adopting existing reasonix serve on %s", chatID, serveAddr(port))
+		return nil
+	}
+
 	cmd := exec.Command(a.cfg.ReasonixBin, args...)
 	cmd.Dir = wd
 	cmd.Env = a.reasonixEnv()
+	// Go wires nil Stderr to /dev/null; forward serve diagnostics (RTK/CTX hit/miss) to journal.
+	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: 0}
 
 	if err := cmd.Start(); err != nil {
@@ -563,6 +576,10 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 		case "tool_result":
 			if a.getMode() != ModeChat {
 				if ev.Tool != nil {
+					// Reset consolidation first so hook-only skip doesn't bypass it.
+					lastToolName = ""
+					toolCount = 0
+
 					// Skip hook-only noise.
 					if isHookOnlyOutput(ev.Tool.Err) || isHookOnlyOutput(ev.Tool.Output) {
 						continue
