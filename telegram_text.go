@@ -130,9 +130,37 @@ func telegramErrorIsParseEntities(err error) bool {
 		strings.Contains(s, "can't find end tag")
 }
 
+func telegramErrorIsFlood(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := strings.ToLower(err.Error())
+	return strings.Contains(s, "retry after") ||
+		strings.Contains(s, "flood") ||
+		strings.Contains(s, "too many requests")
+}
+
 // telegramEditOK reports whether an edit failure can be treated as success.
 func telegramEditOK(err error) bool {
 	return err == nil || telegramErrorIsNotModified(err)
+}
+
+// streamContinuationText returns the portion of final not already visible in the
+// streamed preview. When the preview was a tail slice, final does not start with
+// visiblePrefix — return the full final so fallback send delivers the answer.
+func streamContinuationText(final, visiblePrefix string) string {
+	final = strings.TrimSpace(final)
+	visiblePrefix = strings.TrimSpace(visiblePrefix)
+	if final == "" {
+		return ""
+	}
+	if visiblePrefix == "" {
+		return final
+	}
+	if strings.HasPrefix(final, visiblePrefix) {
+		return strings.TrimSpace(final[len(visiblePrefix):])
+	}
+	return final
 }
 
 // capTelegramMessage trims text to fit one Telegram message (≤4096 runes).
@@ -173,39 +201,66 @@ func (a *App) sendFormattedParts(chatID int64, displayText string, editFirstMsgI
 	if len(parts) == 0 {
 		return 0
 	}
+	if editFirstMsgID != nil && *editFirstMsgID != 0 {
+		return a.editOverflowSplit(chatID, *editFirstMsgID, parts, parseMode)
+	}
+	return a.sendMessageParts(chatID, parts, parseMode, 0)
+}
+
+// editOverflowSplit edits the first chunk in-place, then sends continuations as
+// reply-threaded messages (Hermes Telegram _edit_overflow_split, lightweight).
+func (a *App) editOverflowSplit(chatID int64, messageID int, parts []string, parseMode string) int {
+	if len(parts) == 0 {
+		return 0
+	}
+	edit := tgbotapi.NewEditMessageText(chatID, messageID, parts[0])
+	if parseMode != "" {
+		edit.ParseMode = parseMode
+	}
+	_, err := a.bot.Send(edit)
+	if !telegramEditOK(err) {
+		if telegramErrorIsMessageTooLong(err) && len(parts) == 1 && len([]rune(parts[0])) > 500 {
+			sub := splitTelegramText(parts[0], telegramMaxMessageRunes/2)
+			if len(sub) > 1 {
+				log.Printf("chat=%d: edit overflow reactive split (%d subchunks)", chatID, len(sub))
+				return a.editOverflowSplit(chatID, messageID, sub, parseMode)
+			}
+		}
+		if telegramErrorIsParseEntities(err) {
+			return 0
+		}
+		log.Printf("chat=%d: edit part 1/%d failed: %v", chatID, len(parts), err)
+		return 0
+	}
+	sent := 1
+	replyTo := messageID
+	if len(parts) == 1 {
+		return sent
+	}
+	sent += a.sendMessageParts(chatID, parts[1:], parseMode, replyTo)
+	return sent
+}
+
+func (a *App) sendMessageParts(chatID int64, parts []string, parseMode string, replyTo int) int {
 	sent := 0
 	for i, part := range parts {
-		if i == 0 && editFirstMsgID != nil && *editFirstMsgID != 0 {
-			edit := tgbotapi.NewEditMessageText(chatID, *editFirstMsgID, part)
-			if parseMode != "" {
-				edit.ParseMode = parseMode
-			}
-			_, err := a.bot.Send(edit)
-			if telegramEditOK(err) {
-				return sent + 1
-			}
-			if telegramErrorIsParseEntities(err) {
-				return 0
-			}
-			log.Printf("chat=%d: edit part 1/%d failed: %v", chatID, len(parts), err)
-			return sent
-		}
 		msg := tgbotapi.NewMessage(chatID, part)
 		if parseMode != "" {
 			msg.ParseMode = parseMode
 		}
+		if replyTo != 0 {
+			msg.ReplyToMessageID = replyTo
+		}
 		m, err := a.bot.Send(msg)
 		if err != nil {
 			if telegramErrorIsParseEntities(err) {
-				return 0
+				return sent
 			}
 			log.Printf("chat=%d: send part %d/%d failed: %v", chatID, i+1, len(parts), err)
 			return sent
 		}
 		sent++
-		if i == 0 && editFirstMsgID != nil && *editFirstMsgID == 0 {
-			*editFirstMsgID = m.MessageID
-		}
+		replyTo = m.MessageID
 		if i+1 < len(parts) {
 			time.Sleep(multiPartSendGap)
 		}

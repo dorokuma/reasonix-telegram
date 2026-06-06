@@ -98,3 +98,27 @@ func TestTelegramErrorIsParseEntities(t *testing.T) {
 		t.Fatal("too long is not parse entities")
 	}
 }
+
+func TestTelegramErrorIsFlood(t *testing.T) {
+	if !telegramErrorIsFlood(errors.New(`Too Many Requests: retry after 12`)) {
+		t.Fatal("retry after is flood")
+	}
+	if telegramErrorIsFlood(errors.New("MESSAGE_TOO_LONG")) {
+		t.Fatal("too long is not flood")
+	}
+}
+
+func TestStreamContinuationText(t *testing.T) {
+	got := streamContinuationText("hello world", "hello ")
+	if got != "world" {
+		t.Fatalf("got %q", got)
+	}
+	// Tail preview: full body does not start with visible tail → send all.
+	got = streamContinuationText("abcdef", "cdef")
+	if got != "abcdef" {
+		t.Fatalf("got %q", got)
+	}
+	if streamContinuationText("", "x") != "" {
+		t.Fatal("empty final")
+	}
+}

@@ -797,8 +797,10 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		streamDone     bool
 		lastDraftBody  string
 		msgCreatedAt   time.Time // when first draft/stream msg was sent
-		draftFailCount int      // consecutive draft failures in this turn
-		editFailCount  int      // consecutive edit failures in this turn
+		draftFailCount       int  // consecutive draft failures in this turn
+		editFailCount        int  // consecutive edit failures in this turn
+		streamEditFallback   bool // edit flood-silenced: finalize via sendMessage tail
+		streamVisiblePrefix  string // last raw preview successfully shown (edit/draft)
 	)
 	const (
 		maxDraftFailures = 3
@@ -865,13 +867,24 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			}
 			hadLiveDraft := draftNeedsCleanup(draftShown, liveDraftEver, lastDraftBody)
 			if streamMsgID > 0 && !useFreshFinal {
-				streamed := formatForTelegram(telegramPreviewTail(body, telegramMaxMessageRunes))
-				if streamed == formatForTelegram(lastDraftBody) {
-					n = 1
-					log.Printf("chat=%d: finalize skip edit (already shown via stream)", chatID)
+				if streamEditFallback {
+					tail := streamContinuationText(body, streamVisiblePrefix)
+					if tail == "" {
+						n = 1
+						log.Printf("chat=%d: finalize fallback skip (already shown)", chatID)
+					} else {
+						log.Printf("chat=%d: finalize fallback send continuation len=%d", chatID, len(tail))
+						n = a.sendTextParts(chatID, tail, nil)
+					}
 				} else {
-					editID := streamMsgID
-					n = a.sendTextParts(chatID, body, &editID)
+					streamed := formatForTelegram(telegramPreviewTail(body, telegramMaxMessageRunes))
+					if streamed == formatForTelegram(lastDraftBody) {
+						n = 1
+						log.Printf("chat=%d: finalize skip edit (already shown via stream)", chatID)
+					} else {
+						editID := streamMsgID
+						n = a.sendTextParts(chatID, body, &editID)
+					}
 				}
 			} else {
 				n = a.sendTextParts(chatID, body, nil)
@@ -957,9 +970,13 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			editFailCount = 0
 			streamMsgID = sent.MessageID
 			lastDraftBody = preview
+			streamVisiblePrefix = preview
 			if msgCreatedAt.IsZero() {
 				msgCreatedAt = time.Now()
 			}
+			return
+		}
+		if streamEditFallback {
 			return
 		}
 		if preview == lastDraftBody {
@@ -968,14 +985,18 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		previewHTML := formatForTelegram(preview)
 		edit := tgbotapi.NewEditMessageText(chatID, streamMsgID, previewHTML)
 		edit.ParseMode = "HTML"
-		if _, err := a.bot.Send(edit); err == nil || telegramErrorIsNotModified(err) {
+		_, err := a.bot.Send(edit)
+		if telegramEditOK(err) {
 			editFailCount = 0
 			lastDraftBody = preview
+			streamVisiblePrefix = preview
 			return
 		}
 		editFailCount++
-		if editFailCount >= maxEditFailures {
-			log.Printf("chat=%d: edit flood-silenced after %d failures", chatID, editFailCount)
+		if telegramErrorIsFlood(err) || editFailCount >= maxEditFailures {
+			streamEditFallback = true
+			streamVisiblePrefix = lastDraftBody
+			log.Printf("chat=%d: stream edit fallback (flood=%v strikes=%d)", chatID, telegramErrorIsFlood(err), editFailCount)
 		}
 	}
 
@@ -1261,6 +1282,8 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			liveDraftEver = false
 			lastDraftBody = ""
 			streamMsgID = 0
+			streamEditFallback = false
+			streamVisiblePrefix = ""
 			msgCreatedAt = time.Now()
 			draftMu.Unlock()
 		}

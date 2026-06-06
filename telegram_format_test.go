@@ -223,17 +223,22 @@ func TestFormat_asteriskEdgeCases(t *testing.T) {
 	tests := []struct {
 		name  string
 		input string
+		want  string // expected output; "" means check no asterisks only
 	}{
-		{"bold_double", "**解法A（经典）**"},
-		{"italic_one_two", "*解法A（经典）**"},
-		{"bold_code_placeholder", "**`turn_done`事件处理**"},
-		{"bold_code_placeholder_mid", "第一，**`turn_done`是唯一触发终结的信号**"},
+		{"bold_double", "**解法A（经典）**", "<b>解法A（经典）</b>"},
+		{"italic_one_two", "*解法A（经典）**", "<i>解法A（经典）</i>"},
+		{"bold_code_placeholder", "**`turn_done`事件处理**", "<b><code>turn_done</code>事件处理</b>"},
+		{"bold_code_placeholder_mid", "第一，**`turn_done`是唯一触发终结的信号**", "第一，<b><code>turn_done</code>是唯一触发终结的信号</b>"},
+		{"bold_simple_cn", "**修了两处：**", "<b>修了两处：</b>"},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got := formatForTelegram(tt.input)
 			t.Logf("input: %q", tt.input)
 			t.Logf("output: %q", got)
+			if tt.want != "" && got != tt.want {
+				t.Fatalf("want %q, got %q", tt.want, got)
+			}
 			if stringsContains(got, "**") || stringsContains(got, "*") || stringsContains(got, "&ast;") || stringsContains(got, "&#42;") {
 				t.Fatalf("asterisks leaked in output: %q", got)
 			}
