@@ -417,11 +417,20 @@ func toolEmoji(name string) string {
 		return "🔍"
 	case "ask":
 		return "❓"
-	case "search_web", "web_search":
+	case "search_web", "web_search",
+		"mcp__jina__search_web", "mcp__jina__search",
+		"mcp__brave__search", "mcp__tavily__search",
+		"mcp__kagi__search", "mcp__serpapi__search":
 		// Spider web — visually distinct from 💬/🗨️ speech balloons, and the
 		// "web" in "web search" + the "crawling the web" metaphor make it
 		// unambiguous even to users seeing it for the first time.
 		return "🕸️"
+
+	case "read_url", "mcp__jina__read_url":
+		// Same family as web_fetch — fetch a URL and read it. Share the
+		// "📄" emoji with curl/wget/web_fetch (network I/O) so the user
+		// sees a consistent network category.
+		return "📄"
 	case "curl", "wget", "web_fetch":
 		return "📄"
 	case "memory_save", "remember", "memory":
