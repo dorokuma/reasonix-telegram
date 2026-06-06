@@ -418,7 +418,10 @@ func toolEmoji(name string) string {
 	case "ask":
 		return "❓"
 	case "search_web", "web_search":
-		return "🌐"
+		// Spider web — visually distinct from 💬/🗨️ speech balloons, and the
+		// "web" in "web search" + the "crawling the web" metaphor make it
+		// unambiguous even to users seeing it for the first time.
+		return "🕸️"
 	case "curl", "wget", "web_fetch":
 		return "📄"
 	case "memory_save", "remember", "memory":
