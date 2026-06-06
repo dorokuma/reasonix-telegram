@@ -113,6 +113,36 @@ func telegramErrorIsNotModified(err error) bool {
 	return strings.Contains(err.Error(), "message is not modified")
 }
 
+func telegramErrorIsMessageTooLong(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "MESSAGE_TOO_LONG")
+}
+
+// telegramEditOK reports whether an edit failure can be treated as success.
+func telegramEditOK(err error) bool {
+	return err == nil || telegramErrorIsNotModified(err)
+}
+
+// capTelegramMessage trims text to fit one Telegram message (≤4096 runes).
+func capTelegramMessage(text string) string {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return ""
+	}
+	runes := []rune(text)
+	if len(runes) <= telegramMaxMessageRunes {
+		return text
+	}
+	const suffix = "\n…（已截断）"
+	suffixRunes := len([]rune(suffix))
+	if telegramMaxMessageRunes <= suffixRunes {
+		return string(runes[:telegramMaxMessageRunes])
+	}
+	return string(runes[:telegramMaxMessageRunes-suffixRunes]) + suffix
+}
+
 // sendTextParts delivers text as one or more Telegram messages (≤4096 runes each).
 // Text is automatically converted from markdown to Telegram HTML format.
 // If editFirstMsgID != nil and *editFirstMsgID > 0, the first part updates that message.

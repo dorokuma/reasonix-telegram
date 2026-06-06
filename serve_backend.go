@@ -269,10 +269,26 @@ func (a *App) ensureServe(chatID int64) error {
 }
 
 func (a *App) restorePersistedSessions() {
+	a.state.cleanupOrphanSessionArtifacts()
 	records, err := a.state.load()
 	if err != nil {
 		log.Printf("warning: load persisted state: %v", err)
 		return
+	}
+	known := map[int64]struct{}{}
+	for _, rec := range records {
+		known[rec.ChatID] = struct{}{}
+	}
+	for _, chatID := range a.state.chatIDsWithSessionJSONL() {
+		if _, ok := known[chatID]; ok {
+			continue
+		}
+		records = append(records, chatRecord{
+			ChatID:      chatID,
+			SessionPath: a.state.sessionPathForChat(chatID),
+			Port:        portForChat(chatID),
+		})
+		log.Printf("startup: recovered orphan session jsonl for chat=%d", chatID)
 	}
 	for _, rec := range records {
 		s := a.getOrCreateSession(rec.ChatID)

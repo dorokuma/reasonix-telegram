@@ -1009,6 +1009,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				// onCommentary: send a standalone message (tool progress, result)
 				// Not part of the stream buffer — send immediately as new message.
 				// Don't touch draftMu to avoid contention with pusher goroutine.
+				text = capTelegramMessage(text)
 				msg := tgbotapi.NewMessage(chatID, formatForTelegram(text))
 				msg.ParseMode = "HTML"
 				sent, err := a.bot.Send(msg)
@@ -2108,7 +2109,7 @@ func (a *App) removeKeyboard(chatID int64, messageID int) {
 	edit := tgbotapi.NewEditMessageReplyMarkup(chatID, messageID, tgbotapi.InlineKeyboardMarkup{
 		InlineKeyboard: [][]tgbotapi.InlineKeyboardButton{},
 	})
-	if _, err := a.bot.Request(edit); err != nil {
+	if _, err := a.bot.Request(edit); err != nil && !telegramErrorIsNotModified(err) {
 		log.Printf("remove keyboard failed: %v", err)
 	}
 }
@@ -2120,26 +2121,23 @@ func (a *App) deleteMessage(chatID int64, messageID int) {
 	}
 }
 
-// editCommentary appends result text to an existing tool dispatch message.
+// editCommentary updates a tool-dispatch message. Caps length and treats
+// "message is not modified" as success.
 func (a *App) editCommentary(chatID int64, messageID int, appendText string) error {
-	edit := tgbotapi.NewEditMessageText(chatID, messageID, formatForTelegram(appendText))
+	text := capTelegramMessage(appendText)
+	edit := tgbotapi.NewEditMessageText(chatID, messageID, formatForTelegram(text))
 	edit.ParseMode = "HTML"
 	_, err := a.bot.Send(edit)
-	if err != nil {
-		log.Printf("chat=%d: edit commentary failed: %v", chatID, err)
+	if telegramEditOK(err) {
+		return nil
 	}
+	log.Printf("chat=%d: edit commentary failed: %v", chatID, err)
 	return err
 }
 
-// appendToCommentary is a no-op on success. On error, replace the message with the error.
+// appendToCommentary replaces a tool-dispatch message (same caps as editCommentary).
 func (a *App) appendToCommentary(chatID int64, messageID int, appendText string) error {
-	edit := tgbotapi.NewEditMessageText(chatID, messageID, formatForTelegram(appendText))
-	edit.ParseMode = "HTML"
-	_, err := a.bot.Send(edit)
-	if err != nil {
-		log.Printf("chat=%d: append commentary failed: %v", chatID, err)
-	}
-	return err
+	return a.editCommentary(chatID, messageID, appendText)
 }
 
 // submitClarifyAnswers POSTs accumulated clarify answers to the serve backend.

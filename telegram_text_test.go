@@ -61,3 +61,30 @@ func TestTelegramErrorIsNotModified(t *testing.T) {
 		t.Fatal("nil should be false")
 	}
 }
+
+func TestCapTelegramMessage(t *testing.T) {
+	if capTelegramMessage("hi") != "hi" {
+		t.Fatal("short text unchanged")
+	}
+	long := strings.Repeat("字", 5000)
+	out := capTelegramMessage(long)
+	if utf8.RuneCountInString(out) > telegramMaxMessageRunes {
+		t.Fatalf("capped too long: %d runes", utf8.RuneCountInString(out))
+	}
+	if !strings.Contains(out, "截断") {
+		t.Fatalf("expected truncation marker: %q", out[len(out)-20:])
+	}
+}
+
+func TestTelegramEditOK(t *testing.T) {
+	if !telegramEditOK(nil) {
+		t.Fatal("nil is ok")
+	}
+	err := errors.New(`Bad Request: message is not modified`)
+	if !telegramEditOK(err) {
+		t.Fatal("not-modified is ok")
+	}
+	if telegramEditOK(errors.New("MESSAGE_TOO_LONG")) {
+		t.Fatal("too long is not ok")
+	}
+}

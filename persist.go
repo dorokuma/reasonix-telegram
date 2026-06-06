@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -114,10 +115,64 @@ func (st *stateStore) writeLocked(sf *stateFile) error {
 		return err
 	}
 	tmp := st.path + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	if err := os.Chmod(tmp, 0o600); err != nil {
 		return err
 	}
 	return os.Rename(tmp, st.path)
+}
+
+// chatIDsWithSessionJSONL returns chat IDs that have a non-empty session file on disk.
+func (st *stateStore) chatIDsWithSessionJSONL() []int64 {
+	entries, err := os.ReadDir(st.sessionsDir())
+	if err != nil {
+		return nil
+	}
+	var ids []int64
+	for _, ent := range entries {
+		name := ent.Name()
+		if !strings.HasSuffix(name, ".jsonl") || ent.IsDir() {
+			continue
+		}
+		base := strings.TrimSuffix(name, ".jsonl")
+		id, err := strconv.ParseInt(base, 10, 64)
+		if err != nil || id == 0 {
+			continue
+		}
+		info, err := ent.Info()
+		if err != nil || info.Size() == 0 {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+// cleanupOrphanSessionArtifacts removes checkpoint/meta files left after /new
+// when the session JSONL is gone.
+func (st *stateStore) cleanupOrphanSessionArtifacts() {
+	entries, err := os.ReadDir(st.sessionsDir())
+	if err != nil {
+		return
+	}
+	for _, ent := range entries {
+		name := ent.Name()
+		if ent.IsDir() && strings.HasSuffix(name, ".ckpt") {
+			chatID := strings.TrimSuffix(name, ".ckpt")
+			if _, err := os.Stat(filepath.Join(st.sessionsDir(), chatID+".jsonl")); os.IsNotExist(err) {
+				_ = os.RemoveAll(filepath.Join(st.sessionsDir(), name))
+			}
+			continue
+		}
+		if strings.HasSuffix(name, ".jsonl.meta") {
+			chatID := strings.TrimSuffix(name, ".jsonl.meta")
+			if _, err := os.Stat(filepath.Join(st.sessionsDir(), chatID+".jsonl")); os.IsNotExist(err) {
+				_ = os.Remove(filepath.Join(st.sessionsDir(), name))
+			}
+		}
+	}
 }
 
 // sessionStats reads a Reasonix session JSONL for logging resume health.
