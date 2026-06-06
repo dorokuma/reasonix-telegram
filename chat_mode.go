@@ -15,7 +15,7 @@ func (a *App) reasonixTomlContent() string {
 	if a.getMode() == ModeTool {
 		return `# reasonix-telegram: tool mode (managed by the bridge)
 [agent]
-auto_plan = "ask"
+auto_plan = "off"
 
 [lsp]
 enabled = true
