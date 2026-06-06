@@ -805,38 +805,38 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 	)
 	var procErr error
 	replyDelivered := false
-	var endStreamOnce sync.Once
-
 	// endStream mirrors TelePi finalizeResponse: set streamDone first, flush last
 	// draft frame, then sendMessage so no late sendMessageDraft lands after the real message.
 	// Fresh final: if the first preview was sent >30s ago, create a new message
 	// instead of editing the stale preview (so TG timestamp reflects completion time).
 	endStream := func() {
-		endStreamOnce.Do(func() {
 		draftMu.Lock()
 		defer draftMu.Unlock()
 		if streamDone {
 			return
 		}
-		log.Printf("chat=%d: endStream setting streamDone=true useDraft=%v draftID=%d", chatID, useDraft, draftID)
-		streamDone = true
 
 		bufMu.Lock()
-		body := buf.String()
+		raw := buf.String()
 		tr := truncated
 		bufMu.Unlock()
-		body = strings.TrimSpace(body)
-		log.Printf("chat=%d: endStream bodyLen=%d bodyPreview=%q", chatID, len(body), logPreview(body, 100))
+		body := streamFinalizeBody(raw, lastDraftBody)
+		if body != "" && strings.TrimSpace(raw) == "" && strings.TrimSpace(lastDraftBody) != "" {
+			log.Printf("chat=%d: endStream using lastDraftBody fallback len=%d", chatID, len(body))
+		}
+		log.Printf("chat=%d: endStream useDraft=%v draftID=%d bodyLen=%d bodyPreview=%q", chatID, useDraft, draftID, len(body), logPreview(body, 100))
 		if body == "" {
-			hadLiveDraft := draftShown
-			if hadLiveDraft {
+			hadPreview := draftShown || strings.TrimSpace(lastDraftBody) != ""
+			if hadPreview {
 				a.clearDraftPreview(chatID, draftID)
 				draftShown = false
 				lastDraftBody = ""
 			}
-			log.Printf("chat=%d: endStream body empty, clearedDraft=%v useDraft=%v", chatID, hadLiveDraft, useDraft)
+			streamDone = true
+			log.Printf("chat=%d: endStream body empty, clearedDraft=%v useDraft=%v", chatID, hadPreview, useDraft)
 			return
 		}
+		streamDone = true
 		if len(body) > maxFinalizeBytes {
 			body = trimUTF8Bytes(body, maxFinalizeBytes)
 			tr = true
@@ -883,7 +883,6 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		if n > 0 {
 			replyDelivered = true
 		}
-		})
 	}
 
 	retireLiveDraftLocked := func(reason string) {
@@ -990,6 +989,12 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 	s.mu.Unlock()
 
 	go func() {
+		defer func() {
+			// Belt-and-suspenders: ensure pusher sees a flush even if turn_done
+			// onComplete was missed (SSE dropped before turn_done).
+			signalFlush()
+			close(finished)
+		}()
 		procErr = a.runServeTurn(ctx, chatID, prompt,
 			func(chunk string) {
 				bufMu.Lock()
@@ -1181,7 +1186,6 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				s.mu.Unlock()
 			},
 		)
-		close(finished)
 	}()
 
 	pusherDone := make(chan struct{})
@@ -1264,6 +1268,20 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			case <-finished:
 				log.Printf("chat=%d: pusher: finished", chatID)
 				flushAndEnd()
+				draftMu.Lock()
+				done := streamDone
+				draftMu.Unlock()
+				if done {
+					return
+				}
+				// runServeTurn returned before turn_done flush; wait briefly for it.
+				select {
+				case <-flushNow:
+					log.Printf("chat=%d: pusher: late flushNow after finished", chatID)
+					flushAndEnd()
+				case <-time.After(3 * time.Second):
+					log.Printf("chat=%d: pusher: finished without finalize, giving up", chatID)
+				}
 				return
 			}
 		}
@@ -1323,6 +1341,17 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 	bufMu.Unlock()
 	log.Printf("chat=%d prompt=%q stream=draft draftID=%d finalLen=%d runes=%d body=%q",
 		chatID, logPreview(prompt, 80), draftID, len(finalBody), utf8.RuneCountInString(finalBody), logPreview(finalBody, 200))
+}
+
+// streamFinalizeBody picks the text to finalize at turn end. The accumulator
+// buffer can lag behind or be reset while sendMessageDraft already shows text
+// in lastDraftBody — falling back prevents a stuck draft with no sendMessage.
+func streamFinalizeBody(buf, lastDraftBody string) string {
+	body := strings.TrimSpace(buf)
+	if body == "" {
+		body = strings.TrimSpace(lastDraftBody)
+	}
+	return body
 }
 
 // nextDraftID returns a unique Telegram draft_id (int32-safe, no second-level collisions).
