@@ -77,6 +77,9 @@ func isReasonixNoise(line string) bool {
 	if strings.HasPrefix(line, "background ") {
 		return true // background job start/finish/kill notices
 	}
+	if strings.Contains(line, "context reached") && strings.Contains(line, "compact threshold") {
+		return true // compaction notice — automatic, no user action needed
+	}
 	return reTokenStats.MatchString(line) ||
 		reStatusDot.MatchString(line) ||
 		reThinkingBar.MatchString(line)
