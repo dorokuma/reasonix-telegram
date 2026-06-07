@@ -20,3 +20,5 @@ reasonix:
 
 clean:
 	rm -f $(BINARY)
+# Local overrides (e.g. pointing 'reasonix' at a fork). File is gitignored.
+-include Makefile.local
