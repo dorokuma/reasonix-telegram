@@ -493,6 +493,14 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 			// drop the real answer after web_search / multi-step tools.
 			if ev.Reasoning != "" {
 				reasoningBuf.WriteString(ev.Reasoning)
+				// DeepSeek V4 reasoning bug: model places reply in reasoning_content
+				// instead of content. Try early fallback when text is missing.
+				if ev.Text == "" && !gotTextDelta && !sawToolDispatch {
+					if body, ok := reasoningFallbackBody(ev.Reasoning); ok {
+						gotTextDelta = true
+						onChunk(body)
+					}
+				}
 			}
 			if ev.Text != "" && !gotTextDelta {
 				gotTextDelta = true
@@ -697,6 +705,28 @@ func shouldFlushReasoningFallback(gotTextDelta, sawToolDispatch bool) bool {
 // reasoningFallbackBody returns visible text when a turn produced only reasoning.
 func reasoningFallbackBody(reasoning string) (string, bool) {
 	body := strings.TrimSpace(stripThinkBlocks(stripANSI(reasoning)))
+	if body == "" {
+		return "", false
+	}
+	// Split into paragraphs by double newline; prefer keeping the last paragraph
+	// as the model's actual response (earlier content is chain-of-thought).
+	// When the last paragraph is less than half the total, the answer likely
+	// spans multiple paragraphs — return the full body instead.
+	original := body
+	for _, delim := range []string{"\n\n", "\n\t"} {
+		if parts := strings.Split(body, delim); len(parts) > 1 {
+			last := strings.TrimSpace(parts[len(parts)-1])
+			if last != "" {
+				body = last
+				break
+			}
+		}
+	}
+	// If stripping to one paragraph loses >50% of content, the answer has
+	// multiple relevant paragraphs — keep the full body.
+	if len(body) < len(original)/2 && utf8RuneCount(original) > len(body)+80 {
+		body = original
+	}
 	if body == "" || isReasonixNoise(body) || isSilenceOnly(body) {
 		return "", false
 	}
