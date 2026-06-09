@@ -676,7 +676,23 @@ func formatToolArgs(toolName, argsJSON string) string {
 		return ""
 	case "bash":
 		if cmd, ok := m["command"].(string); ok && cmd != "" {
-			return "💻 " + trimUTF8Bytes(cmd, 100)
+			cmd = strings.TrimSpace(cmd)
+			if cmd == "" {
+				return "💻 bash"
+			}
+			// Hermes parity: wrap command in fenced code block
+			// (github.com/nousresearch/hermes-agent gateway/run.py L13032)
+			first := cmd
+			if idx := strings.Index(cmd, "\n"); idx >= 0 {
+				first = cmd[:idx]
+			}
+			const capLen = 200
+			if len(first) > capLen {
+				first = trimUTF8Bytes(first, capLen-3) + "..."
+			} else if strings.Contains(cmd, "\n") {
+				first = first + " ..."
+			}
+			return fmt.Sprintf("💻 bash\n```\n%s\n```", first)
 		}
 	case "ls":
 		if p, ok := m["path"].(string); ok && p != "" && len(p) > 2 {
