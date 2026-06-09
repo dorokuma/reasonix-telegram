@@ -474,7 +474,7 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 
 			a.removeKeyboard(m.Chat.ID, prevMsgID)
 			replyText := "❓ " + header + qText
-			msg := tgbotapi.NewMessage(m.Chat.ID, replyText)
+			msg := newMessage(m.Chat.ID, replyText)
 			msg.ParseMode = "MarkdownV2"
 			if len(options) > 0 {
 				var rows [][]tgbotapi.InlineKeyboardButton
@@ -1003,7 +1003,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		}
 		if streamMsgID == 0 {
 			previewHTML := formatForTelegram(preview)
-			msg := tgbotapi.NewMessage(chatID, previewHTML)
+			msg := newMessage(chatID, previewHTML)
 			msg.ParseMode = "MarkdownV2"
 			sent, err := a.bot.Send(msg)
 			if err != nil {
@@ -1093,7 +1093,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				// Not part of the stream buffer — send immediately as new message.
 				// Don't touch draftMu to avoid contention with pusher goroutine.
 				text = capTelegramMessage(text)
-				msg := tgbotapi.NewMessage(chatID, formatForTelegram(text))
+				msg := newMessage(chatID, formatForTelegram(text))
 				msg.ParseMode = "MarkdownV2"
 				sent, err := a.bot.Send(msg)
 				if err != nil {
@@ -1162,7 +1162,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 					header = fmt.Sprintf("问题 1/%d\n", len(questions))
 				}
 				text := "❓ " + header + qText
-				msg := tgbotapi.NewMessage(chatID, text)
+				msg := newMessage(chatID, text)
 				msg.ParseMode = "MarkdownV2"
 				if len(q.Options) > 0 {
 					var rows [][]tgbotapi.InlineKeyboardButton
@@ -1239,7 +1239,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				onceData := fmt.Sprintf("%s:%s", apID, actionOnce)
 				sessionData := fmt.Sprintf("%s:%s", apID, actionSession)
 				denyData := fmt.Sprintf("%s:%s", apID, actionDeny)
-				msg := tgbotapi.NewMessage(chatID, text)
+				msg := newMessage(chatID, text)
 				msg.ParseMode = "MarkdownV2"
 				msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
 					[]tgbotapi.InlineKeyboardButton{
@@ -1716,7 +1716,7 @@ func (a *App) sendModelPicker(chatID int64, page int) {
 	}
 
 	text := fmt.Sprintf("🤖 选择模型（当前：%s）", a.modelDisplayName(current))
-	msg := tgbotapi.NewMessage(chatID, text)
+	msg := newMessage(chatID, text)
 	msg.ParseMode = "MarkdownV2"
 	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
 	a.sendSafe(msg)
@@ -1918,7 +1918,7 @@ func (a *App) sendEffortPicker(chatID int64, _ int) {
 			{Text: l.Name, CallbackData: &data},
 		})
 	}
-	msg := tgbotapi.NewMessage(chatID, "🤔 选择推理深度")
+	msg := newMessage(chatID, "🤔 选择推理深度")
 	msg.ParseMode = "MarkdownV2"
 	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
 	a.sendSafe(msg)
@@ -2072,7 +2072,7 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 		s.mu.Unlock()
 		a.answerCallback(cq.ID, "")
 		a.removeKeyboard(chatID, msgID)
-		msg := tgbotapi.NewMessage(chatID, "📝 请输入你的回答：")
+		msg := newMessage(chatID, "📝 请输入你的回答：")
 		msg.ParseMode = "MarkdownV2"
 		msg.ReplyToMessageID = cq.Message.MessageID
 		a.sendSafe(msg)
@@ -2116,7 +2116,7 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 
 		header := fmt.Sprintf("问题 %d/%d\n", nextIdx+1, len(pc.allQuestions))
 		text := "❓ " + header + qText
-		msg := tgbotapi.NewMessage(chatID, text)
+		msg := newMessage(chatID, text)
 		msg.ParseMode = "MarkdownV2"
 		if len(options) > 0 {
 			var rows [][]tgbotapi.InlineKeyboardButton

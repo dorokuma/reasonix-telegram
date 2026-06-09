@@ -1,7 +1,10 @@
 package main
 
 import (
+	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -16,6 +19,126 @@ const telegramMaxMessageRunes = 4096
 
 // Hard cap on streamed reply size before finalize (OOM guard).
 const maxFinalizeBytes = 512 << 10
+
+// isMediaFilePath detects media file type from extension.
+func isMediaFilePath(path string) (mediaType string, ok bool) {
+	if idx := strings.LastIndex(path, "."); idx >= 0 {
+		ext := strings.ToLower(path[idx:])
+		if qi := strings.Index(ext, "?"); qi >= 0 {
+			ext = ext[:qi]
+		}
+		switch ext {
+		case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp":
+			return "photo", true
+		case ".mp4", ".webm", ".mov", ".avi", ".mkv":
+			return "video", true
+		case ".mp3", ".ogg", ".wav", ".flac", ".m4a":
+			return "audio", true
+		}
+	}
+	return "", false
+}
+
+// sendNativeMedia sends a local file as Telegram native media.
+func (a *App) sendNativeMedia(chatID int64, path string, caption string) bool {
+	mediaType, ok := isMediaFilePath(path)
+	if !ok {
+		return false
+	}
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		log.Printf("chat=%d: open media %s: %v", chatID, path, err)
+		return false
+	}
+	defer f.Close()
+	file := tgbotapi.FileReader{Name: filepath.Base(path), Reader: f}
+	switch mediaType {
+	case "photo":
+		msg := tgbotapi.NewPhoto(chatID, file)
+		if caption != "" {
+			msg.Caption = caption
+		}
+		if _, err := a.bot.Send(msg); err != nil {
+			log.Printf("chat=%d: sendPhoto %s: %v", chatID, path, err)
+			return false
+		}
+		return true
+	case "video":
+		msg := tgbotapi.NewVideo(chatID, file)
+		if caption != "" {
+			msg.Caption = caption
+		}
+		if _, err := a.bot.Send(msg); err != nil {
+			log.Printf("chat=%d: sendVideo %s: %v", chatID, path, err)
+			return false
+		}
+		return true
+	case "audio":
+		msg := tgbotapi.NewAudio(chatID, file)
+		if caption != "" {
+			msg.Caption = caption
+		}
+		if _, err := a.bot.Send(msg); err != nil {
+			log.Printf("chat=%d: sendAudio %s: %v", chatID, path, err)
+			return false
+		}
+		return true
+	}
+	return false
+}
+
+// sendDocument sends a file as native Telegram document.
+func (a *App) sendDocument(chatID int64, path string, caption string) bool {
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return false
+	}
+	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+		return false
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		log.Printf("chat=%d: open document %s: %v", chatID, path, err)
+		return false
+	}
+	defer f.Close()
+	msg := tgbotapi.NewDocument(chatID, tgbotapi.FileReader{Name: filepath.Base(path), Reader: f})
+	if caption != "" {
+		msg.Caption = caption
+	}
+	if _, err := a.bot.Send(msg); err != nil {
+		log.Printf("chat=%d: sendDocument %s: %v", chatID, path, err)
+		return false
+	}
+	return true
+}
+
+// extractAndSendMedia scans text for file paths and sends matching files as native media.
+func (a *App) extractAndSendMedia(chatID int64, text string) string {
+	lines := strings.Split(text, "\n")
+	var kept []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		path := ""
+		if strings.HasPrefix(trimmed, "file://") {
+			path = strings.TrimPrefix(trimmed, "file://")
+		} else if strings.HasPrefix(trimmed, "/") && len(trimmed) > 5 && !strings.Contains(trimmed, " ") {
+			path = trimmed
+		}
+		if path != "" {
+			if a.sendNativeMedia(chatID, path, "") {
+				continue
+			}
+			if a.sendDocument(chatID, path, "") {
+				continue
+			}
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n")
+}
 
 // splitTelegramText splits s into chunks of at most maxRunes, preferring line breaks.
 func splitTelegramText(s string, maxRunes int) []string {
@@ -181,6 +304,13 @@ func capTelegramMessage(text string) string {
 	return string(runes[:telegramMaxMessageRunes-suffixRunes]) + suffix
 }
 
+// newMessage creates a MessageConfig with link preview disabled (Hermes parity).
+func newMessage(chatID int64, text string) tgbotapi.MessageConfig {
+	msg := tgbotapi.NewMessage(chatID, text)
+	msg.DisableWebPagePreview = true
+	return msg
+}
+
 // sendTextParts delivers text as one or more Telegram messages (≤4096 runes each).
 // Tries Telegram MarkdownV2 first; on entity-parse failure retries as plain text
 // (with the MDV2 escape backslashes and formatting markers stripped via _stripMdv2,
@@ -190,6 +320,12 @@ func (a *App) sendTextParts(chatID int64, text string, editFirstMsgID *int) int 
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return 0
+	}
+	// Extract and send native media before formatting text
+	text = a.extractAndSendMedia(chatID, text)
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return 1
 	}
 	if n := a.sendFormattedParts(chatID, formatForTelegram(text), editFirstMsgID, "MarkdownV2"); n > 0 {
 		return n
@@ -246,14 +382,14 @@ func (a *App) editOverflowSplit(chatID int64, messageID int, parts []string, par
 func (a *App) sendMessageParts(chatID int64, parts []string, parseMode string, replyTo int) int {
 	sent := 0
 	for i, part := range parts {
-		msg := tgbotapi.NewMessage(chatID, part)
+		msg := newMessage(chatID, part)
 		if parseMode != "" {
 			msg.ParseMode = parseMode
 		}
 		if replyTo != 0 {
 			msg.ReplyToMessageID = replyTo
 		}
-		m, err := a.bot.Send(msg)
+		m, err := a.sendWithRetry(msg)
 		if err != nil {
 			if telegramErrorIsParseEntities(err) {
 				return sent
@@ -268,4 +404,39 @@ func (a *App) sendMessageParts(chatID int64, parts []string, parseMode string, r
 		}
 	}
 	return sent
+}
+
+// sendWithRetry sends a message with retry for flood/network errors (Hermes parity).
+func (a *App) sendWithRetry(msg tgbotapi.MessageConfig) (tgbotapi.Message, error) {
+	const maxAttempts = 3
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		m, err := a.bot.Send(msg)
+		if err == nil {
+			return m, nil
+		}
+		lastErr = err
+		if telegramErrorIsParseEntities(err) || telegramErrorIsNotModified(err) {
+			return m, err
+		}
+		if telegramErrorIsFlood(err) {
+			var waitSec int
+			if _, se := fmt.Sscanf(err.Error(), "%d", &waitSec); se != nil || waitSec < 1 {
+				waitSec = 5
+			}
+			if waitSec > 15 {
+				waitSec = 15
+			}
+			log.Printf("chat=%d: flood wait %ds (attempt %d/%d)", msg.ChatID, waitSec, attempt+1, maxAttempts)
+			time.Sleep(time.Duration(waitSec) * time.Second)
+			continue
+		}
+		if attempt+1 < maxAttempts {
+			backoff := time.Duration(1<<uint(attempt)) * time.Second
+			log.Printf("chat=%d: transient error, retry in %v (attempt %d/%d): %v", msg.ChatID, backoff, attempt+1, maxAttempts, err)
+			time.Sleep(backoff)
+			continue
+		}
+	}
+	return tgbotapi.Message{}, lastErr
 }
