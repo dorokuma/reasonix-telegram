@@ -98,32 +98,59 @@ type turnResult struct {
 }
 
 func (a *App) reasonixEnv() []string {
-	env := os.Environ()
-	// Ensure /root/.local/bin is in PATH (rtk lives there).
-	hasLocalBin := false
-	for _, e := range env {
-		if strings.HasPrefix(e, "PATH=") && strings.Contains(e, "/root/.local/bin") {
-			hasLocalBin = true
-			break
-		}
+	// Build a minimal environment for child processes — never inherit all
+	// parent env vars (which may contain API keys, tokens, secrets).
+	var env []string
+
+	// Pass through safe variables that reasonix may need.
+	safePrefixes := []string{
+		"HOME=", "USER=", "LOGNAME=", "SHELL=",
+		"PATH=", "LANG=", "LC_", "LANGUAGE=", "TZ=",
+		"HTTP_PROXY=", "HTTPS_PROXY=", "NO_PROXY=",
+		"http_proxy=", "https_proxy=", "no_proxy=",
+		"SSH_AUTH_SOCK=", "SSH_AGENT_PID=",
+		"DOCKER_HOST=", "DOCKER_CONTEXT=",
+		"EDITOR=", "VISUAL=", "PAGER=",
+		"XDG_",
 	}
-	if !hasLocalBin {
-		for i, e := range env {
-			if strings.HasPrefix(e, "PATH=") {
-				env[i] = e + ":/root/.local/bin"
+	for _, e := range os.Environ() {
+		for _, p := range safePrefixes {
+			if strings.HasPrefix(e, p) {
+				env = append(env, e)
 				break
 			}
 		}
 	}
+
+	// Ensure PATH includes common bin locations.
+	hasUsrLocal := false
+	for _, e := range env {
+		if strings.HasPrefix(e, "PATH=") && strings.Contains(e, "/usr/local/bin") {
+			hasUsrLocal = true
+			break
+		}
+	}
+	if !hasUsrLocal {
+		for i, e := range env {
+			if strings.HasPrefix(e, "PATH=") {
+				env[i] = e + ":/usr/local/bin"
+				break
+			}
+		}
+	}
+
+	// Only DEEPSEEK_API_KEY is intentionally forwarded.
 	if k := os.Getenv("DEEPSEEK_API_KEY"); k != "" {
 		env = append(env, "DEEPSEEK_API_KEY="+k)
 	}
+
 	// systemd ProtectHome=read-only blocks /root/.cache; keep caches under StateDir.
 	cacheBase := filepath.Join(a.cfg.StateDir, "cache")
 	env = append(env,
 		"REASONIX_CACHE_DIR="+cacheBase,
 		"XDG_CACHE_HOME="+cacheBase,
 	)
+
 	if a.getMode() == ModeChat {
 		env = append(env, "NO_COLOR=1", "FORCE_COLOR=0", "CI=1", "TERM=dumb")
 	}
@@ -159,8 +186,11 @@ func (a *App) stopSessionServe(s *session, chatID int64) {
 	s.serveCmd = nil
 	s.mu.Unlock()
 	if cmd != nil && cmd.Process != nil {
-		// Send SIGTERM and wait for serve to flush session data.
-		log.Printf("chat=%d: stopping serve (pid %d), waiting for session flush…", chatID, cmd.Process.Pid)
+		// The bridge already sent /cancel via cancelAllTasks + waitTasksDone.
+		// Give the serve process 3s to flush its session JSONL before SIGTERM,
+		// so the last few messages survive a restart.
+		log.Printf("chat=%d: stopping serve (pid %d), 3s grace for session flush…", chatID, cmd.Process.Pid)
+		time.Sleep(3 * time.Second)
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 		waitDone := make(chan struct{})
 		go func() {
@@ -368,8 +398,12 @@ func postJSON(port int, path string, body any) error {
 
 func (a *App) lockServeMode(port int) {
 	if a.getMode() == ModeChat {
-		_ = postJSON(port, "/plan", map[string]bool{"on": false})
-		_ = postJSON(port, "/bypass", map[string]bool{"on": false})
+		if err := postJSON(port, "/plan", map[string]bool{"on": false}); err != nil {
+			log.Printf("chat=%s: lock plan failed: %v", serveAddr(port), err)
+		}
+		if err := postJSON(port, "/bypass", map[string]bool{"on": false}); err != nil {
+			log.Printf("chat=%s: lock bypass failed: %v", serveAddr(port), err)
+		}
 	}
 	// tool mode: leave plan/bypass as-is so the agent can use tools
 }
@@ -433,14 +467,21 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 
 	// SSE idle watchdog: close body if no data for 5 min (Hermes-inspired).
 	var lastActivityUnix int64 = time.Now().Unix()
+	watchdogCtx, watchdogCancel := context.WithCancel(ctx)
+	defer watchdogCancel()
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
-		for range ticker.C {
-			elapsed := time.Now().Unix() - atomic.LoadInt64(&lastActivityUnix)
-			if elapsed > 300 {
-				log.Printf("port=%d: SSE idle for %ds, closing stream", port, elapsed)
-				resp.Body.Close()
+		for {
+			select {
+			case <-ticker.C:
+				elapsed := time.Now().Unix() - atomic.LoadInt64(&lastActivityUnix)
+				if elapsed > 300 {
+					log.Printf("port=%d: SSE idle for %ds, closing stream", port, elapsed)
+					resp.Body.Close()
+					return
+				}
+			case <-watchdogCtx.Done():
 				return
 			}
 		}
@@ -703,6 +744,67 @@ func shouldFlushReasoningFallback(gotTextDelta, sawToolDispatch bool) bool {
 }
 
 // reasoningFallbackBody returns visible text when a turn produced only reasoning.
+// hasCJK returns true when s contains any CJK Unified Ideograph (Chinese/Japanese/Korean).
+func hasCJK(s string) bool {
+	for _, r := range s {
+		if r >= 0x4E00 && r <= 0x9FFF {
+			return true
+		}
+	}
+	return false
+}
+
+// isPureEnglish returns true when s has meaningful English content but zero CJK characters.
+// Reasoning/thinking from the model is nearly always English; a Chinese-locale response
+// almost always contains CJK characters (even if mixed with code/terms).
+func isPureEnglish(s string) bool {
+	letterCount := 0
+	for _, r := range s {
+		if r >= 0x4E00 && r <= 0x9FFF {
+			return false
+		}
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
+			letterCount++
+		}
+	}
+	return letterCount > 5
+}
+
+// thinkingOpeners are phrases (lowercased) that indicate the text is self-directed
+// reasoning/thinking rather than a user-facing response. When the fallback body
+// begins with any of these, it is still thinking, not an answer.
+var thinkingOpeners = []string{
+	// Chinese self-directed analysis
+	"让我", "我先", "我需要", "我们先",
+	"首先", "第一步",
+	"我来看看", "让我看看",
+	"这个问题", "这需要",
+	// English self-directed analysis
+	"let me", "let's", "i need", "i want", "i should",
+	"first,", "first i", "firstly",
+	"the user", "the model",
+}
+
+// isLikelyThinking returns true when the text reads like internal reasoning
+// rather than a direct response. Used to reject reasoning-only fallback that
+// would leak the model's chain-of-thought to the user.
+func isLikelyThinking(s string) bool {
+	trimmed := strings.TrimSpace(s)
+	lower := strings.ToLower(trimmed)
+	// Check for thinking opener patterns on the first line / beginning of text.
+	for _, p := range thinkingOpeners {
+		if strings.HasPrefix(lower, p) {
+			return true
+		}
+	}
+	// English-only text in a reasoning-only turn is almost certainly thinking.
+	if isPureEnglish(trimmed) {
+		return true
+	}
+	return false
+}
+
+// reasoningFallbackBody returns visible text when a turn produced only reasoning.
 func reasoningFallbackBody(reasoning string) (string, bool) {
 	body := strings.TrimSpace(stripThinkBlocks(stripANSI(reasoning)))
 	if body == "" {
@@ -727,7 +829,7 @@ func reasoningFallbackBody(reasoning string) (string, bool) {
 	if len(body) < len(original)/2 && utf8RuneCount(original) > len(body)+80 {
 		body = original
 	}
-	if body == "" || isReasonixNoise(body) || isSilenceOnly(body) {
+	if body == "" || isReasonixNoise(body) || isSilenceOnly(body) || isLikelyThinking(body) {
 		return "", false
 	}
 	return body, true

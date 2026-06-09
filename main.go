@@ -77,9 +77,7 @@ func isReasonixNoise(line string) bool {
 	if strings.HasPrefix(line, "background ") {
 		return true // background job start/finish/kill notices
 	}
-	if strings.Contains(line, "context reached") && strings.Contains(line, "compact threshold") {
-		return true // compaction notice — automatic, no user action needed
-	}
+
 	return reTokenStats.MatchString(line) ||
 		reStatusDot.MatchString(line) ||
 		reThinkingBar.MatchString(line)
@@ -271,6 +269,7 @@ type App struct {
 	restartMu      sync.Mutex
 	restarting     bool
 	restartStarted time.Time
+	msgWg          sync.WaitGroup // tracks in-flight handleMessage goroutines
 	draftSeq       uint64 // per-process draft_id sequence (avoids same-second collisions)
 	clarifySeq     uint64 // monotonic counter for clarify IDs
 	mode           atomic.Value // string: ModeChat or ModeTool
@@ -348,9 +347,24 @@ func main() {
 		app.restartMu.Lock()
 		app.restarting = true
 		app.restartMu.Unlock()
-		// Cancel running tasks so they exit cleanly (no "unexpected EOF").
+		// Drain: wait for in-flight handleMessage / handleCallbackQuery
+		// goroutines to complete so messages are submitted to the serve
+		// process before we cancel anything. This mirrors Hermes'
+		// _drain_active_agents approach: let tasks finish, don't interrupt.
+		drainDone := make(chan struct{})
+		go func() {
+			app.msgWg.Wait()
+			close(drainDone)
+		}()
+		select {
+		case <-drainDone:
+			log.Printf("shutdown: all message handlers drained")
+		case <-time.After(15 * time.Second):
+			log.Printf("shutdown: drain timeout, proceeding with cancel")
+		}
+		// Cancel any remaining tasks that didn't drain in time.
 		app.cancelAllTasks()
-		// Wait for running tasks to finish (max 5 min).
+		// Wait for cancelled tasks to finish (max 5 min).
 		app.waitTasksDone(5 * time.Minute)
 		log.Printf("shutdown: all tasks done, stopping serves…")
 		app.stopAllServes()
@@ -363,10 +377,18 @@ func main() {
 
 	for upd := range updates {
 		if upd.Message != nil {
-			go app.handleMessage(upd.Message)
+			app.msgWg.Add(1)
+			go func(msg *tgbotapi.Message) {
+				defer app.msgWg.Done()
+				app.handleMessage(msg)
+			}(upd.Message)
 		}
 		if upd.CallbackQuery != nil {
-			go app.handleCallbackQuery(upd.CallbackQuery)
+			app.msgWg.Add(1)
+			go func(query *tgbotapi.CallbackQuery) {
+				defer app.msgWg.Done()
+				app.handleCallbackQuery(query)
+			}(upd.CallbackQuery)
 		}
 	}
 }
@@ -1905,28 +1927,9 @@ func (a *App) sendEffortPicker(chatID int64, _ int) {
 
 // persistModel writes the model ID to the .env file so it survives restarts.
 func (a *App) persistModel(modelID string) error {
-	envPath := filepath.Join(filepath.Dir(a.cfg.ReasonixBin), ".env")
-	// Try project dir first, then state dir.
-	if _, err := os.Stat(envPath); err != nil {
-		envPath = "/root/reasonix-telegram/.env"
-	}
-	data, err := os.ReadFile(envPath)
-	if err != nil {
-		return err
-	}
-	lines := strings.Split(string(data), "\n")
-	found := false
-	for i, line := range lines {
-		if strings.HasPrefix(line, "MODEL=") || strings.HasPrefix(line, "MODEL =") {
-			lines[i] = "MODEL=" + modelID
-			found = true
-			break
-		}
-	}
-	if !found {
-		lines = append(lines, "MODEL="+modelID)
-	}
-	return os.WriteFile(envPath, []byte(strings.Join(lines, "\n")), 0o644)
+	envPath := filepath.Join(a.cfg.StateDir, "env")
+	data := []byte("MODEL=" + modelID + "\n")
+	return os.WriteFile(envPath, data, 0o600)
 }
 
 func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {

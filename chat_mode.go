@@ -1,6 +1,7 @@
 package main
 
 import (
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -99,6 +100,10 @@ func (a *App) linkUserRulesIntoChatWD(wd string) {
 		return
 	}
 	link := filepath.Join(wd, filepath.Base(src))
-	_ = os.Remove(link)
-	_ = os.Symlink(src, link)
+	if err := os.Remove(link); err != nil && !os.IsNotExist(err) {
+		log.Printf("remove old rules link %s: %v", link, err)
+	}
+	if err := os.Symlink(src, link); err != nil {
+		log.Printf("symlink rules %s -> %s: %v", link, src, err)
+	}
 }

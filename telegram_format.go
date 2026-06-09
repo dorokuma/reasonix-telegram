@@ -259,7 +259,27 @@ func renderTableBlockForTelegram(tableBlock []string) string {
 			}
 		}
 
-		groupLines := []string{"**" + heading + "**"}
+		// Strip any existing bold/code markers from the cell content before
+		// we wrap it as a bold heading. The cell may contain **bold** or
+		// `code` markdown; double-wrapping would produce ****text**** or
+		// **`**bold**`** which breaks the bold regex later.
+		clean := strings.TrimSpace(heading)
+		// Strip surrounding backticks (inline code) so that `**bold**`
+		// becomes **bold** then bold, not **`**bold**`** which leaks.
+		for strings.HasPrefix(clean, "`") {
+			clean = strings.TrimPrefix(clean, "`")
+		}
+		for strings.HasSuffix(clean, "`") {
+			clean = strings.TrimSuffix(clean, "`")
+		}
+		for strings.HasPrefix(clean, "**") {
+			clean = strings.TrimPrefix(clean, "**")
+		}
+		for strings.HasSuffix(clean, "**") {
+			clean = strings.TrimSuffix(clean, "**")
+		}
+		clean = strings.TrimSpace(clean)
+		groupLines := []string{"**" + clean + "**"}
 		groupLines = append(groupLines, bullets...)
 		groups = append(groups, strings.Join(groupLines, "\n"))
 	}
