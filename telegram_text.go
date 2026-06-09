@@ -1,10 +1,11 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -19,6 +20,7 @@ const telegramMaxMessageRunes = 4096
 
 // Hard cap on streamed reply size before finalize (OOM guard).
 const maxFinalizeBytes = 512 << 10
+const maxMediaSize = 50 << 20 // 50 MB max for media uploads
 
 // isMediaFilePath detects media file type from extension.
 func isMediaFilePath(path string) (mediaType string, ok bool) {
@@ -45,7 +47,7 @@ func (a *App) sendNativeMedia(chatID int64, path string, caption string) bool {
 	if !ok {
 		return false
 	}
-	if _, err := os.Stat(path); os.IsNotExist(err) {
+	if fi, err := os.Stat(path); os.IsNotExist(err) || (err == nil && fi.Size() > maxMediaSize) {
 		return false
 	}
 	f, err := os.Open(path)
@@ -61,7 +63,7 @@ func (a *App) sendNativeMedia(chatID int64, path string, caption string) bool {
 		if caption != "" {
 			msg.Caption = caption
 		}
-		if _, err := a.bot.Send(msg); err != nil {
+		if _, err := a.sendWithRetry(msg, chatID); err != nil {
 			log.Printf("chat=%d: sendPhoto %s: %v", chatID, path, err)
 			return false
 		}
@@ -71,7 +73,7 @@ func (a *App) sendNativeMedia(chatID int64, path string, caption string) bool {
 		if caption != "" {
 			msg.Caption = caption
 		}
-		if _, err := a.bot.Send(msg); err != nil {
+		if _, err := a.sendWithRetry(msg, chatID); err != nil {
 			log.Printf("chat=%d: sendVideo %s: %v", chatID, path, err)
 			return false
 		}
@@ -81,7 +83,7 @@ func (a *App) sendNativeMedia(chatID int64, path string, caption string) bool {
 		if caption != "" {
 			msg.Caption = caption
 		}
-		if _, err := a.bot.Send(msg); err != nil {
+		if _, err := a.sendWithRetry(msg, chatID); err != nil {
 			log.Printf("chat=%d: sendAudio %s: %v", chatID, path, err)
 			return false
 		}
@@ -92,10 +94,10 @@ func (a *App) sendNativeMedia(chatID int64, path string, caption string) bool {
 
 // sendDocument sends a file as native Telegram document.
 func (a *App) sendDocument(chatID int64, path string, caption string) bool {
-	if _, err := os.Stat(path); os.IsNotExist(err) {
+	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
 		return false
 	}
-	if strings.HasPrefix(path, "http://") || strings.HasPrefix(path, "https://") {
+	if fi, err := os.Stat(path); os.IsNotExist(err) || (err == nil && fi.Size() > maxMediaSize) {
 		return false
 	}
 	f, err := os.Open(path)
@@ -108,7 +110,7 @@ func (a *App) sendDocument(chatID int64, path string, caption string) bool {
 	if caption != "" {
 		msg.Caption = caption
 	}
-	if _, err := a.bot.Send(msg); err != nil {
+	if _, err := a.sendWithRetry(msg, chatID); err != nil {
 		log.Printf("chat=%d: sendDocument %s: %v", chatID, path, err)
 		return false
 	}
@@ -389,7 +391,7 @@ func (a *App) sendMessageParts(chatID int64, parts []string, parseMode string, r
 		if replyTo != 0 {
 			msg.ReplyToMessageID = replyTo
 		}
-		m, err := a.sendWithRetry(msg)
+		m, err := a.sendWithRetry(msg, chatID)
 		if err != nil {
 			if telegramErrorIsParseEntities(err) {
 				return sent
@@ -406,9 +408,10 @@ func (a *App) sendMessageParts(chatID int64, parts []string, parseMode string, r
 	return sent
 }
 
-// sendWithRetry sends a message with retry for flood/network errors (Hermes parity).
-func (a *App) sendWithRetry(msg tgbotapi.MessageConfig) (tgbotapi.Message, error) {
+// sendWithRetry sends any Chattable with retry for flood/network errors.
+func (a *App) sendWithRetry(msg tgbotapi.Chattable, chatID int64) (tgbotapi.Message, error) {
 	const maxAttempts = 3
+	reFloodWait := regexp.MustCompile(`(\d+)`)
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		m, err := a.bot.Send(msg)
@@ -421,19 +424,24 @@ func (a *App) sendWithRetry(msg tgbotapi.MessageConfig) (tgbotapi.Message, error
 		}
 		if telegramErrorIsFlood(err) {
 			var waitSec int
-			if _, se := fmt.Sscanf(err.Error(), "%d", &waitSec); se != nil || waitSec < 1 {
+			if m := reFloodWait.FindStringSubmatch(err.Error()); len(m) > 1 {
+				if ws, err := strconv.Atoi(m[1]); err == nil && ws > 0 {
+					waitSec = ws
+				}
+			}
+			if waitSec < 1 {
 				waitSec = 5
 			}
 			if waitSec > 15 {
 				waitSec = 15
 			}
-			log.Printf("chat=%d: flood wait %ds (attempt %d/%d)", msg.ChatID, waitSec, attempt+1, maxAttempts)
+			log.Printf("chat=%d: flood wait %ds (attempt %d/%d)", chatID, waitSec, attempt+1, maxAttempts)
 			time.Sleep(time.Duration(waitSec) * time.Second)
 			continue
 		}
 		if attempt+1 < maxAttempts {
 			backoff := time.Duration(1<<uint(attempt)) * time.Second
-			log.Printf("chat=%d: transient error, retry in %v (attempt %d/%d): %v", msg.ChatID, backoff, attempt+1, maxAttempts, err)
+			log.Printf("chat=%d: transient error, retry in %v (attempt %d/%d): %v", chatID, backoff, attempt+1, maxAttempts, err)
 			time.Sleep(backoff)
 			continue
 		}

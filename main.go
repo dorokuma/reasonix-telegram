@@ -275,6 +275,22 @@ type App struct {
 	mode           atomic.Value // string: ModeChat or ModeTool
 }
 
+type tokenRedactingTransport struct {
+	inner http.RoundTripper
+	token string
+}
+
+func (t *tokenRedactingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	resp, err := t.inner.RoundTrip(req)
+	if err != nil && t.token != "" {
+		sanitized := strings.ReplaceAll(err.Error(), t.token, "***")
+		if sanitized != err.Error() {
+			return resp, errors.New(sanitized)
+		}
+	}
+	return resp, err
+}
+
 func (a *App) getMode() string {
 	if v := a.mode.Load(); v != nil {
 		return v.(string)
@@ -313,6 +329,13 @@ func main() {
 		log.Fatalf("telegram auth failed: %v", err)
 	}
 	bot.Debug = false
+	// Wrap HTTP client to redact bot token from error logs
+	bot.Client = &http.Client{
+		Transport: &tokenRedactingTransport{
+			inner: http.DefaultTransport,
+			token: cfg.BotToken,
+		},
+	}
 	log.Printf("authorized as @%s (id=%d)", bot.Self.UserName, bot.Self.ID)
 
 	if err := registerCommands(bot); err != nil {
@@ -491,7 +514,7 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 				})
 				msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
 			}
-			if sent, err := a.bot.Send(msg); err != nil {
+			if sent, err := a.sendWithRetry(msg, m.Chat.ID); err != nil {
 				log.Printf("send failed: %v", err)
 			} else {
 				s.mu.Lock()
@@ -1005,7 +1028,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			previewHTML := formatForTelegram(preview)
 			msg := newMessage(chatID, previewHTML)
 			msg.ParseMode = "MarkdownV2"
-			sent, err := a.bot.Send(msg)
+			sent, err := a.sendWithRetry(msg, chatID)
 			if err != nil {
 				log.Printf("chat=%d: stream send failed: %v", chatID, err)
 				editFailCount++
@@ -1029,7 +1052,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		previewHTML := formatForTelegram(preview)
 		edit := tgbotapi.NewEditMessageText(chatID, streamMsgID, previewHTML)
 		edit.ParseMode = "MarkdownV2"
-		_, err := a.bot.Send(edit)
+		_, err := a.sendWithRetry(edit, chatID)
 		if telegramEditOK(err) {
 			editFailCount = 0
 			lastDraftBody = preview
@@ -1095,7 +1118,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				text = capTelegramMessage(text)
 				msg := newMessage(chatID, formatForTelegram(text))
 				msg.ParseMode = "MarkdownV2"
-				sent, err := a.bot.Send(msg)
+				sent, err := a.sendWithRetry(msg, chatID)
 				if err != nil {
 					log.Printf("chat=%d: commentary send failed: %v", chatID, err)
 					return 0
@@ -1180,7 +1203,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 					msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
 				}
 				// Send message and store ID for keyboard removal
-				if sent, err := a.bot.Send(msg); err != nil {
+				if sent, err := a.sendWithRetry(msg, chatID); err != nil {
 					log.Printf("send failed: %v", err)
 				} else {
 					s.mu.Lock()
@@ -2133,7 +2156,7 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 			})
 			msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
 		}
-		if sent, err := a.bot.Send(msg); err != nil {
+		if sent, err := a.sendWithRetry(msg, chatID); err != nil {
 			log.Printf("send failed: %v", err)
 		} else {
 			s.mu.Lock()
@@ -2237,9 +2260,9 @@ func killDescendants(rootPid int) {
 }
 
 
-// sendSafe sends a message and logs any error.
+// sendSafe sends a message with retry and logs any error.
 func (a *App) sendSafe(msg tgbotapi.Chattable) {
-	if _, err := a.bot.Send(msg); err != nil {
+	if _, err := a.sendWithRetry(msg, 0); err != nil {
 		log.Printf("send failed: %v", err)
 	}
 }
@@ -2274,7 +2297,7 @@ func (a *App) editCommentary(chatID int64, messageID int, appendText string) err
 	text := capTelegramMessage(appendText)
 	edit := tgbotapi.NewEditMessageText(chatID, messageID, formatForTelegram(text))
 	edit.ParseMode = "MarkdownV2"
-	_, err := a.bot.Send(edit)
+	_, err := a.sendWithRetry(edit, chatID)
 	if telegramEditOK(err) {
 		return nil
 	}
