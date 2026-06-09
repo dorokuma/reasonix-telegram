@@ -5,21 +5,14 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=reasonix-tg
-Group=reasonix-tg
-WorkingDirectory=/var/lib/reasonix-telegram
+User=root
+Group=root
+WorkingDirectory=/root
 EnvironmentFile=/etc/reasonix-telegram.env
-EnvironmentFile=-/var/lib/reasonix-telegram/env
 ExecStart=/usr/local/bin/reasonix-telegram
 Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=310
-
-NoNewPrivileges=true
-ProtectSystem=strict
-ReadWritePaths=/var/lib/reasonix-telegram
-ProtectHome=read-only
-PrivateTmp=true
 
 StandardOutput=journal
 StandardError=journal
