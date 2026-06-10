@@ -357,7 +357,7 @@ func (a *App) editOverflowSplit(chatID int64, messageID int, parts []string, par
 	if parseMode != "" {
 		edit.ParseMode = parseMode
 	}
-	_, err := a.bot.Send(edit)
+	_, err := a.sendWithRetry(edit, chatID)
 	if !telegramEditOK(err) {
 		if telegramErrorIsMessageTooLong(err) && len(parts) == 1 && len([]rune(parts[0])) > 500 {
 			sub := splitTelegramText(parts[0], telegramMaxMessageRunes/2)
