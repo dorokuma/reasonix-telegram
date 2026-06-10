@@ -552,7 +552,7 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 					}
 				}
 			}
-			if ev.Text != "" && !gotTextDelta {
+			if ev.Text != "" && !gotTextDelta && !isReasonixNoise(ev.Text) {
 				gotTextDelta = true
 				if !bufferingAsk {
 					onChunk(ev.Text)
