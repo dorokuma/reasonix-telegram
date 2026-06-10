@@ -20,6 +20,7 @@ import (
 )
 
 var httpClient = &http.Client{Timeout: 10 * time.Second}
+var sseClient = &http.Client{} // no timeout for long-lived SSE streams
 
 func portForChat(chatID int64) int {
 	const base = 18780
@@ -455,7 +456,7 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 	if err != nil {
 		return turnResult{err: err}
 	}
-	resp, err := httpClient.Do(req)
+	resp, err := sseClient.Do(req)
 	if err != nil {
 		return turnResult{err: err}
 	}
