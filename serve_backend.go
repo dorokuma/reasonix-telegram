@@ -645,8 +645,8 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 					if lastToolMsgID != 0 {
 						if ev.Tool.Err != "" {
 							errMsg := stripHookMessages(ev.Tool.Err)
-							if errMsg != "" {
-								newText := lastToolText + "\n❌ " + trimUTF8Bytes(errMsg, 300)
+							if errMsg != "" && !isReasonixNoise(errMsg) {
+								newText := lastToolText + "\n" + trimUTF8Bytes(errMsg, 300)
 								_ = a.editCommentary(chatID, lastToolMsgID, newText)
 								lastToolText = newText
 							}
