@@ -67,17 +67,15 @@ var (
 )
 
 // isReasonixNoise returns true if the line should be dropped before display.
+// isReasonixNoise returns true if the line should be dropped before display.
 func isReasonixNoise(line string) bool {
-	if strings.TrimSpace(line) == "" {
-		return false // preserve blank lines; the scanner trims these implicitly
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" {
+		return false
 	}
-	if strings.Contains(line, "回复未向用户展示正文") {
-		return true // agent visibility-recovery operator notice, not user content
+	if strings.HasPrefix(trimmed, "❌") || strings.HasPrefix(trimmed, "✅") || strings.HasPrefix(trimmed, "ℹ️") {
+		return true
 	}
-	if strings.HasPrefix(line, "background ") {
-		return true // background job start/finish/kill notices
-	}
-
 	return reTokenStats.MatchString(line) ||
 		reStatusDot.MatchString(line) ||
 		reThinkingBar.MatchString(line)
