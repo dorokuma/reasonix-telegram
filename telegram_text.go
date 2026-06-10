@@ -461,6 +461,10 @@ func (a *App) sendWithRetry(msg tgbotapi.Chattable, chatID int64) (tgbotapi.Mess
 			time.Sleep(time.Duration(waitSec) * time.Second)
 			continue
 		}
+		// timeout/deadline exceeded means the request MAY have succeeded on Telegram end. Retrying creates a duplicate.
+		if strings.Contains(err.Error(), "timeout") || strings.Contains(err.Error(), "deadline exceeded") {
+			return tgbotapi.Message{}, err
+		}
 		if attempt+1 < maxAttempts {
 			backoff := time.Duration(1<<uint(attempt)) * time.Second
 			log.Printf("chat=%d: transient error, retry in %v (attempt %d/%d): %v", chatID, backoff, attempt+1, maxAttempts, err)
