@@ -21,6 +21,7 @@ const telegramMaxMessageRunes = 4096
 // Hard cap on streamed reply size before finalize (OOM guard).
 const maxFinalizeBytes = 512 << 10
 const maxMediaSize = 50 << 20 // 50 MB max for media uploads
+const telegramMaxCaptionRunes = 1024 // Telegram Bot API caption limit
 
 // isMediaFilePath detects media file type from extension.
 func isMediaFilePath(path string) (mediaType string, ok bool) {
@@ -175,7 +176,7 @@ func splitTelegramText(s string, maxRunes int) []string {
 			}
 		}
 		if breakAt > 0 {
-			parts = append(parts, string(window[:breakAt]))
+			parts = append(parts, string(window[:breakAt+1]))
 			start += breakAt + 1
 			continue
 		}
@@ -318,10 +319,31 @@ func newMessage(chatID int64, text string) tgbotapi.MessageConfig {
 // (with the MDV2 escape backslashes and formatting markers stripped via _stripMdv2,
 // Hermes pattern). If editFirstMsgID != nil and *editFirstMsgID > 0, the first
 // part updates that message.
-func (a *App) sendTextParts(chatID int64, text string, editFirstMsgID *int) int {
+func (a *App) sendTextParts(chatID int64, text string, editFirstMsgID *int, noFileFallback ...bool) int {
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return 0
+	}
+	// Check if file fallback is disabled (recursion guard)
+	if len(noFileFallback) > 0 && noFileFallback[0] && len(text) > telegramMaxMessageRunes*3 {
+		// Split long text into multiple parts without file fallback
+		parts := splitTelegramText(formatForTelegram(text), telegramMaxMessageRunes)
+		total := 0
+		for i, p := range parts {
+			msg := newMessage(chatID, p)
+			msg.ParseMode = "MarkdownV2"
+			if i > 0 {
+				time.Sleep(multiPartSendGap)
+			}
+			if _, err := a.sendWithRetry(msg, chatID); err != nil {
+				if !telegramErrorIsParseEntities(err) {
+					log.Printf("chat=%d: noFileFallback part %d/%d: %v", chatID, i+1, len(parts), err)
+				}
+				break
+			}
+			total++
+		}
+		return total
 	}
 	// Extract and send native media before formatting text
 	text = a.extractAndSendMedia(chatID, text)

@@ -19,6 +19,8 @@ import (
 	"time"
 )
 
+var httpClient = &http.Client{Timeout: 10 * time.Second}
+
 func portForChat(chatID int64) int {
 	const base = 18780
 	const span = 8000
@@ -158,6 +160,9 @@ func (a *App) reasonixEnv() []string {
 }
 
 func (a *App) serveRunning(s *session) bool {
+	if s == nil {
+		return false
+	}
 	s.mu.Lock()
 	cmd := s.serveCmd
 	port := s.servePort
@@ -384,7 +389,7 @@ func postJSON(port int, path string, body any) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -412,6 +417,8 @@ func (a *App) lockServeMode(port int) {
 // streams SSE events until turn_done. The conversation history stays in the
 // same Reasonix session file across Telegram messages and bridge restarts.
 func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string) int, onAskRequest func(askID string, questions []askQuestionData), onApprovalRequest func(approvalID string, toolName string), onUsage func(wireUsage)) error {
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
 	s := a.getOrCreateSession(chatID)
 	s.mu.Lock()
 	port := s.servePort
@@ -425,6 +432,7 @@ func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onC
 	}()
 
 	if err := postJSON(port, "/submit", map[string]string{"input": prompt}); err != nil {
+		cancel()
 		return fmt.Errorf("submit: %w", err)
 	}
 
@@ -447,7 +455,7 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 	if err != nil {
 		return turnResult{err: err}
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return turnResult{err: err}
 	}
@@ -701,10 +709,16 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 			}
 		}
 	}
-	if err := sc.Err(); err != nil && ctx.Err() == nil {
-		return turnResult{err: err}
+	if err := sc.Err(); err != nil {
+		log.Printf("chat=%d: consumeServeEvents scanner error: %v", chatID, err)
+		if ctx.Err() == nil {
+			return turnResult{err: err}
+		}
 	}
-	return turnResult{err: ctx.Err()}
+	if ctx.Err() != nil {
+		return turnResult{err: ctx.Err()}
+	}
+	return turnResult{}
 }
 
 // openThinkTags and closeThinkTags for stripping reasoning blocks.

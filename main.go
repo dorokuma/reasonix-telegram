@@ -194,6 +194,8 @@ func loadConfig() Config {
 		for _, p := range strings.Split(s, ",") {
 			if id, err := strconv.ParseInt(strings.TrimSpace(p), 10, 64); err == nil {
 				c.AllowedUsers = append(c.AllowedUsers, id)
+			} else {
+				log.Printf("config: ALLOWED_USERS ignoring invalid id %q: %v", p, err)
 			}
 		}
 	}
@@ -208,7 +210,10 @@ func getenv(k, def string) string {
 }
 
 func atoi(s string) int {
-	n, _ := strconv.Atoi(s)
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		log.Printf("config: numeric value %q invalid, using 0", s)
+	}
 	return n
 }
 
@@ -391,7 +396,7 @@ func main() {
 		app.waitTasksDone(5 * time.Minute)
 		log.Printf("shutdown: all tasks done, stopping serves…")
 		app.stopAllServes()
-		os.Exit(0)
+		log.Fatal("shutdown complete")
 	}()
 
 	u := tgbotapi.NewUpdate(0)
