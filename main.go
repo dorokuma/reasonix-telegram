@@ -826,7 +826,13 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 	stopTyping := a.beginTyping(chatID)
 	defer stopTyping()
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(a.cfg.MaxDuration)*time.Minute)
+	var ctx context.Context
+	var cancel context.CancelFunc
+	if a.cfg.MaxDuration > 0 {
+		ctx, cancel = context.WithTimeout(context.Background(), time.Duration(a.cfg.MaxDuration)*time.Minute)
+	} else {
+		ctx, cancel = context.WithCancel(context.Background())
+	}
 	s.mu.Lock()
 	s.task = &runningTask{cancel: cancel}
 	s.mu.Unlock()
