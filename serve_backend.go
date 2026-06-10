@@ -528,7 +528,7 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 		switch ev.Kind {
 		case "text":
 			// Streaming token deltas — append in place (never suffix "\n" per chunk).
-			if ev.Text != "" {
+			if ev.Text != "" && !isReasonixNoise(ev.Text) {
 				gotTextDelta = true
 				if bufferingAsk {
 					askTextBuffer.WriteString(ev.Text)
