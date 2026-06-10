@@ -106,4 +106,18 @@ func (a *App) linkUserRulesIntoChatWD(wd string) {
 	if err := os.Symlink(src, link); err != nil {
 		log.Printf("symlink rules %s -> %s: %v", link, src, err)
 	}
+
+	// Symlink REASONIX.md (memory, writable — reasonix writes remembers here).
+	home, _ := os.UserHomeDir()
+	memDir := filepath.Join(home, ".config", "reasonix")
+	memFile := filepath.Join(memDir, "REASONIX.md")
+	if err := os.MkdirAll(memDir, 0o755); err == nil {
+		if _, err := os.Stat(memFile); os.IsNotExist(err) {
+			_ = os.WriteFile(memFile, nil, 0o600)
+		}
+		memLink := filepath.Join(wd, "REASONIX.md")
+		if err := os.Symlink(memFile, memLink); err != nil {
+			log.Printf("chat-wd: symlink %s -> %s: %v", memLink, memFile, err)
+		}
+	}
 }
