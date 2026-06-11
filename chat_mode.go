@@ -12,7 +12,7 @@ const chatWorkdirSubdir = "chat-wd"
 // chatReasonixToml is written into the dedicated chat workdir on every bridge
 // start. Only technical lockdown (tools/plugins/LSP/codegraph) — no system_prompt,
 // persona, or agent behavior overrides; the user's own rules apply via Reasonix.
-const chatReasonixToml = `# reasonix-telegram: tool lockdown only (managed by the bridge)
+const chatReasonixToml = `# reasonix-telegram: chat mode — tool lockdown (managed by the bridge)
 [agent]
 auto_plan = "off"
 
@@ -27,6 +27,13 @@ enabled = false
 auto_install = false
 `
 
+// toolReasonixToml is used in tool/code mode — tools, codegraph and LSP are
+// all available; only auto_plan is disabled so the model doesn't get stuck.
+const toolReasonixToml = `# reasonix-telegram: tool mode — full tools (managed by the bridge)
+[agent]
+auto_plan = "off"
+`
+
 func (a *App) chatWorkdir() string {
 	return filepath.Join(a.cfg.StateDir, chatWorkdirSubdir)
 }
@@ -34,13 +41,17 @@ func (a *App) chatWorkdir() string {
 // ensureChatWorkdir prepares the per-chat reasonix workdir and writes a
 // per-mode reasonix.toml that overrides the global config (reasonix.toml
 // in the cwd wins over ~/.config/reasonix/config.toml). Without this, the
-// chat-mode tool lockdown defined in reasonixTomlContent() is dead code.
+// chat-mode tool lockdown defined in chatReasonixToml is dead code.
 func (a *App) ensureChatWorkdir() error {
 	wd := a.chatWorkdir()
 	if err := os.MkdirAll(wd, 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(wd, "reasonix.toml"), []byte(chatReasonixToml), 0o644); err != nil {
+	content := chatReasonixToml
+	if a.getMode() == ModeTool {
+		content = toolReasonixToml
+	}
+	if err := os.WriteFile(filepath.Join(wd, "reasonix.toml"), []byte(content), 0o644); err != nil {
 		return err
 	}
 	a.linkUserRulesIntoChatWD(wd)
