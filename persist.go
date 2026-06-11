@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -121,7 +122,24 @@ func (st *stateStore) writeLocked(sf *stateFile) error {
 	if err := os.Chmod(tmp, 0o600); err != nil {
 		return err
 	}
-	return os.Rename(tmp, st.path)
+	if err := os.Rename(tmp, st.path); err != nil {
+		return err
+	}
+	// Sync parent directory so rename is durable after a crash.
+	return syncDir(filepath.Dir(st.path))
+}
+
+func syncDir(dir string) error {
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	err = f.Sync()
+	closeErr := f.Close()
+	if err != nil {
+		return err
+	}
+	return closeErr
 }
 
 // chatIDsWithSessionJSONL returns chat IDs that have a non-empty session file on disk.
@@ -177,15 +195,14 @@ func (st *stateStore) cleanupOrphanSessionArtifacts() {
 
 // sessionStats reads a Reasonix session JSONL for logging resume health.
 func sessionStats(path string) (messages int, userTurns int, err error) {
-	b, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return 0, 0, err
 	}
-	if len(b) == 0 {
-		return 0, 0, nil
-	}
-	for _, line := range strings.Split(string(b), "\n") {
-		line = strings.TrimSpace(line)
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
 		if line == "" {
 			continue
 		}
@@ -200,5 +217,5 @@ func sessionStats(path string) (messages int, userTurns int, err error) {
 			userTurns++
 		}
 	}
-	return messages, userTurns, nil
+	return messages, userTurns, sc.Err()
 }

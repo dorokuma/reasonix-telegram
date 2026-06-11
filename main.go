@@ -67,13 +67,12 @@ var (
 )
 
 // isReasonixNoise returns true if the line should be dropped before display.
-// isReasonixNoise returns true if the line should be dropped before display.
 func isReasonixNoise(line string) bool {
 	trimmed := strings.TrimSpace(line)
 	if trimmed == "" {
 		return false
 	}
-	if strings.HasPrefix(trimmed, "❌") || strings.HasPrefix(trimmed, "✅") || strings.HasPrefix(trimmed, "ℹ️") || strings.HasPrefix(trimmed, "hook ") || strings.Contains(trimmed, "exit status") || strings.Contains(trimmed, "remembered") || strings.Contains(trimmed, "remembered") || strings.Contains(trimmed, "exit status") {
+	if strings.HasPrefix(trimmed, "❌") || strings.HasPrefix(trimmed, "✅") || strings.HasPrefix(trimmed, "ℹ️") || strings.HasPrefix(trimmed, "hook ") || strings.Contains(trimmed, "exit status") || strings.Contains(trimmed, "remembered") {
 		return true
 	}
 	return reTokenStats.MatchString(line) ||
@@ -364,19 +363,19 @@ func main() {
 	app.restorePersistedSessions()
 	app.notifyBridgeRestarted()
 
+	// Shutdown handling: signal → drain handlers → cancel tasks → stop serves.
+	// restarting is set first so the update loop below stops accepting new work;
+	// then msgWg is drained; remaining tasks cancelled; serves stopped.
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
+	shutdownCh := make(chan struct{})
 	go func() {
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
 		s := <-sig
-		log.Printf("shutdown signal: received %v, waiting for running tasks to complete…", s)
-		// Don't accept new tasks.
+		log.Printf("shutdown signal: received %v, draining message handlers…", s)
 		app.restartMu.Lock()
 		app.restarting = true
 		app.restartMu.Unlock()
-		// Drain: wait for in-flight handleMessage / handleCallbackQuery
-		// goroutines to complete so messages are submitted to the serve
-		// process before we cancel anything. This mirrors Hermes'
-		// _drain_active_agents approach: let tasks finish, don't interrupt.
+
 		drainDone := make(chan struct{})
 		go func() {
 			app.msgWg.Wait()
@@ -388,13 +387,11 @@ func main() {
 		case <-time.After(15 * time.Second):
 			log.Printf("shutdown: drain timeout, proceeding with cancel")
 		}
-		// Cancel any remaining tasks that didn't drain in time.
 		app.cancelAllTasks()
-		// Wait for cancelled tasks to finish (max 5 min).
 		app.waitTasksDone(5 * time.Minute)
 		log.Printf("shutdown: all tasks done, stopping serves…")
 		app.stopAllServes()
-		log.Fatal("shutdown complete")
+		close(shutdownCh)
 	}()
 
 	u := tgbotapi.NewUpdate(0)
@@ -402,6 +399,9 @@ func main() {
 	updates := bot.GetUpdatesChan(u)
 
 	for upd := range updates {
+		if app.restarting {
+			break
+		}
 		if upd.Message != nil {
 			app.msgWg.Add(1)
 			go func(msg *tgbotapi.Message) {
@@ -417,6 +417,9 @@ func main() {
 			}(upd.CallbackQuery)
 		}
 	}
+	// Wait for shutdown to finish (serve processes stopped, etc).
+	<-shutdownCh
+	log.Print("shutdown complete")
 }
 
 // registerCommands tells Telegram which slash commands to surface in the

@@ -22,10 +22,14 @@ import (
 var httpClient = &http.Client{Timeout: 10 * time.Second}
 var sseClient = &http.Client{} // no timeout for long-lived SSE streams
 
+var portNext int // next port offset, guarded by a.state itself during init
+
 func portForChat(chatID int64) int {
 	const base = 18780
 	const span = 8000
-	return base + int(uint64(chatID)%span)
+	p := base + (portNext % span)
+	portNext++
+	return p
 }
 
 func serveAddr(port int) string {
@@ -111,10 +115,8 @@ func (a *App) reasonixEnv() []string {
 		"PATH=", "LANG=", "LC_", "LANGUAGE=", "TZ=",
 		"HTTP_PROXY=", "HTTPS_PROXY=", "NO_PROXY=",
 		"http_proxy=", "https_proxy=", "no_proxy=",
-		"SSH_AUTH_SOCK=", "SSH_AGENT_PID=",
-		"DOCKER_HOST=", "DOCKER_CONTEXT=",
 		"EDITOR=", "VISUAL=", "PAGER=",
-		"XDG_",
+		"XDG_CACHE_HOME=", "XDG_CONFIG_HOME=", "XDG_DATA_HOME=", "XDG_STATE_HOME=",
 	}
 	for _, e := range os.Environ() {
 		for _, p := range safePrefixes {

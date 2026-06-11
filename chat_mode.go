@@ -63,7 +63,11 @@ func (a *App) ensureChatWorkdir() error {
 // CHAT_RULES_FILE overrides when set.
 func defaultRulesFile() string {
 	if src := strings.TrimSpace(os.Getenv("CHAT_RULES_FILE")); src != "" {
-		return src
+		if st, err := os.Stat(src); err == nil && st.Mode().IsRegular() {
+			return src
+		}
+		log.Printf("chat-wd: CHAT_RULES_FILE %q not found or not a regular file, skipping", src)
+		return ""
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -98,12 +102,20 @@ func (a *App) linkUserRulesIntoChatWD(wd string) {
 	home, _ := os.UserHomeDir()
 	memDir := filepath.Join(home, ".config", "reasonix")
 	memFile := filepath.Join(memDir, "REASONIX.md")
+	memLink := filepath.Join(wd, "REASONIX.md")
+	// Remove stale regular file so symlink can replace it.
+	if st, err := os.Lstat(memLink); err == nil && st.Mode().IsRegular() {
+		if err := os.Remove(memLink); err != nil {
+			log.Printf("chat-wd: remove stale REASONIX.md: %v", err)
+		}
+	} else if err != nil && !os.IsNotExist(err) {
+		log.Printf("chat-wd: stat REASONIX.md: %v", err)
+	}
 	if err := os.MkdirAll(memDir, 0o755); err == nil {
 		// Ensure the target exists so the symlink isn't dangling.
 		if _, err := os.Stat(memFile); os.IsNotExist(err) {
 			_ = os.WriteFile(memFile, nil, 0o600)
 		}
-		memLink := filepath.Join(wd, "REASONIX.md")
 		if err := os.Symlink(memFile, memLink); err != nil {
 			log.Printf("chat-wd: symlink %s -> %s: %v", memLink, memFile, err)
 		}

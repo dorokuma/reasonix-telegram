@@ -5,10 +5,11 @@ import (
 )
 
 func TestIsReasonixServeCmd(t *testing.T) {
-	if !isReasonixServeCmd("/usr/local/bin/reasonix serve --addr 127.0.0.1:23650") {
+	bin := "reasonix"
+	if !isReasonixServeCmd("/usr/local/bin/reasonix serve --addr 127.0.0.1:23650", bin) {
 		t.Fatal("expected serve match")
 	}
-	if isReasonixServeCmd("/usr/local/bin/reasonix doctor") {
+	if isReasonixServeCmd("/usr/local/bin/reasonix doctor", bin) {
 		t.Fatal("doctor should not match")
 	}
 }

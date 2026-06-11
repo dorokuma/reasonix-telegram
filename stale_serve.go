@@ -20,7 +20,7 @@ var ssPIDRe = regexp.MustCompile(`pid=(\d+)`)
 // not reap the child automatically.
 func (a *App) cleanupStaleServesOnStartup() {
 	bridgePID := os.Getpid()
-	stale := findStaleReasonixServePIDs(bridgePID)
+	stale := findStaleReasonixServePIDs(bridgePID, a.cfg.ReasonixBin)
 	ports := persistedServePorts(a.state)
 
 	// Also reclaim listeners on persisted chat ports (covers cmdline renames).
@@ -58,7 +58,7 @@ func persistedServePorts(st *stateStore) map[int]struct{} {
 	return out
 }
 
-func findStaleReasonixServePIDs(bridgePID int) map[int]struct{} {
+func findStaleReasonixServePIDs(bridgePID int, reasonixBin string) map[int]struct{} {
 	out := map[int]struct{}{}
 	entries, err := os.ReadDir("/proc")
 	if err != nil {
@@ -70,7 +70,7 @@ func findStaleReasonixServePIDs(bridgePID int) map[int]struct{} {
 			continue
 		}
 		cmd := readProcCmdline(pid)
-		if !isReasonixServeCmd(cmd) {
+		if !isReasonixServeCmd(cmd, reasonixBin) {
 			continue
 		}
 		ppid := readProcPPID(pid)
@@ -82,9 +82,18 @@ func findStaleReasonixServePIDs(bridgePID int) map[int]struct{} {
 	return out
 }
 
-func isReasonixServeCmd(cmd string) bool {
+func isReasonixServeCmd(cmd string, reasonixBin string) bool {
+	// cmd is read from /proc/PID/cmdline with nulls replaced by spaces.
+	// The first token is the binary path; the rest are arguments.
 	cmd = strings.TrimSpace(cmd)
-	return strings.Contains(cmd, "reasonix") && strings.Contains(cmd, "serve")
+	parts := strings.Fields(cmd)
+	if len(parts) < 2 {
+		return false
+	}
+	bin := parts[0]
+	// Check the binary path ends with the expected name (or /name).
+	// Then verify the first argument is "serve".
+	return (strings.HasSuffix(bin, "/"+reasonixBin) || bin == reasonixBin) && parts[1] == "serve"
 }
 
 func readProcCmdline(pid int) string {
@@ -118,11 +127,18 @@ func pidsListeningOnTCPPort(port int) []int {
 }
 
 func terminateProcessGroup(pid int, timeout time.Duration) {
-	// serve uses Setpgid with pgid == pid.
+	// Snapshot the process start time from /proc before signalling, so we can
+	// detect PID reuse if the process dies and the kernel recycles the PID.
+	startTime := readProcStartTime(pid)
 	_ = syscall.Kill(-pid, syscall.SIGTERM)
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		if err := syscall.Kill(pid, 0); err != nil {
+			return
+		}
+		// Verify the PID hasn't been recycled: the process at pid should still
+		// have the same start_time as when we started.
+		if readProcStartTime(pid) != startTime {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
@@ -132,8 +148,33 @@ func terminateProcessGroup(pid int, timeout time.Duration) {
 		if err := syscall.Kill(pid, 0); err != nil {
 			return
 		}
+		if readProcStartTime(pid) != startTime {
+			return
+		}
 		time.Sleep(50 * time.Millisecond)
 	}
+}
+
+// readProcStartTime returns the start_time field (field 22) from /proc/PID/stat.
+// This value is monotonically increasing per PID and changes only when the PID
+// is recycled, so it can be used to detect PID reuse.
+func readProcStartTime(pid int) string {
+	b, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "stat"))
+	if err != nil {
+		return ""
+	}
+	// comm can contain spaces and parens; start_time is field 22 (0-indexed: 21).
+	// Skip the comm field (enclosed in parens) to get stable field positions.
+	s := string(b)
+	commEnd := strings.LastIndex(s, ")")
+	if commEnd < 0 {
+		return ""
+	}
+	fields := strings.Fields(s[commEnd+1:])
+	if len(fields) < 20 {
+		return ""
+	}
+	return fields[19] // start_time is field 22 (0-based index 21, after 2 fields before comm)
 }
 
 // parseSSPIDs is exported to tests for ss output parsing.
