@@ -19,9 +19,6 @@ import (
 	"time"
 )
 
-var httpClient = &http.Client{Timeout: 10 * time.Second}
-var sseClient = &http.Client{} // no timeout for long-lived SSE streams
-
 var portNext int // next port offset, guarded by a.state itself during init
 
 func portForChat(chatID int64) int {
@@ -178,7 +175,7 @@ func (a *App) serveRunning(s *session) bool {
 	}
 	// Adopt an already-listening serve (e.g. after an out-of-band restart) so the
 	// bridge does not try to bind the same port again.
-	return waitServeReady(port, 2*time.Second) == nil
+	return a.waitServeReady(port, 2*time.Second) == nil
 }
 
 func (a *App) stopServe(chatID int64) {
@@ -262,7 +259,7 @@ func (a *App) startServe(chatID int64) error {
 	// Reasonix Resume now re-applies the boot system prompt even when the file is empty.
 	args = append(args, "--resume", sessionPath)
 
-	if err := waitServeReady(port, 2*time.Second); err == nil {
+	if err := a.waitServeReady(port, 2*time.Second); err == nil {
 		log.Printf("chat=%d: adopting existing reasonix serve on %s", chatID, serveAddr(port))
 		return nil
 	}
@@ -296,7 +293,7 @@ func (a *App) startServe(chatID int64) error {
 		}
 	}()
 
-	if err := waitServeReady(port, 45*time.Second); err != nil {
+	if err := a.waitServeReady(port, 45*time.Second); err != nil {
 		a.stopServe(chatID)
 		return err
 	}
@@ -317,6 +314,38 @@ func (a *App) ensureServe(chatID int64) error {
 		return nil
 	}
 	return a.startServe(chatID)
+}
+
+// startServeHealthCheck periodically checks all serve processes are alive.
+// Runs every 60s; restarts any that have died.
+func (a *App) startServeHealthCheck() {
+	go func() {
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			a.sessMu.Lock()
+			chatIDs := make([]int64, 0, len(a.sess))
+			for chatID, s := range a.sess {
+				s.mu.Lock()
+				cmd := s.serveCmd
+				port := s.servePort
+				s.mu.Unlock()
+				// Check if process is dead but port not listening
+				alive := cmd != nil && cmd.Process != nil && cmd.ProcessState == nil
+				listening := port > 0 && a.waitServeReady(port, 2*time.Second) == nil
+				if !alive && !listening {
+					chatIDs = append(chatIDs, chatID)
+				}
+			}
+			a.sessMu.Unlock()
+			for _, chatID := range chatIDs {
+				log.Printf("health: chat=%d serve process dead, restarting", chatID)
+				if err := a.startServe(chatID); err != nil {
+					log.Printf("health: chat=%d restart failed: %v", chatID, err)
+				}
+			}
+		}
+	}()
 }
 
 func (a *App) restorePersistedSessions() {
@@ -365,7 +394,7 @@ func (a *App) restorePersistedSessions() {
 	}
 }
 
-func waitServeReady(port int, timeout time.Duration) error {
+func (a *App) waitServeReady(port int, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	url := serveBaseURL(port) + "/status"
 	client := &http.Client{Timeout: 2 * time.Second}
@@ -382,7 +411,7 @@ func waitServeReady(port int, timeout time.Duration) error {
 	return fmt.Errorf("reasonix serve not ready at %s", url)
 }
 
-func postJSON(port int, path string, body any) error {
+func (a *App) postJSON(port int, path string, body any) error {
 	b, err := json.Marshal(body)
 	if err != nil {
 		return err
@@ -392,7 +421,7 @@ func postJSON(port int, path string, body any) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := httpClient.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -406,10 +435,10 @@ func postJSON(port int, path string, body any) error {
 
 func (a *App) lockServeMode(port int) {
 	if a.getMode() == ModeChat {
-		if err := postJSON(port, "/plan", map[string]bool{"on": false}); err != nil {
+		if err := a.postJSON(port, "/plan", map[string]bool{"on": false}); err != nil {
 			log.Printf("chat=%s: lock plan failed: %v", serveAddr(port), err)
 		}
-		if err := postJSON(port, "/bypass", map[string]bool{"on": false}); err != nil {
+		if err := a.postJSON(port, "/bypass", map[string]bool{"on": false}); err != nil {
 			log.Printf("chat=%s: lock bypass failed: %v", serveAddr(port), err)
 		}
 	}
@@ -434,7 +463,7 @@ func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onC
 		eventsDone <- a.consumeServeEvents(ctx, chatID, port, onChunk, onComplete, onToolDispatch, onCommentary, onAskRequest, onApprovalRequest, onUsage)
 	}()
 
-	if err := postJSON(port, "/submit", map[string]string{"input": prompt}); err != nil {
+	if err := a.postJSON(port, "/submit", map[string]string{"input": prompt}); err != nil {
 		cancel()
 		return fmt.Errorf("submit: %w", err)
 	}
@@ -443,7 +472,7 @@ func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onC
 	case tr := <-eventsDone:
 		return tr.err
 	case <-ctx.Done():
-		_ = postJSON(port, "/cancel", map[string]any{})
+		_ = a.postJSON(port, "/cancel", map[string]any{})
 		select {
 		case tr := <-eventsDone:
 			return tr.err
@@ -458,7 +487,7 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 	if err != nil {
 		return turnResult{err: err}
 	}
-	resp, err := sseClient.Do(req)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return turnResult{err: err}
 	}
@@ -576,7 +605,7 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 					}
 					cancelOnce.Do(func() {
 						log.Printf("chat-only: blocked tool %s, cancelling turn", ev.Tool.Name)
-						_ = postJSON(port, "/cancel", map[string]any{})
+						_ = a.postJSON(port, "/cancel", map[string]any{})
 					})
 				}
 			} else {

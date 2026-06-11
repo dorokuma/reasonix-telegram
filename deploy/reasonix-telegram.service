@@ -14,6 +14,13 @@ Restart=on-failure
 RestartSec=5s
 TimeoutStopSec=310
 
+# Security hardening
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/reasonix-telegram
+PrivateTmp=true
+NoNewPrivileges=true
+
 StandardOutput=journal
 StandardError=journal
 

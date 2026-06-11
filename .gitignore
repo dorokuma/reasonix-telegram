@@ -28,6 +28,9 @@ coverage.html
 
 # IDE / OS
 .idea/
+
+# Runtime test output (created by ensureChatWorkdir in tests)
+/chat-wd/
 .vscode/
 *.swp
 *~

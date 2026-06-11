@@ -51,6 +51,12 @@ func (st *stateStore) sessionsDir() string {
 	return filepath.Join(st.dir, "sessions")
 }
 
+// sessionPathForChat returns the path to the session JSONL file for a given chat.
+// Session files contain plaintext conversation history (including user messages and
+// model responses). The file is created and written by the external reasonix serve
+// process, not by the bridge. Permissions are inherited from the reasonix serve
+// process's umask; if tighter control is needed, reasonix serve should be configured
+// to create these files with 0o600.
 func (st *stateStore) sessionPathForChat(chatID int64) string {
 	return filepath.Join(st.sessionsDir(), fmt.Sprintf("%d.jsonl", chatID))
 }
@@ -143,6 +149,7 @@ func syncDir(dir string) error {
 }
 
 // chatIDsWithSessionJSONL returns chat IDs that have a non-empty session file on disk.
+// Only called during startup before concurrent access begins.
 func (st *stateStore) chatIDsWithSessionJSONL() []int64 {
 	entries, err := os.ReadDir(st.sessionsDir())
 	if err != nil {
