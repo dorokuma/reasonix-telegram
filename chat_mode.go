@@ -13,9 +13,6 @@ const chatWorkdirSubdir = "chat-wd"
 // start. Only technical lockdown (tools/plugins/LSP/codegraph) — no system_prompt,
 // persona, or agent behavior overrides; the user's own rules apply via Reasonix.
 const chatReasonixToml = `# reasonix-telegram: chat mode — tool lockdown (managed by the bridge)
-[agent]
-auto_plan = "off"
-
 [tools]
 enabled = ["none"]
 
@@ -28,10 +25,8 @@ auto_install = false
 `
 
 // toolReasonixToml is used in tool/code mode — tools, codegraph and LSP are
-// all available; only auto_plan is disabled so the model doesn't get stuck.
+// all available.
 const toolReasonixToml = `# reasonix-telegram: tool mode — full tools (managed by the bridge)
-[agent]
-auto_plan = "off"
 `
 
 func (a *App) chatWorkdir() string {

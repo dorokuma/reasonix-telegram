@@ -32,7 +32,7 @@ flowchart LR
 - **Session resume** — conversation survives bridge restarts (`reasonix serve --resume`)
 - **Streaming UX** — live draft preview, then final message(s); typing indicator while generating
 - **Long replies** — auto-split at Telegram’s 4096-character limit (no `…[cut]…` in user-visible text)
-- **Chat-only lockdown** — plan/bypass off; tool dispatches cancelled; no “agent work” surface in TG
+- **Chat-only lockdown** — tool dispatches cancelled; no “agent work” surface in TG
 - **User rules** — `~/.config/reasonix/REASONIX.md` (Reasonix global); bridged into `chat-wd/REASONIX.md` (not `AGENTS.md`, so Hermes won't pick it up from `$HOME`)
 - **Slash commands** — `/stop`, `/status`, `/new`, `/restart`, `/help`, …
 
@@ -156,7 +156,7 @@ This repository is **not** Reasonix. It spawns and talks to `reasonix serve`:
 
 - Submit: `POST /submit`
 - Events: `GET /events` (SSE)
-- Control: `/plan`, `/bypass`, `/cancel`, …
+- Control: `/cancel`, …
 
 Upstream: [esengine/DeepSeek-Reasonix](https://github.com/esengine/DeepSeek-Reasonix). Tool-disable and serve-mode behavior depend on your Reasonix build and `reasonix.toml` in `chat-wd`.
 
@@ -203,7 +203,7 @@ Add a `LICENSE` file when publishing publicly; until then, follow your deploymen
 - **会话恢复** — 桥接重启后继续同一 JSONL（`--resume`）
 - **流式体验** — 草稿预览 + 正式消息；生成时显示「正在输入」
 - **长文回复** — 超过 Telegram 单条 **4096 字** 自动连发多条，用户可见正文无 `…[cut]…`
-- **纯聊天加固** — 关闭 plan/bypass；拦截工具调度，不在 TG 里干「工程师活」
+- **纯聊天加固** — 拦截工具调度，不在 TG 里干「工程师活」
 - **用户规则** — 使用 `~/.config/reasonix/REASONIX.md`，桥接软链到 `chat-wd/REASONIX.md`（勿放 `$HOME/AGENTS.md`，会被 Hermes 读取）
 - **斜杠命令** — `/stop`、`/status`、`/new`、`/restart`、`/help` 等
 

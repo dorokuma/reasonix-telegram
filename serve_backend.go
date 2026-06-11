@@ -297,8 +297,7 @@ func (a *App) startServe(chatID int64) error {
 		a.stopServe(chatID)
 		return err
 	}
-	// Lock plan/bypass in chat mode (tool mode leaves them on).
-	a.lockServeMode(port)
+	// mode lockdown is handled by reasonix.toml
 	log.Printf("chat=%d: serve cwd=%s mode=%s", chatID, wd, a.getMode())
 	if err := a.state.upsert(chatRecord{
 		ChatID: chatID, Workdir: wd, SessionPath: sessionPath, Port: port,
@@ -433,18 +432,6 @@ func (a *App) postJSON(port int, path string, body any) error {
 	return nil
 }
 
-func (a *App) lockServeMode(port int) {
-	if a.getMode() == ModeChat {
-		if err := a.postJSON(port, "/plan", map[string]bool{"on": false}); err != nil {
-			log.Printf("chat=%s: lock plan failed: %v", serveAddr(port), err)
-		}
-		if err := a.postJSON(port, "/bypass", map[string]bool{"on": false}); err != nil {
-			log.Printf("chat=%s: lock bypass failed: %v", serveAddr(port), err)
-		}
-	}
-	// tool mode: leave plan/bypass as-is so the agent can use tools
-}
-
 // runServeTurn submits a prompt to the long-lived reasonix serve process and
 // streams SSE events until turn_done. The conversation history stays in the
 // same Reasonix session file across Telegram messages and bridge restarts.
@@ -455,8 +442,6 @@ func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onC
 	s.mu.Lock()
 	port := s.servePort
 	s.mu.Unlock()
-
-	a.lockServeMode(port)
 
 	eventsDone := make(chan turnResult, 1)
 	go func() {
@@ -714,7 +699,7 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 				if onApprovalRequest != nil {
 					toolName := ev.Approval.Tool
 					if toolName == "" {
-						toolName = "plan"
+						toolName = "approval"
 					}
 					onApprovalRequest(ev.Approval.ID, toolName)
 				}

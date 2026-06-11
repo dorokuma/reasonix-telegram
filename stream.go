@@ -454,7 +454,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				replyDelivered = true
 			},
 			func(approvalID, toolName string) {
-				// onApprovalRequest: model needs user approval (plan or tool).
+				// onApprovalRequest: model needs user approval for a tool.
 				// Finalize current stream content first.
 				signalFlush()
 				// Reset stream state so post-approval output can flow in a fresh draft.
@@ -481,9 +481,6 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				var label string
 				var emoji string
 				switch toolName {
-				case "plan":
-					label = "执行计划"
-					emoji = "📋"
 				default:
 					label = toolName
 					emoji = "🔧"
