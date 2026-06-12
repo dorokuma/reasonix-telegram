@@ -37,6 +37,10 @@ func serveBaseURL(port int) string {
 	return fmt.Sprintf("http://%s", serveAddr(port))
 }
 
+// localHTTPClient is a shared HTTP client for local reasonix serve communication.
+// It has a 10s timeout and no Transport-level TLS since the server binds to localhost.
+var localHTTPClient = &http.Client{Timeout: 10 * time.Second}
+
 // wireUsage mirrors usage stats from the reasonix serve SSE stream.
 type wireUsage struct {
 	PromptTokens     int     `json:"promptTokens"`
@@ -396,7 +400,7 @@ func (a *App) restorePersistedSessions() {
 func (a *App) waitServeReady(port int, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	url := serveBaseURL(port) + "/status"
-	client := &http.Client{Timeout: 2 * time.Second}
+	client := localHTTPClient
 	for time.Now().Before(deadline) {
 		resp, err := client.Get(url)
 		if err == nil {
@@ -420,7 +424,7 @@ func (a *App) postJSON(port int, path string, body any) error {
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := localHTTPClient.Do(req)
 	if err != nil {
 		return err
 	}
@@ -472,9 +476,9 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 	if err != nil {
 		return turnResult{err: err}
 	}
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := localHTTPClient.Do(req)
 	if err != nil {
-		return turnResult{err: err}
+		return turnResult{err: fmt.Errorf("reasonix events: %w", err)}
 	}
 	defer resp.Body.Close()
 
