@@ -10,17 +10,18 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
-// killDescendants SIGKILLs any process whose ppid is the given pid, walking
-// recursively. Best-effort: relies on /proc being readable, which is true on
-// Linux. We don't fail loudly if /proc is missing or the pid is gone.
+// killDescendants terminates a process tree with SIGTERM + grace + SIGKILL.
+// Best-effort: relies on /proc being readable, which is true on Linux.
 func killDescendants(rootPid int) {
 	visited := map[int]bool{rootPid: true}
-	var walk func(int)
-	walk = func(ppid int) {
+	// Phase 1: SIGTERM all descendants
+	var walkTerm func(int)
+	walkTerm = func(ppid int) {
 		entries, err := os.ReadDir("/proc")
 		if err != nil {
 			return
@@ -37,9 +38,6 @@ func killDescendants(rootPid int) {
 			if err != nil {
 				continue
 			}
-			// stat format: "pid (comm) state ppid pgrp ..."
-			// comm can contain spaces and parens; the safe way is to find
-			// the LAST ')' and parse from there.
 			stat := string(statBytes)
 			rpar := strings.LastIndex(stat, ")")
 			if rpar < 0 || rpar+2 >= len(stat) {
@@ -49,19 +47,45 @@ func killDescendants(rootPid int) {
 			if len(fields) < 2 {
 				continue
 			}
-			// fields[0] = state, fields[1] = ppid
 			parent, err := strconv.Atoi(fields[1])
 			if err != nil {
 				continue
 			}
 			if parent == ppid {
 				visited[pid] = true
-				_ = syscall.Kill(pid, syscall.SIGKILL)
-				walk(pid)
+				_ = syscall.Kill(pid, syscall.SIGTERM)
+				walkTerm(pid)
 			}
 		}
 	}
-	walk(rootPid)
+	walkTerm(rootPid)
+
+	// Phase 2: wait for graceful exit (up to 3s)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		allDone := true
+		for pid := range visited {
+			if pid == rootPid {
+				continue
+			}
+			if err := syscall.Kill(pid, 0); err == nil {
+				allDone = false
+				break
+			}
+		}
+		if allDone {
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	// Phase 3: SIGKILL survivors
+	for pid := range visited {
+		if pid == rootPid {
+			continue
+		}
+		_ = syscall.Kill(pid, syscall.SIGKILL)
+	}
 }
 
 

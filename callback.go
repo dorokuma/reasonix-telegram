@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -283,8 +281,8 @@ func (a *App) switchModel(chatID int64, modelID, modelName string) {
 	s.mu.Lock()
 	s.model = modelID
 	s.mu.Unlock()
-	// Persist to .env file.
-	if err := a.persistModel(modelID); err != nil {
+	// Persist to state.json.
+	if err := a.persistModel(chatID, modelID); err != nil {
 		log.Printf("chat=%d: persist model failed: %v", chatID, err)
 	}
 	if err := a.startServe(chatID); err != nil {
@@ -380,11 +378,24 @@ func (a *App) sendEffortPicker(chatID int64, _ int) {
 	_ = port // keep port reference for future use
 }
 
-// persistModel writes the model ID to the .env file so it survives restarts.
-func (a *App) persistModel(modelID string) error {
-	envPath := filepath.Join(a.cfg.StateDir, "env")
-	data := []byte("MODEL=" + modelID + "\n")
-	return os.WriteFile(envPath, data, 0o600)
+// persistModel writes the model ID to state.json so it survives restarts.
+func (a *App) persistModel(chatID int64, modelID string) error {
+	records, err := a.state.load()
+	if err != nil {
+		return err
+	}
+	found := false
+	for i, rec := range records {
+		if rec.ChatID == chatID {
+			records[i].Model = modelID
+			found = true
+			break
+		}
+	}
+	if !found {
+		records = append(records, chatRecord{ChatID: chatID, Model: modelID})
+	}
+	return a.state.saveAll(records)
 }
 
 func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {

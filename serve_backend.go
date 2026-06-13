@@ -389,6 +389,7 @@ func (a *App) restorePersistedSessions() {
 		if s.servePort == 0 {
 			s.servePort = portForChat(rec.ChatID)
 		}
+		s.model = rec.Model
 		s.mu.Unlock()
 		go func(chatID int64) {
 			if err := a.startServe(chatID); err != nil {

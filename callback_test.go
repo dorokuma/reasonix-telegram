@@ -1,8 +1,6 @@
 package main
 
 import (
-	"os"
-	"path/filepath"
 	"testing"
 )
 
@@ -58,21 +56,25 @@ func TestModelDisplayName(t *testing.T) {
 	}
 }
 
-// TestPersistModel verifies model persistence to .env file.
+// TestPersistModel verifies model persistence to state.json.
 func TestPersistModel(t *testing.T) {
 	dir := t.TempDir()
-	app := &App{cfg: Config{StateDir: dir}}
-
-	if err := app.persistModel("deepseek/deepseek-v4"); err != nil {
-		t.Fatal(err)
-	}
-
-	data, err := os.ReadFile(filepath.Join(dir, "env"))
+	st, err := newStateStore(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(data) != "MODEL=deepseek/deepseek-v4\n" {
-		t.Fatalf("got %q", string(data))
+	app := &App{cfg: Config{StateDir: dir}, state: st, sess: map[int64]*session{}}
+
+	if err := app.persistModel(42, "deepseek/deepseek-v4"); err != nil {
+		t.Fatal(err)
+	}
+
+	records, err := st.load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(records) != 1 || records[0].ChatID != 42 || records[0].Model != "deepseek/deepseek-v4" {
+		t.Fatalf("unexpected records: %+v", records)
 	}
 }
 

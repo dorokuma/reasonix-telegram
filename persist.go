@@ -17,9 +17,10 @@ const defaultStateDir = "/var/lib/reasonix-telegram"
 // same Reasonix conversation (reasonix serve --resume <path>).
 type chatRecord struct {
 	ChatID      int64  `json:"chat_id"`
-	Workdir     string `json:"workdir"`
+	Workdir     string `json:"workdir,omitempty"`
 	SessionPath string `json:"session_path"`
 	Port        int    `json:"port"`
+	Model       string `json:"model,omitempty"` // per-chat model override, survives restart
 }
 
 type stateFile struct {
@@ -114,6 +115,13 @@ func (st *stateStore) remove(chatID int64) error {
 	}
 	sf.Chats = out
 	return st.writeLocked(&sf)
+}
+
+// saveAll replaces the entire chat state with the given records.
+func (st *stateStore) saveAll(records []chatRecord) error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	return st.writeLocked(&stateFile{Chats: records})
 }
 
 func (st *stateStore) writeLocked(sf *stateFile) error {
