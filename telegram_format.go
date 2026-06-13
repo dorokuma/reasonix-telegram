@@ -653,6 +653,8 @@ func formatToolArgs(toolName, argsJSON string) string {
 		if q, ok := m["name"].(string); ok && q != "" {
 			return "🏷 " + q
 		}
+		return ""
+
 	case "codegraph_context":
 		if f, ok := m["file"].(string); ok && f != "" {
 			line := ""
@@ -661,10 +663,14 @@ func formatToolArgs(toolName, argsJSON string) string {
 			}
 			return "📄 " + trimUTF8Bytes(f, 60) + line
 		}
+		return ""
+
 	case "codegraph_files":
 		if p, ok := m["pattern"].(string); ok && p != "" {
 			return "📁 " + p
 		}
+		return ""
+
 	case "read_file":
 		if p, ok := m["path"].(string); ok && p != "" && len(p) > 3 {
 			return "📄 " + trimUTF8Bytes(p, 80)
@@ -695,6 +701,7 @@ func formatToolArgs(toolName, argsJSON string) string {
 			}
 			return fmt.Sprintf("💻 bash\n```\n%s\n```", first)
 		}
+		return "💻 bash"
 	case "ls":
 		if p, ok := m["path"].(string); ok && p != "" && len(p) > 2 {
 			return "📁 " + trimUTF8Bytes(p, 80)
@@ -704,18 +711,26 @@ func formatToolArgs(toolName, argsJSON string) string {
 		if p, ok := m["pattern"].(string); ok && p != "" && len(p) > 2 {
 			return "📁 " + p
 		}
+		return ""
+
 	case "search_web":
 		if q, ok := m["query"].(string); ok && q != "" {
 			return "🔍 " + trimUTF8Bytes(q, 80)
 		}
+		return ""
+
 	case "web_fetch", "read_url":
 		if u, ok := m["url"].(string); ok && u != "" {
 			return "🌐 " + trimUTF8Bytes(u, 80)
 		}
+		return ""
+
 	case "remember":
 		if t, ok := m["title"].(string); ok && t != "" {
 			return "🧠 " + t
 		}
+		return ""
+
 	case "ask":
 		return ""
 	}
