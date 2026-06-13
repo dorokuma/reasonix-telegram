@@ -351,11 +351,15 @@ func (a *App) sendTextParts(chatID int64, text string, editFirstMsgID *int, noFi
 	if text == "" {
 		return 1
 	}
-	if n := a.sendFormattedParts(chatID, formatForTelegram(text), editFirstMsgID, "MarkdownV2"); n > 0 {
+	// Try MarkdownV2 first, fall back to plain text if entities fail to parse.
+	formatted := formatForTelegram(text)
+	if n := a.sendFormattedParts(chatID, formatted, editFirstMsgID, "MarkdownV2"); n > 0 {
 		return n
 	}
 	log.Printf("chat=%d: MarkdownV2 delivery failed, retrying plain text (%d runes)", chatID, utf8.RuneCountInString(text))
-	return a.sendFormattedParts(chatID, _stripMdv2(capTelegramMessage(text)), editFirstMsgID, "")
+	// strip the MarkdownV2 output (not the raw markdown) so _stripMdv2 can
+	// handle Telegram-specific formatting like \#, *bold*, ~strike~, ||spoiler||.
+	return a.sendFormattedParts(chatID, _stripMdv2(capTelegramMessage(formatted)), editFirstMsgID, "")
 }
 
 func (a *App) sendFormattedParts(chatID int64, displayText string, editFirstMsgID *int, parseMode string) int {
