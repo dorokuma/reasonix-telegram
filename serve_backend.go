@@ -150,7 +150,7 @@ func (a *App) reasonixEnv() []string {
 	}
 
 	// Only DEEPSEEK_API_KEY is intentionally forwarded.
-	if k := os.Getenv("DEEPSEEK_API_KEY"); k != "" {
+	if k := a.cfg.DeepSeekKey; k != "" {
 		env = append(env, "DEEPSEEK_API_KEY="+k)
 	}
 

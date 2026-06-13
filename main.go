@@ -168,6 +168,21 @@ type Config struct {
 	Model          string  // MODEL, default "" (reasonix default)
 	StateDir string // STATE_DIR, default /var/lib/reasonix-telegram
 	Mode     string // MODE: "chat" (default, tools locked) or "tool" (full agent access)
+	DeepSeekKey string // read from /etc/reasonix-api.env, never in os.Environ
+}
+
+func loadEnvFile(path, key string) string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, key+"=") {
+			return strings.TrimPrefix(line, key+"=")
+		}
+	}
+	return ""
 }
 
 func loadConfig() Config {
@@ -183,6 +198,7 @@ func loadConfig() Config {
 		Model:          os.Getenv("MODEL"),
 		StateDir: getenv("STATE_DIR", defaultStateDir),
 		Mode:           mode,
+		DeepSeekKey: loadEnvFile("/etc/reasonix-api.env", "DEEPSEEK_API_KEY"),
 	}
 	if s := os.Getenv("ALLOWED_USERS"); s != "" {
 		for _, p := range strings.Split(s, ",") {
@@ -331,6 +347,11 @@ func (a *App) modeLabel() string {
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	cfg := loadConfig()
+
+	// Strip API key from process environment so /proc/<pid>/environ doesn't leak it.
+	// reasonixEnv() passes it explicitly to child processes from cfg.DeepSeekKey.
+	os.Unsetenv("DEEPSEEK_API_KEY")
+	os.Unsetenv("TG_BOT_TOKEN")
 	if cfg.BotToken == "" {
 		log.Fatal("TG_BOT_TOKEN is required")
 	}
