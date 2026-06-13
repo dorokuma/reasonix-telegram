@@ -41,6 +41,10 @@ func serveBaseURL(port int) string {
 // It has a 10s timeout and no Transport-level TLS since the server binds to localhost.
 var localHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
+// sseClient is a separate HTTP client for long-lived SSE streams.
+// It must NOT have an overall timeout — the application-level idle watchdog handles that.
+var sseClient = &http.Client{}
+
 // wireUsage mirrors usage stats from the reasonix serve SSE stream.
 type wireUsage struct {
 	PromptTokens     int     `json:"promptTokens"`
@@ -476,7 +480,7 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 	if err != nil {
 		return turnResult{err: err}
 	}
-	resp, err := localHTTPClient.Do(req)
+	resp, err := sseClient.Do(req)
 	if err != nil {
 		return turnResult{err: fmt.Errorf("reasonix events: %w", err)}
 	}

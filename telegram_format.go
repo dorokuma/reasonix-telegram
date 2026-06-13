@@ -299,6 +299,7 @@ func formatForTelegram(content string) string {
 	}
 	content = stripHookMessages(content)
 	content = stripBackgroundJobs(content)
+	content = stripThinkBlocks(content) // second defense: catch cross-chunk tag splits
 	if content == "" {
 		return ""
 	}
