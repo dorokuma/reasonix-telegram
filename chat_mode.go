@@ -46,8 +46,17 @@ func (a *App) ensureChatWorkdir() error {
 	if a.getMode() == ModeTool {
 		content = toolReasonixToml
 	}
-	if err := os.WriteFile(filepath.Join(wd, "reasonix.toml"), []byte(content), 0o644); err != nil {
+	tomlPath := filepath.Join(wd, "reasonix.toml")
+	if err := os.WriteFile(tomlPath, []byte(content), 0o644); err != nil {
 		return err
+	}
+	// 写回验证：确保写入内容可读回匹配
+	if readBack, err := os.ReadFile(tomlPath); err != nil {
+		log.Printf("chat-wd: write-verify read failed: %v", err)
+		return err
+	} else if string(readBack) != content {
+		log.Printf("chat-wd: write-verify mismatch (got %d bytes, want %d)", len(readBack), len(content))
+		return os.ErrInvalid
 	}
 	a.linkUserRulesIntoChatWD(wd)
 	return nil
