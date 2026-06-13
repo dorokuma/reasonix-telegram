@@ -4,10 +4,8 @@ import (
 	"encoding/json"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -180,12 +178,14 @@ func (a *App) waitTasksDone(timeout time.Duration) {
 
 const restartUnit = "reasonix-telegram.service"
 
-// triggerSystemRestart schedules a unit restart outside this process cgroup.
-// Blocking "systemctl restart" from inside the service can deadlock shutdown.
-func triggerSystemRestart() error {
-	cmd := exec.Command("systemctl", "restart", "--no-block", restartUnit)
-	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
-	return cmd.Run()
+// triggerSystemRestart exits the process and lets systemd Restart=on-failure
+// bring us back. We DO NOT call "systemctl restart" because systemd uses
+// KillMode=control-group (default) which sends SIGTERM to all processes in
+// the service cgroup, killing the systemctl child before its D-Bus call
+// completes. Exiting directly with a non-zero code avoids this race entirely.
+func triggerSystemRestart() {
+	log.Printf("triggerSystemRestart: exiting for systemd auto-restart (Restart=on-failure)")
+	os.Exit(1)
 }
 
 // gracefulServiceRestart stops in-flight work, persists who to notify on boot,
@@ -218,16 +218,8 @@ func (a *App) gracefulServiceRestart(chatID int64) {
 		a.stopAllServes()
 		time.Sleep(500 * time.Millisecond)
 
-		log.Printf("chat=%d: initiating graceful systemd restart (--no-block)", chatID)
-		if err := triggerSystemRestart(); err != nil {
-			log.Printf("systemctl restart failed: %v", err)
-			a.restartMu.Lock()
-			a.restarting = false
-			a.restartMu.Unlock()
-			a.reply(chatID, "❌ 重启失败，请检查服务器日志。")
-			return
-		}
-		// Success: systemd stops this process; new instance sends msgConnected on boot.
+		log.Printf("chat=%d: cleanup done, exiting for systemd auto-restart", chatID)
+		triggerSystemRestart() // never returns
 	}()
 }
 
