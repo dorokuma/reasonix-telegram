@@ -15,7 +15,7 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
-// runTask streams the model reply into one Telegram bubble (sendMessageDraft when
+// runTask streams the model reply into one Telegram bubble (sendRichMessageDraft when
 // supported, else editMessageText). No "running/done" status prefix — only text.
 func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 	s := a.getOrCreateSession(chatID)
@@ -83,8 +83,8 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		streamMsgID    int
 		draftID        = a.nextDraftID()
 		useDraft       = true
-		draftShown     bool // sendMessageDraft succeeded for current draftID
-		liveDraftEver  bool // any sendMessageDraft succeeded this segment (survives state resets)
+		draftShown     bool // sendRichMessageDraft succeeded for current draftID
+		liveDraftEver  bool // any sendRichMessageDraft succeeded this segment (survives state resets)
 		streamDone     bool
 		lastDraftBody  string
 		msgCreatedAt   time.Time // when first draft/stream msg was sent
@@ -108,7 +108,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		s.mu.Unlock()
 	}
 	// endStream mirrors TelePi finalizeResponse: set streamDone first, flush last
-	// draft frame, then sendMessage so no late sendMessageDraft lands after the real message.
+	// draft frame, then sendMessage so no late sendRichMessageDraft lands after the real message.
 	// Fresh final: if the first preview was sent >30s ago, create a new message
 	// instead of editing the stale preview (so TG timestamp reflects completion time).
 	endStream := func() {
@@ -239,7 +239,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			return
 		}
 		preview := telegramPreviewTail(body, telegramMaxMessageRunes)
-		// Native drafts and edit-in-place must not mix: an open sendMessageDraft
+		// Native drafts and edit-in-place must not mix: an open sendRichMessageDraft
 		// blocks the user's input even when the preview is invisible. Once we have
 		// a stream message to edit, stay on the edit path for this segment.
 		if useDraft && streamMsgID == 0 {
@@ -310,7 +310,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		// Acquire draftMu so this does not race with endStream/pushDraft
 		// which also use draftMu to protect streamDone, draftShown, etc.
 		draftMu.Lock()
-		// Native sendMessageDraft holds the Telegram composer until dismissed — do not
+		// Native sendRichMessageDraft holds the Telegram composer until dismissed — do not
 		// wait for finalize/sendMessage; unblock the user as soon as the model finishes.
 		a.dismissSessionDraft(chatID)
 		draftMu.Unlock()
@@ -585,7 +585,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				a.clearDraftPreview(chatID, segDraftID)
 			}
 			// Post-tool segments use edit-in-place, not native drafts — an open
-			// sendMessageDraft blocks the user from replying until Telegram times it out.
+			// sendRichMessageDraft blocks the user from replying until Telegram times it out.
 			draftID = a.nextDraftID()
 			useDraft = false
 			draftShown = false
@@ -710,7 +710,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 }
 
 // streamFinalizeBody picks the text to finalize at turn end. The accumulator
-// buffer can lag behind or be reset while sendMessageDraft already shows text
+// buffer can lag behind or be reset while sendRichMessageDraft already shows text
 // in lastDraftBody — falling back prevents a stuck draft with no sendMessage.
 func streamFinalizeBody(buf, lastDraftBody string) string {
 	body := strings.TrimSpace(buf)
@@ -732,34 +732,25 @@ func draftHadPreview(lastDraftBody string) bool {
 }
 
 func draftNeedsCleanup(draftShown, liveDraftEver bool, lastDraftBody string) bool {
-	_ = lastDraftBody // edit-in-place preview; not a native sendMessageDraft
-	return draftShown || liveDraftEver
+	return false // sendRichMessage auto-replaces drafts; no manual cleanup needed
 }
 
-// clearDraftPreview retires a live sendMessageDraft bubble. Only safe when a
-// non-empty preview was previously sent for this draft_id — empty dismiss on a
-// never-shown draft creates a brief ghost bubble on Telegram.
+// clearDraftPreview clears session draft state. No API call needed —
+// sendRichMessage replaces the draft automatically.
 func (a *App) clearDraftPreview(chatID int64, draftID int64) {
 	if draftID == 0 {
 		return
 	}
-	a.dismissDraft(chatID, draftID)
 	a.clearSessionDraft(chatID, draftID)
-	log.Printf("chat=%d draftID=%d: cleared draft preview", chatID, draftID)
 }
 
-// finalizeDraft ends a native-draft segment with sendMessage (Hermes pattern).
-// sendMessage first so a failed HTML format does not dismiss the live preview;
-// dismiss the draft only after the real message lands.
+// finalizeDraft ends a stream segment by sending the final text.
+// Rich Messages finalize replaces the draft automatically.
 func (a *App) finalizeDraft(chatID int64, draftID int64, text string, hadLiveDraft bool) int {
+	_ = draftID
+	_ = hadLiveDraft
 	if strings.TrimSpace(text) == "" {
-		if hadLiveDraft {
-			a.clearDraftPreview(chatID, draftID)
-		}
 		return 0
-	}
-	if hadLiveDraft {
-		a.clearDraftPreview(chatID, draftID)
 	}
 	return a.sendTextParts(chatID, text, nil)
 }
@@ -783,41 +774,31 @@ func (a *App) clearSessionDraft(chatID int64, draftID int64) {
 func (a *App) dismissSessionDraft(chatID int64) {
 	s := a.getOrCreateSession(chatID)
 	s.mu.Lock()
-	draftID := s.liveDraftID
 	s.liveDraftID = 0
 	s.mu.Unlock()
-	if draftID == 0 {
-		return
-	}
-	a.dismissDraft(chatID, draftID)
-	log.Printf("chat=%d: dismissed session draftID=%d (pre-empt/stale cleanup)", chatID, draftID)
 }
 
-// sendDraft pushes streaming preview text via sendMessageDraft (Bot API 9.5+).
-// Text is automatically converted from markdown to Telegram HTML format.
+// sendDraft pushes streaming preview via sendRichMessageDraft (Bot API 10.1+).
+// The same draft_id auto-animates updates. Final sendRichMessage replaces the draft.
 func (a *App) sendDraft(chatID int64, draftID int64, text string) bool {
 	text = telegramPreviewTail(text, telegramMaxMessageRunes)
 	if text == "" {
 		return false
 	}
-	_, err := a.bot.MakeRequest("sendMessageDraft", tgbotapi.Params{
-		"chat_id":    strconv.FormatInt(chatID, 10),
-		"draft_id":   strconv.FormatInt(draftID, 10),
-		"text":       text,
-		"parse_mode": "MarkdownV2",
+	_, err := a.bot.MakeRequest("sendRichMessageDraft", tgbotapi.Params{
+		"chat_id":  strconv.FormatInt(chatID, 10),
+		"draft_id": strconv.FormatInt(draftID, 10),
+		"rich_message": mustMarshal(map[string]any{
+			"markdown": text,
+		}),
 	})
 	if err != nil {
-		log.Printf("sendMessageDraft failed (fallback to edit): %v", err)
+		log.Printf("sendRichMessageDraft failed (fallback to edit): %v", err)
 		return false
 	}
 	return true
 }
 
-// dismissDraft clears a native draft preview by sending an empty sendMessageDraft.
-func (a *App) dismissDraft(chatID int64, draftID int64) {
-	_, _ = a.bot.MakeRequest("sendMessageDraft", tgbotapi.Params{
-		"chat_id":  strconv.FormatInt(chatID, 10),
-		"draft_id": strconv.FormatInt(draftID, 10),
-		"text":     "",
-	})
-}
+// dismissDraft is no longer needed — sendRichMessage replaces drafts automatically.
+// Kept as no-op for callers that haven't been migrated yet.
+func (a *App) dismissDraft(chatID int64, draftID int64) {}
