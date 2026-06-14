@@ -751,17 +751,11 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 // openThinkTags and closeThinkTags for stripping reasoning blocks.
 var openThinkTags = []string{
 	"<REASONING_SCRATCHPAD>", "<think>", "<reasoning>",
-	"<THINKING>", "<thinking>", "<thought>", "<Thought>",
-	"<cot>", "<COT>",
-	"[thinking]", "[THOUGHT]", "[reason]", "[analysis]",
-	"【思考】",
+	"<THINKING>", "<thinking>", "<thought>",
 }
 var closeThinkTags = []string{
 	"</REASONING_SCRATCHPAD>", "</think>", "</reasoning>",
-	"</THINKING>", "</thinking>", "</thought>", "</Thought>",
-	"</cot>", "</COT>",
-	"[/thinking]", "[/THOUGHT]", "[/reason]", "[/analysis]",
-	"【/思考】",
+	"</THINKING>", "</thinking>", "</thought>",
 }
 
 // stripThinkBlocks removes content between known think/reasoning tags.
@@ -779,67 +773,6 @@ func stripThinkBlocks(s string) string {
 				s = s[:start]
 				break
 			}
-			end = start + len(open) + end + len(close)
-			s = s[:start] + s[end:]
-		}
-	}
-	return s
-}
-
-// stripThinkBlocksStateful is a stateful version of stripThinkBlocks that tracks
-// whether a thinking tag was opened in a previous chunk and not yet closed.
-// This prevents thinking content from leaking when the opening/closing tags
-// span across SSE chunks.
-// inThinking must be a pointer to a bool that persists across calls within one turn.
-// It should be initialized to false at the start of each turn.
-func stripThinkBlocksStateful(s string, inThinking *bool) string {
-	if s == "" {
-		return s
-	}
-
-	// If we're inside an open thinking block from a previous chunk,
-	// look for the closing tag first.
-	if *inThinking {
-		// Find the earliest closing tag among all known types.
-		earliestClose := -1
-		closeLen := 0
-		for _, close := range closeThinkTags {
-			idx := strings.Index(s, close)
-			if idx >= 0 && (earliestClose < 0 || idx < earliestClose) {
-				earliestClose = idx
-				closeLen = len(close)
-			}
-		}
-		if earliestClose >= 0 {
-			// Found a closing tag — emit text after it and clear state.
-			*inThinking = false
-			s = s[earliestClose+closeLen:]
-			// Fall through to check for new open tags in the remainder.
-		} else {
-			// No closing tag — entire chunk is thinking, discard.
-			return ""
-		}
-	}
-
-	// Not in an open block (or just closed one above). Strip any complete
-	// thinking blocks and handle partial open-at-end.
-	// Process each open tag type.
-	for i, open := range openThinkTags {
-		close := closeThinkTags[i]
-		for {
-			start := strings.Index(s, open)
-			if start < 0 {
-				break
-			}
-			end := strings.Index(s[start+len(open):], close)
-			if end < 0 {
-				// No closing tag in this chunk — this is a partial block.
-				// Strip from open to end and set the state flag.
-				*inThinking = true
-				s = s[:start]
-				break
-			}
-			// Complete block — strip it.
 			end = start + len(open) + end + len(close)
 			s = s[:start] + s[end:]
 		}
@@ -882,68 +815,15 @@ func isPureEnglish(s string) bool {
 // reasoning/thinking rather than a user-facing response. When the fallback body
 // begins with any of these, it is still thinking, not an answer.
 var thinkingOpeners = []string{
-	// Chinese self-directed analysis (conservative — avoid matching response openers)
-	"我来看看", "让我看看", "让我先看看", "我们先看看",
-	"我先理解", "我需要先", "我来分析", "首先",
-	"爸爸给", "爸爸说", "爸爸问", "爸爸想",        // 第三人称说用户
-	"用户给", "用户说", "用户问", "用户想",
-	"他给", "他说", "他问",                      // "他"指用户或第三方
-	// English self-directed analysis (model typically thinks in English)
+	// Chinese self-directed analysis
+	"让我", "我先", "我需要", "我们先",
+	"首先", "第一步",
+	"我来看看", "让我看看",
+	"这个问题", "这需要",
+	// English self-directed analysis
 	"let me", "let's", "i need", "i want", "i should",
-	"i think", "i can", "i will", "i would", "i could",
 	"first,", "first i", "firstly",
-	"the user", "the model", "the question",
-	"so the", "okay,", "okay so",
-	"now i", "here i", "this is a",
-}
-
-// hasThinkingPrefix returns true when the text starts with a known thinking opener
-// pattern. Unlike isLikelyThinking, it does NOT use isPureEnglish — this avoids
-// falsely blocking legitimate English responses in the draft/finalize paths.
-func hasThinkingPrefix(s string) bool {
-	trimmed := strings.TrimSpace(s)
-	lower := strings.ToLower(trimmed)
-	for _, p := range thinkingOpeners {
-		if strings.HasPrefix(lower, p) {
-			return true
-		}
-	}
-	return false
-}
-
-// stripThinkingPrefix removes leading thinking/reasoning content from text,
-// keeping only the actual response. If the text doesn't start with a thinking
-// pattern, returns it unchanged. If it's pure thinking with no response,
-// returns empty string.
-func stripThinkingPrefix(s string) string {
-	if !hasThinkingPrefix(s) && !isPureEnglish(s) {
-		return s
-	}
-	// Try direct address as transition marker (Chinese: addressing user).
-	for _, marker := range []string{"爸爸，", "爸爸：", "爸爸!", "爸爸！"} {
-		if idx := strings.Index(s, marker); idx >= 0 {
-			return s[idx:]
-		}
-	}
-	// Scan rune by rune, splitting at Chinese/English sentence boundaries.
-	// Find the first sentence segment that's neither thinking-opener-prefixed
-	// nor pure English (pure English = thinking in Chinese-only conversations).
-	in := []rune(s)
-	for i, r := range in {
-		if strings.ContainsRune("。！？\n.!?", r) && i+1 < len(in) {
-			nextStart := i + 1
-			// Skip whitespace after punctuation.
-			for nextStart < len(in) && in[nextStart] == ' ' {
-				nextStart++
-			}
-			next := strings.TrimSpace(string(in[nextStart:]))
-			if next != "" && !hasThinkingPrefix(next) && !isPureEnglish(next) {
-				return string(in[nextStart:])
-			}
-		}
-	}
-	// No non-thinking segment found — it's pure thinking.
-	return ""
+	"the user", "the model",
 }
 
 // isLikelyThinking returns true when the text reads like internal reasoning
@@ -1023,12 +903,9 @@ func isSilenceOnly(s string) bool {
 }
 
 // appendChunk accumulates streamed assistant text (full buffer; finalize may split across messages).
-// inThinking tracks whether a prior chunk opened a thinking/reasoning block that wasn't closed
-// (thinking blocks can span multiple SSE chunks). Callers MUST pass the same pointer for the
-// duration of one turn and reset it to false before the next turn.
-func appendChunk(buf *strings.Builder, chunk string, maxBytes int, truncated *bool, inThinking *bool) {
+func appendChunk(buf *strings.Builder, chunk string, maxBytes int, truncated *bool) {
 	clean := stripANSI(chunk)
-	clean = stripThinkBlocksStateful(clean, inThinking)
+	clean = stripThinkBlocks(clean)
 	if clean == "" || isReasonixNoise(clean) {
 		return
 	}

@@ -137,83 +137,8 @@ func TestHasCJK(t *testing.T) {
 	}
 }
 
-func TestStripThinkBlocksStateful(t *testing.T) {
-	t.Parallel()
-
-	t.Run("single chunk complete block", func(t *testing.T) {
-		var inThinking bool
-		got := stripThinkBlocksStateful("before <thinking>hidden</thinking> after", &inThinking)
-		if got != "before  after" {
-			t.Fatalf("got %q, want %q", got, "before  after")
-		}
-		if inThinking {
-			t.Fatal("inThinking should be false after complete block")
-		}
-	})
-
-	t.Run("cross chunk open in first", func(t *testing.T) {
-		var inThinking bool
-		got1 := stripThinkBlocksStateful("before <thinking>hidden content ", &inThinking)
-		if got1 != "before " {
-			t.Fatalf("chunk1: got %q, want %q", got1, "before ")
-		}
-		if !inThinking {
-			t.Fatal("inThinking should be true after open tag")
-		}
-
-		got2 := stripThinkBlocksStateful("more hidden text", &inThinking)
-		if got2 != "" {
-			t.Fatalf("chunk2: got %q, want empty (all thinking)", got2)
-		}
-		if !inThinking {
-			t.Fatal("inThinking should still be true")
-		}
-
-		got3 := stripThinkBlocksStateful("</thinking> after", &inThinking)
-		if got3 != " after" {
-			t.Fatalf("chunk3: got %q, want %q", got3, " after")
-		}
-		if inThinking {
-			t.Fatal("inThinking should be false after close tag")
-		}
-	})
-
-	t.Run("close tag alone discarded", func(t *testing.T) {
-		var inThinking bool
-		got := stripThinkBlocksStateful("</thinking> hello", &inThinking)
-		// Not in a thinking block, so the closing tag is just text
-		if got != "</thinking> hello" {
-			t.Fatalf("got %q, want %q", got, "</thinking> hello")
-		}
-	})
-
-	t.Run("multiple complete blocks in one chunk", func(t *testing.T) {
-		var inThinking bool
-		got := stripThinkBlocksStateful("a<think>b</think>c<think>d</think>e", &inThinking)
-		if got != "ace" {
-			t.Fatalf("got %q, want %q", got, "ace")
-		}
-	})
-
-	t.Run("empty chunk", func(t *testing.T) {
-		var inThinking bool
-		got := stripThinkBlocksStateful("", &inThinking)
-		if got != "" {
-			t.Fatalf("got %q, want empty", got)
-		}
-	})
-
-	t.Run("ansi inside thinking still stripped", func(t *testing.T) {
-		var inThinking bool
-		// ANSI is stripped BEFORE calling stripThinkBlocksStateful
-		got := stripThinkBlocksStateful("visible<thinking>\x1b[32mhidden\x1b[0m</thinking>end", &inThinking)
-		if got != "visibleend" {
-			t.Fatalf("got %q, want %q", got, "visibleend")
-		}
-	})
-}
-
 func TestIsLikelyThinking(t *testing.T) {
+	t.Parallel()
 	cases := []struct {
 		in   string
 		want bool

@@ -9,10 +9,9 @@ import (
 func TestAppendChunk(t *testing.T) {
 	var buf strings.Builder
 	var truncated bool
-	var inThinking bool
 
-	appendChunk(&buf, "hello ", 100, &truncated, &inThinking)
-	appendChunk(&buf, "world", 100, &truncated, &inThinking)
+	appendChunk(&buf, "hello ", 100, &truncated)
+	appendChunk(&buf, "world", 100, &truncated)
 	if buf.String() != "hello world" {
 		t.Fatalf("expected 'hello world', got %q", buf.String())
 	}
@@ -21,7 +20,7 @@ func TestAppendChunk(t *testing.T) {
 	}
 
 	// Test with ANSI stripping
-	appendChunk(&buf, "\x1b[32m green \x1b[0m", 100, &truncated, &inThinking)
+	appendChunk(&buf, "\x1b[32m green \x1b[0m", 100, &truncated)
 	if !strings.Contains(buf.String(), "green") {
 		t.Fatalf("expected green text, got %q", buf.String())
 	}
@@ -32,9 +31,8 @@ func TestAppendChunk(t *testing.T) {
 	// Test truncation at cap
 	var buf2 strings.Builder
 	var tr2 bool
-	var inThinking2 bool
 	long := strings.Repeat("a", 200)
-	appendChunk(&buf2, long, 50, &tr2, &inThinking2)
+	appendChunk(&buf2, long, 50, &tr2)
 	if !tr2 {
 		t.Fatal("should be truncated")
 	}
