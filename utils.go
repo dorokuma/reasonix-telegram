@@ -124,7 +124,7 @@ func (a *App) deleteMessage(chatID int64, messageID int) {
 // "message is not modified" as success.
 func (a *App) editCommentary(chatID int64, messageID int, appendText string) error {
 	text := capTelegramMessage(appendText)
-	edit := tgbotapi.NewEditMessageText(chatID, messageID, formatForTelegram(text))
+	edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
 	edit.ParseMode = "MarkdownV2"
 	_, err := a.sendWithRetry(edit, chatID)
 	if telegramEditOK(err) {

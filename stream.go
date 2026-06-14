@@ -180,8 +180,8 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 						n = a.sendTextParts(chatID, tail, nil)
 					}
 				} else {
-					streamed := formatForTelegram(telegramPreviewTail(body, telegramMaxMessageRunes))
-					if streamed == formatForTelegram(lastDraftBody) {
+					streamed := telegramPreviewTail(body, telegramMaxMessageRunes)
+					if streamed == lastDraftBody {
 						n = 1
 						log.Printf("chat=%d: finalize skip edit (already shown via stream)", chatID)
 					} else {
@@ -262,9 +262,8 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			draftID = a.nextDraftID()
 		}
 		if streamMsgID == 0 {
-			previewHTML := formatForTelegram(preview)
-			msg := newMessage(chatID, previewHTML)
-			msg.ParseMode = "MarkdownV2"
+			msg := newMessage(chatID, preview)
+			msg.ParseMode = "" // plain text preview; final send uses Rich Messages
 			sent, err := a.sendWithRetry(msg, chatID)
 			if err != nil {
 				log.Printf("chat=%d: stream send failed: %v", chatID, err)
@@ -286,9 +285,8 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		if preview == lastDraftBody {
 			return
 		}
-		previewHTML := formatForTelegram(preview)
-		edit := tgbotapi.NewEditMessageText(chatID, streamMsgID, previewHTML)
-		edit.ParseMode = "MarkdownV2"
+		edit := tgbotapi.NewEditMessageText(chatID, streamMsgID, preview)
+		edit.ParseMode = "" // plain text edit; final send uses Rich Messages
 		_, err := a.sendWithRetry(edit, chatID)
 		if telegramEditOK(err) {
 			editFailCount = 0
@@ -357,8 +355,8 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				// Not part of the stream buffer — send immediately as new message.
 				// Don't touch draftMu to avoid contention with pusher goroutine.
 				text = capTelegramMessage(text)
-				msg := newMessage(chatID, formatForTelegram(text))
-				msg.ParseMode = "MarkdownV2"
+				msg := newMessage(chatID, text)
+				msg.ParseMode = "MarkdownV2" // still needed for inline keyboard fallback
 				sent, err := a.sendWithRetry(msg, chatID)
 				if err != nil {
 					log.Printf("chat=%d: commentary send failed: %v", chatID, err)
@@ -794,7 +792,6 @@ func (a *App) dismissSessionDraft(chatID int64) {
 // sendDraft pushes streaming preview text via sendMessageDraft (Bot API 9.5+).
 // Text is automatically converted from markdown to Telegram HTML format.
 func (a *App) sendDraft(chatID int64, draftID int64, text string) bool {
-	text = formatForTelegram(text)
 	text = telegramPreviewTail(text, telegramMaxMessageRunes)
 	if text == "" {
 		return false

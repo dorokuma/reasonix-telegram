@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -927,3 +928,194 @@ func appendChunk(buf *strings.Builder, chunk string, maxBytes int, truncated *bo
 	buf.WriteString(clean)
 }
 
+// stripHookMessages removes RTK hook interception messages from tool output.
+func stripHookMessages(output string) string {
+	// Hook interceptions look like:
+	//   hook <name> intercepted [args] → <reason>
+	//   hook <name> — intercepted: <reason>
+	// or multiline variants covering the entire tool output.
+	lines := strings.Split(output, "\n")
+	var kept []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		// Single-line hook interception
+		if strings.HasPrefix(trimmed, "hook ") && strings.Contains(trimmed, "intercepted") {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	result := strings.TrimSpace(strings.Join(kept, "\n"))
+	if result == "" {
+		return ""
+	}
+	return result
+}
+
+// stripBackgroundJobs removes reasonix background-job lifecycle blocks from text.
+func stripBackgroundJobs(text string) string {
+	if !strings.Contains(text, "job_") {
+		return text
+	}
+	re := regexp.MustCompile(`\n?⏳.*job_[a-z_]+\s+(started|completed|failed|cancelled|rescheduled|skipped).*`)
+	return strings.TrimSpace(re.ReplaceAllString(text, ""))
+}
+
+func toolEmoji(name string) string {
+	switch name {
+	case "bash":
+		return "💻"
+	case "python", "python3", "execute_code", "code":
+		return "🐍"
+	case "read_file", "cat":
+		return "📖"
+	case "write_file", "edit_file", "multi_edit":
+		return "✍️"
+	case "grep", "search_files", "codegraph_search":
+		return "🔎"
+	case "glob", "ls", "codegraph_files":
+		return "📁"
+	case "codegraph_callees", "codegraph_callers", "codegraph_context",
+		"codegraph_explore", "codegraph_trace", "codegraph_impact":
+		return "🔍"
+	case "ask":
+		return "❓"
+	case "search_web", "web_search",
+		"mcp__jina__search_web", "mcp__jina__search",
+		"mcp__brave__search", "mcp__tavily__search",
+		"mcp__kagi__search", "mcp__serpapi__search",
+		"read_url", "mcp__jina__read_url", "web_fetch":
+		// Globe with meridians — anything that fetches *content* over
+		// the web (search results, read URL, web_fetch). User said these
+		// all need the obvious "网络" affordance; curl/wget are different
+		// (raw HTTP I/O plumbing, kept as 📄).
+		return "🌐"
+	case "curl", "wget":
+		return "📄"
+	case "memory_save", "remember", "memory":
+		return "🧠"
+	case "todo", "todo_write":
+		return "📋"
+	case "gh", "git":
+		return "🔀"
+	case "docker":
+		return "🐳"
+	case "systemctl", "service":
+		return "⚙️"
+	default:
+		return "⚡"
+	}
+}
+
+// stripHookMessages removes RTK hook interception messages from tool output.
+// (Reasonix-specific.)
+func formatToolArgs(toolName, argsJSON string) string {
+	var m map[string]any
+	if err := json.Unmarshal([]byte(argsJSON), &m); err != nil {
+		return trimUTF8Bytes(argsJSON, 100)
+	}
+	switch toolName {
+	case "grep", "codegraph_search":
+		if q, ok := m["pattern"].(string); ok && q != "" && len(q) > 1 {
+			return "💬 " + trimUTF8Bytes(q, 80)
+		}
+		return ""
+	case "codegraph_explore":
+		return ""
+	case "codegraph_callees", "codegraph_callers", "codegraph_impact":
+		if q, ok := m["name"].(string); ok && q != "" {
+			return "🏷 " + q
+		}
+		return ""
+
+	case "codegraph_context":
+		if f, ok := m["file"].(string); ok && f != "" {
+			line := ""
+			if l, ok := m["line"].(float64); ok && l > 0 {
+				line = fmt.Sprintf(":%d", int(l))
+			}
+			return "📄 " + trimUTF8Bytes(f, 60) + line
+		}
+		return ""
+
+	case "codegraph_files":
+		if p, ok := m["pattern"].(string); ok && p != "" {
+			return "📁 " + p
+		}
+		return ""
+
+	case "read_file":
+		if p, ok := m["path"].(string); ok && p != "" && len(p) > 3 {
+			return "📄 " + trimUTF8Bytes(p, 80)
+		}
+		return ""
+	case "write_file", "edit_file", "multi_edit":
+		if p, ok := m["path"].(string); ok && p != "" && len(p) > 3 {
+			return "📄 " + trimUTF8Bytes(p, 80)
+		}
+		return ""
+	case "bash":
+		if cmd, ok := m["command"].(string); ok && cmd != "" {
+			cmd = strings.TrimSpace(cmd)
+			if cmd == "" {
+				return "💻 bash"
+			}
+			const capLen = 200
+			if len(cmd) > capLen {
+				cmd = trimUTF8Bytes(cmd, capLen-3) + "..."
+			}
+			return fmt.Sprintf("💻 bash\n```\n%s\n```", cmd)
+		}
+		return "💻 bash"
+	case "ls":
+		if p, ok := m["path"].(string); ok && p != "" && len(p) > 2 {
+			return "📁 " + trimUTF8Bytes(p, 80)
+		}
+		return ""
+	case "glob":
+		if p, ok := m["pattern"].(string); ok && p != "" && len(p) > 2 {
+			return "📁 " + p
+		}
+		return ""
+
+	case "search_web":
+		if q, ok := m["query"].(string); ok && q != "" {
+			return "🔍 " + trimUTF8Bytes(q, 80)
+		}
+		return ""
+
+	case "web_fetch", "read_url":
+		if u, ok := m["url"].(string); ok && u != "" {
+			return "🌐 " + trimUTF8Bytes(u, 80)
+		}
+		return ""
+
+	case "remember":
+		if t, ok := m["title"].(string); ok && t != "" {
+			return "🧠 " + t
+		}
+		return ""
+
+	case "ask":
+		return ""
+	}
+	for _, v := range m {
+		if s, ok := v.(string); ok && len(s) > 0 && len(s) < 100 {
+			return "💬 " + trimUTF8Bytes(s, 80)
+		}
+	}
+	return ""
+}
+
+// formatToolResult formats tool output for compact Telegram display.
+func isHookOnlyOutput(output string) bool {
+	if output == "" {
+		return false
+	}
+	return strings.TrimSpace(stripHookMessages(output)) == ""
+}
+
+// stripBackgroundJobs removes reasonix background-job lifecycle blocks from text.
+// These are injected by the controller and are not part of the agent's answer.

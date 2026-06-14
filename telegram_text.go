@@ -328,18 +328,15 @@ func (a *App) sendTextParts(chatID int64, text string, editFirstMsgID *int, noFi
 	// Check if file fallback is disabled (recursion guard)
 	if len(noFileFallback) > 0 && noFileFallback[0] && len(text) > telegramMaxMessageRunes*3 {
 		// Split long text into multiple parts without file fallback
-		parts := splitTelegramText(formatForTelegram(text), telegramMaxMessageRunes)
+		parts := splitTelegramText(text, telegramMaxMessageRunes)
 		total := 0
 		for i, p := range parts {
 			msg := newMessage(chatID, p)
-			msg.ParseMode = "MarkdownV2"
 			if i > 0 {
 				time.Sleep(multiPartSendGap)
 			}
 			if _, err := a.sendWithRetry(msg, chatID); err != nil {
-				if !telegramErrorIsParseEntities(err) {
-					log.Printf("chat=%d: noFileFallback part %d/%d: %v", chatID, i+1, len(parts), err)
-				}
+				log.Printf("chat=%d: noFileFallback part %d/%d: %v", chatID, i+1, len(parts), err)
 				break
 			}
 			total++
@@ -358,18 +355,10 @@ func (a *App) sendTextParts(chatID int64, text string, editFirstMsgID *int, noFi
 		if a.tryRichMessage(chatID, text) {
 			return 1
 		}
-		log.Printf("chat=%d: sendRichMessage failed or unavailable, falling back to MarkdownV2", chatID)
+		log.Printf("chat=%d: sendRichMessage failed or unavailable, falling back to plain text", chatID)
 	}
-
-	// Try MarkdownV2 first, fall back to plain text if entities fail to parse.
-	formatted := formatForTelegram(text)
-	if n := a.sendFormattedParts(chatID, formatted, editFirstMsgID, "MarkdownV2"); n > 0 {
-		return n
-	}
-	log.Printf("chat=%d: MarkdownV2 delivery failed, retrying plain text (%d runes)", chatID, utf8.RuneCountInString(text))
-	// strip the MarkdownV2 output (not the raw markdown) so _stripMdv2 can
-	// handle Telegram-specific formatting like \#, *bold*, ~strike~, ||spoiler||.
-	return a.sendFormattedParts(chatID, _stripMdv2(capTelegramMessage(formatted)), editFirstMsgID, "")
+	// Fallback: send as plain text
+	return a.sendFormattedParts(chatID, capTelegramMessage(text), editFirstMsgID, "")
 }
 
 func (a *App) sendFormattedParts(chatID int64, displayText string, editFirstMsgID *int, parseMode string) int {
