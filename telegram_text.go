@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"log"
 	"os"
 	"path/filepath"
@@ -351,6 +352,15 @@ func (a *App) sendTextParts(chatID int64, text string, editFirstMsgID *int, noFi
 	if text == "" {
 		return 1
 	}
+	// Try Rich Messages (sendRichMessage) with raw markdown first.
+	// Only for new messages (not edits) — edit with rich_message is more complex.
+	if editFirstMsgID == nil || *editFirstMsgID == 0 {
+		if a.tryRichMessage(chatID, text) {
+			return 1
+		}
+		log.Printf("chat=%d: sendRichMessage failed or unavailable, falling back to MarkdownV2", chatID)
+	}
+
 	// Try MarkdownV2 first, fall back to plain text if entities fail to parse.
 	formatted := formatForTelegram(text)
 	if n := a.sendFormattedParts(chatID, formatted, editFirstMsgID, "MarkdownV2"); n > 0 {
@@ -473,4 +483,34 @@ func (a *App) sendWithRetry(msg tgbotapi.Chattable, chatID int64) (tgbotapi.Mess
 		}
 	}
 	return tgbotapi.Message{}, lastErr
+}
+
+// tryRichMessage attempts to send text via sendRichMessage with raw markdown.
+// Returns true if the API call succeeded. Falls back silently on failure.
+func (a *App) tryRichMessage(chatID int64, text string) bool {
+	const maxLen = 32768
+	runes := []rune(text)
+	if len(runes) > maxLen {
+		runes = runes[:maxLen]
+	}
+	_, err := a.bot.MakeRequest("sendRichMessage", tgbotapi.Params{
+		"chat_id": strconv.FormatInt(chatID, 10),
+		"rich_message": mustMarshal(map[string]any{
+			"markdown": string(runes),
+		}),
+	})
+	if err != nil {
+		log.Printf("chat=%d: sendRichMessage failed: %v", chatID, err)
+		return false
+	}
+	return true
+}
+
+// mustMarshal JSON-encodes v, panicking on failure (used for API params).
+func mustMarshal(v any) string {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(err)
+	}
+	return string(b)
 }
