@@ -92,6 +92,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		editFailCount        int  // consecutive edit failures in this turn
 		streamEditFallback   bool // edit flood-silenced: finalize via sendMessage tail
 		streamVisiblePrefix  string // last raw preview successfully shown (edit/draft)
+		inThinking     bool   // tracks open thinking blocks across SSE chunks
 	)
 	const (
 		maxDraftFailures = 3
@@ -238,6 +239,11 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			log.Printf("chat=%d: pushDraft skip (empty buffer)", chatID)
 			return
 		}
+		body = stripThinkingPrefix(body)
+		if body == "" {
+			log.Printf("chat=%d: pushDraft skip (thinking only)", chatID)
+			return
+		}
 		preview := telegramPreviewTail(body, telegramMaxMessageRunes)
 		// Native drafts and edit-in-place must not mix: an open sendRichMessageDraft
 		// blocks the user's input even when the preview is invisible. Once we have
@@ -342,7 +348,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		procErr = a.runServeTurn(ctx, chatID, prompt,
 			func(chunk string) {
 				bufMu.Lock()
-				appendChunk(&buf, chunk, a.cfg.MaxOutputBytes, &truncated)
+				appendChunk(&buf, chunk, a.cfg.MaxOutputBytes, &truncated, &inThinking)
 				bufMu.Unlock()
 				wakePush()
 			},
@@ -386,6 +392,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				bufMu.Lock()
 				buf.Reset()
 				truncated = false
+				inThinking = false
 				bufMu.Unlock()
 				draftID = a.nextDraftID()
 				useDraft = true
@@ -470,6 +477,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				bufMu.Lock()
 				buf.Reset()
 				truncated = false
+				inThinking = false
 				bufMu.Unlock()
 				draftID = a.nextDraftID()
 				useDraft = true
@@ -569,6 +577,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			body := strings.TrimSpace(buf.String())
 			buf.Reset()
 			truncated = false
+			inThinking = false
 			bufMu.Unlock()
 			segHadLiveDraft := draftNeedsCleanup(segDraftShown || draftShown, segLiveDraftEver || liveDraftEver, lastDraftBody)
 			if body != "" {
@@ -781,6 +790,8 @@ func (a *App) dismissSessionDraft(chatID int64) {
 // sendDraft pushes streaming preview via sendRichMessageDraft (Bot API 10.1+).
 // The same draft_id auto-animates updates. Final sendRichMessage replaces the draft.
 func (a *App) sendDraft(chatID int64, draftID int64, text string) bool {
+	text = stripThinkBlocks(text)
+	text = stripThinkingPrefix(text)
 	text = telegramPreviewTail(text, telegramMaxMessageRunes)
 	if text == "" {
 		return false

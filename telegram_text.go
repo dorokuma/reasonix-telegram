@@ -321,7 +321,11 @@ func newMessage(chatID int64, text string) tgbotapi.MessageConfig {
 // Hermes pattern). If editFirstMsgID != nil and *editFirstMsgID > 0, the first
 // part updates that message.
 func (a *App) sendTextParts(chatID int64, text string, editFirstMsgID *int, noFileFallback ...bool) int {
-	text = strings.TrimSpace(text)
+	text = strings.TrimSpace(stripThinkBlocks(text))
+	if text == "" {
+		return 0
+	}
+	text = stripThinkingPrefix(text)
 	if text == "" {
 		return 0
 	}
