@@ -128,6 +128,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		tr := truncated
 		bufMu.Unlock()
 		body := streamFinalizeBody(raw, lastDraftBody)
+		body = stripErrorLines(body)
 		if body != "" && strings.TrimSpace(raw) == "" && strings.TrimSpace(lastDraftBody) != "" {
 			log.Printf("chat=%d: endStream using lastDraftBody fallback len=%d", chatID, len(body))
 		}
@@ -182,8 +183,11 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				} else {
 					streamed := telegramPreviewTail(body, telegramMaxMessageRunes)
 					if streamed == lastDraftBody {
-						n = 1
-						log.Printf("chat=%d: finalize skip edit (already shown via stream)", chatID)
+						// Stream showed plain text via draft. Edit the existing message
+						// to upgrade it to Rich Messages formatting.
+						log.Printf("chat=%d: finalize upgrade stream to Rich Messages", chatID)
+						editID := streamMsgID
+						n = a.sendTextParts(chatID, body, &editID)
 					} else {
 						editID := streamMsgID
 						n = a.sendTextParts(chatID, body, &editID)

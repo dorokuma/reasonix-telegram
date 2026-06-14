@@ -349,14 +349,15 @@ func (a *App) sendTextParts(chatID int64, text string, editFirstMsgID *int, noFi
 	if text == "" {
 		return 1
 	}
-	// Try Rich Messages (sendRichMessage) with raw markdown first.
-	// Only for new messages (not edits) — edit with rich_message is more complex.
-	if editFirstMsgID == nil || *editFirstMsgID == 0 {
-		if a.tryRichMessage(chatID, text) {
-			return 1
-		}
-		log.Printf("chat=%d: sendRichMessage failed or unavailable, falling back to plain text", chatID)
+	// Try Rich Messages (sendRichMessage / editMessageText+rich_message) with raw markdown.
+	var editID int
+	if editFirstMsgID != nil {
+		editID = *editFirstMsgID
 	}
+	if a.tryRichMessage(chatID, text, editID) {
+		return 1
+	}
+	log.Printf("chat=%d: sendRichMessage failed or unavailable, falling back to plain text", chatID)
 	// Fallback: send as plain text
 	return a.sendFormattedParts(chatID, capTelegramMessage(text), editFirstMsgID, "")
 }
@@ -475,21 +476,30 @@ func (a *App) sendWithRetry(msg tgbotapi.Chattable, chatID int64) (tgbotapi.Mess
 }
 
 // tryRichMessage attempts to send text via sendRichMessage with raw markdown.
+// If editMsgID > 0, it edits the existing message via editMessageText with rich_message.
 // Returns true if the API call succeeded. Falls back silently on failure.
-func (a *App) tryRichMessage(chatID int64, text string) bool {
+func (a *App) tryRichMessage(chatID int64, text string, editMsgID ...int) bool {
 	const maxLen = 32768
 	runes := []rune(text)
 	if len(runes) > maxLen {
 		runes = runes[:maxLen]
 	}
-	_, err := a.bot.MakeRequest("sendRichMessage", tgbotapi.Params{
-		"chat_id": strconv.FormatInt(chatID, 10),
+	params := tgbotapi.Params{
 		"rich_message": mustMarshal(map[string]any{
 			"markdown": string(runes),
 		}),
-	})
+	}
+	endpoint := "sendRichMessage"
+	if len(editMsgID) > 0 && editMsgID[0] > 0 {
+		endpoint = "editMessageText"
+		params["chat_id"] = strconv.FormatInt(chatID, 10)
+		params["message_id"] = strconv.FormatInt(int64(editMsgID[0]), 10)
+	} else {
+		params["chat_id"] = strconv.FormatInt(chatID, 10)
+	}
+	_, err := a.bot.MakeRequest(endpoint, params)
 	if err != nil {
-		log.Printf("chat=%d: sendRichMessage failed: %v", chatID, err)
+		log.Printf("chat=%d: %s failed: %v", chatID, endpoint, err)
 		return false
 	}
 	return true

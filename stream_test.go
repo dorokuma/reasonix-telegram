@@ -74,6 +74,10 @@ func TestIsReasonixNoise(t *testing.T) {
 		"hook blocked something",
 		"something exit status 1",
 		"something remembered 1 fact",
+		"unknown ref \"ctx-2\"",
+		"unknown ref 'ctx-2'",
+		"[ctx] ref=ctx-1 tool=read_file (200 lines): offset 0",
+		"[ctx] something something",
 	}
 	keep := []string{
 		"hello world",
@@ -90,6 +94,30 @@ func TestIsReasonixNoise(t *testing.T) {
 	for _, s := range keep {
 		if isReasonixNoise(s) {
 			t.Fatalf("expected keep: %q", s)
+		}
+	}
+}
+
+// TestStripErrorLines verifies error line removal.
+func TestStripErrorLines(t *testing.T) {
+	cases := []struct {
+		in   string
+		want string
+	}{
+		{"hello world", "hello world"},
+		{"unknown ref \"ctx-2\"", ""},
+		{"prefix unknown ref 'ctx-2' suffix", ""},
+		{"[ctx] ref=ctx-1 tool=read_file", ""},
+		{"normal line\nunknown ref \"ctx-5\"", "normal line"},
+		{"unknown ref\nnormal line", "normal line"},
+		{"normal line\n[ctx] ref=ctx-1\nanother normal", "normal line\nanother normal"},
+		{"", ""},
+		{"   ", ""},
+	}
+	for _, tc := range cases {
+		got := stripErrorLines(tc.in)
+		if got != tc.want {
+			t.Fatalf("stripErrorLines(%q) = %q, want %q", tc.in, got, tc.want)
 		}
 	}
 }

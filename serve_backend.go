@@ -963,6 +963,30 @@ func stripBackgroundJobs(text string) string {
 	return strings.TrimSpace(re.ReplaceAllString(text, ""))
 }
 
+// stripErrorLines removes known error/diagnostic lines from text.
+// These are reasonix internal messages that should not reach the end user.
+func stripErrorLines(text string) string {
+	lines := strings.Split(text, "\n")
+	var kept []string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			kept = append(kept, line)
+			continue
+		}
+		// unknown ref errors from ctx_read / ctx_search tool (store.go)
+		if strings.Contains(trimmed, "unknown ref") {
+			continue
+		}
+		// [ctx] summary lines from ctx_read output
+		if strings.HasPrefix(trimmed, "[ctx]") {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.TrimSpace(strings.Join(kept, "\n"))
+}
+
 func toolEmoji(name string) string {
 	switch name {
 	case "bash":
