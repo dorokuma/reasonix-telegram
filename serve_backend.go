@@ -583,14 +583,7 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 					if onToolDispatch != nil {
 						onToolDispatch()
 					}
-					emoji := toolEmoji(ev.Tool.Name)
-					newLine := fmt.Sprintf("%s %s", emoji, ev.Tool.Name)
-					if ev.Tool.Args != "" {
-						summary := formatToolArgs(ev.Tool.Name, ev.Tool.Args)
-						if summary != "" {
-							newLine = summary
-						}
-					}
+					newLine := toolDisplayLine(ev.Tool.Name, ev.Tool.Args)
 
 					// Consolidate consecutive same-tool calls into one line with count.
 					if ev.Tool.Name == lastToolName && lastToolMsgID != 0 && toolCount > 0 {
@@ -614,8 +607,6 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 					lastToolName = ev.Tool.Name
 					if lastToolMsgID != 0 {
 						// Append to existing progress message.
-						// Use double newline so Markdown renders each tool as separate
-						// paragraph; single \n would collapse into spaces.
 						fullText := lastToolText + "\n\n" + newLine
 						_ = a.editCommentary(chatID, lastToolMsgID, fullText)
 						lastToolText = fullText
@@ -857,151 +848,161 @@ func stripErrorLines(text string) string {
 	return strings.TrimSpace(strings.Join(kept, "\n"))
 }
 
-func toolEmoji(name string) string {
-	switch name {
+func toolDisplayLine(toolName, argsJSON string) string {
+	// Parse args once.
+	var args map[string]any
+	if argsJSON != "" {
+		_ = json.Unmarshal([]byte(argsJSON), &args)
+	}
+
+	// Helper to extract string arg.
+	str := func(key string) string {
+		if args == nil {
+			return ""
+		}
+		if v, ok := args[key].(string); ok {
+			return v
+		}
+		return ""
+	}
+
+	// Unified emoji + summary per tool.
+	switch toolName {
 	case "bash":
-		return "💻"
+		cmd := strings.TrimSpace(str("command"))
+		if cmd == "" {
+			return "💻 bash"
+		}
+		const capLen = 200
+		if len(cmd) > capLen {
+			cmd = trimUTF8Bytes(cmd, capLen-3) + "..."
+		}
+		return fmt.Sprintf("💻 bash\n```\n%s\n```", cmd)
 	case "python", "python3", "execute_code", "code":
-		return "🐍"
+		return "🐍 " + toolName
 	case "read_file", "cat":
+		if p := str("path"); p != "" && len(p) > 3 {
+			return "📖 " + trimUTF8Bytes(p, 80)
+		}
 		return "📖"
 	case "write_file", "edit_file", "multi_edit":
-		return "✍️"
-	case "grep", "search_files", "codegraph_search":
-		return "🔎"
-	case "glob", "ls", "codegraph_files":
-		return "📁"
-	case "codegraph_callees", "codegraph_callers", "codegraph_context",
-		"codegraph_explore", "codegraph_trace", "codegraph_impact":
-		return "🔍"
-	case "ask":
-		return "❓"
-	case "search_web", "web_search",
-		"mcp__jina__search_web", "mcp__jina__search",
-		"mcp__brave__search", "mcp__tavily__search",
-		"mcp__kagi__search", "mcp__serpapi__search",
-		"read_url", "mcp__jina__read_url", "web_fetch":
-		// Globe with meridians — anything that fetches *content* over
-		// the web (search results, read URL, web_fetch). User said these
-		// all need the obvious "网络" affordance; curl/wget are different
-		// (raw HTTP I/O plumbing, kept as 📄).
-		return "🌐"
-	case "curl", "wget":
-		return "📄"
-	case "memory_save", "remember", "memory":
-		return "🧠"
-	case "todo", "todo_write":
-		return "📋"
-	case "gh", "git":
-		return "🔀"
-	case "docker":
-		return "🐳"
-	case "systemctl", "service":
-		return "⚙️"
-	default:
-		return "⚡"
-	}
-}
-
-// stripHookMessages removes RTK hook interception messages from tool output.
-// (Reasonix-specific.)
-func formatToolArgs(toolName, argsJSON string) string {
-	var m map[string]any
-	if err := json.Unmarshal([]byte(argsJSON), &m); err != nil {
-		return trimUTF8Bytes(argsJSON, 100)
-	}
-	switch toolName {
-	case "grep", "codegraph_search":
-		if q, ok := m["pattern"].(string); ok && q != "" && len(q) > 1 {
-			return "💬 " + trimUTF8Bytes(q, 80)
+		if p := str("path"); p != "" && len(p) > 3 {
+			return "✍️ " + trimUTF8Bytes(p, 80)
 		}
-		return ""
-	case "codegraph_explore":
-		return ""
+		return "✍️"
+	case "grep", "search_files":
+		if q := str("pattern"); q != "" && len(q) > 1 {
+			return "🔎 " + trimUTF8Bytes(q, 80)
+		}
+		return "🔎"
+	case "glob", "ls":
+		if p := str("path"); p != "" && len(p) > 2 {
+			return "📁 " + trimUTF8Bytes(p, 80)
+		}
+		if p := str("pattern"); p != "" && len(p) > 2 {
+			return "📁 " + p
+		}
+		return "📁"
+	case "codegraph_search":
+		if q := str("pattern"); q != "" && len(q) > 1 {
+			return "🔍 " + trimUTF8Bytes(q, 80)
+		}
+		return "🔍"
 	case "codegraph_callees", "codegraph_callers", "codegraph_impact":
-		if q, ok := m["name"].(string); ok && q != "" {
+		if q := str("name"); q != "" {
 			return "🏷 " + q
 		}
-		return ""
-
+		return "🔍"
 	case "codegraph_context":
-		if f, ok := m["file"].(string); ok && f != "" {
+		if f := str("file"); f != "" {
 			line := ""
-			if l, ok := m["line"].(float64); ok && l > 0 {
-				line = fmt.Sprintf(":%d", int(l))
+			if args != nil {
+				if l, ok := args["line"].(float64); ok && l > 0 {
+					line = fmt.Sprintf(":%d", int(l))
+				}
 			}
 			return "📄 " + trimUTF8Bytes(f, 60) + line
 		}
-		return ""
-
+		return "🔍"
+	case "codegraph_explore", "codegraph_trace":
+		return "🔍"
 	case "codegraph_files":
-		if p, ok := m["pattern"].(string); ok && p != "" {
+		if p := str("pattern"); p != "" {
 			return "📁 " + p
 		}
-		return ""
-
-	case "read_file":
-		if p, ok := m["path"].(string); ok && p != "" && len(p) > 3 {
-			return "📄 " + trimUTF8Bytes(p, 80)
+		return "📁"
+	case "search_web", "web_search":
+		if q := str("query"); q != "" {
+			return "🌐 " + trimUTF8Bytes(q, 80)
 		}
-		return ""
-	case "write_file", "edit_file", "multi_edit":
-		if p, ok := m["path"].(string); ok && p != "" && len(p) > 3 {
-			return "📄 " + trimUTF8Bytes(p, 80)
-		}
-		return ""
-	case "bash":
-		if cmd, ok := m["command"].(string); ok && cmd != "" {
-			cmd = strings.TrimSpace(cmd)
-			if cmd == "" {
-				return "💻 bash"
-			}
-			const capLen = 200
-			if len(cmd) > capLen {
-				cmd = trimUTF8Bytes(cmd, capLen-3) + "..."
-			}
-			return fmt.Sprintf("💻 bash\n\n```\n%s\n```", cmd)
-		}
-		return "💻 bash"
-	case "ls":
-		if p, ok := m["path"].(string); ok && p != "" && len(p) > 2 {
-			return "📁 " + trimUTF8Bytes(p, 80)
-		}
-		return ""
-	case "glob":
-		if p, ok := m["pattern"].(string); ok && p != "" && len(p) > 2 {
-			return "📁 " + p
-		}
-		return ""
-
-	case "search_web":
-		if q, ok := m["query"].(string); ok && q != "" {
-			return "🔍 " + trimUTF8Bytes(q, 80)
-		}
-		return ""
-
+		return "🌐"
 	case "web_fetch", "read_url":
-		if u, ok := m["url"].(string); ok && u != "" {
+		if u := str("url"); u != "" {
 			return "🌐 " + trimUTF8Bytes(u, 80)
 		}
-		return ""
-
-	case "remember":
-		if t, ok := m["title"].(string); ok && t != "" {
+		return "🌐"
+	case "curl", "wget":
+		if u := str("url"); u != "" {
+			return "📄 " + trimUTF8Bytes(u, 80)
+		}
+		return "📄"
+	case "remember", "memory_save", "memory":
+		if t := str("title"); t != "" {
 			return "🧠 " + t
 		}
-		return ""
-
+		return "🧠"
+	case "note", "ctx_read", "ctx_search", "ctx_run":
+		return "📝 " + toolName
+	case "audit_finish":
+		return "📋 audit"
+	case "delete_range", "delete_symbol":
+		return "🗑️ " + toolName
+	case "notebook_edit":
+		return "📓 notebook"
+	case "bash_output", "wait", "kill_shell":
+		return "⏱ " + toolName
+	case "run_skill", "install_skill", "install_source", "slash_command":
+		return "📚 " + toolName
+	case "task":
+		return "🤖 task"
+	case "gh", "git":
+		return "🔀 " + toolName
+	case "docker":
+		return "🐳 docker"
+	case "systemctl", "service":
+		return "⚙️ " + toolName
 	case "ask":
-		return ""
-	}
-	for _, v := range m {
-		if s, ok := v.(string); ok && len(s) > 0 && len(s) < 100 {
-			return "💬 " + trimUTF8Bytes(s, 80)
+		return "❓"
+	default:
+		// MCP tools: match by prefix.
+		switch {
+		case strings.HasPrefix(toolName, "mcp__cf-bindings__"):
+			return "☁️ " + strings.TrimPrefix(toolName, "mcp__cf-bindings__")
+		case strings.HasPrefix(toolName, "mcp__cf-observability__"):
+			return "📊 " + strings.TrimPrefix(toolName, "mcp__cf-observability__")
+		case strings.HasPrefix(toolName, "mcp__cf-builds__"):
+			return "🔨 " + strings.TrimPrefix(toolName, "mcp__cf-builds__")
+		case strings.HasPrefix(toolName, "mcp__cf-docs__"):
+			return "📖 " + strings.TrimPrefix(toolName, "mcp__cf-docs__")
+		case strings.HasPrefix(toolName, "mcp__jina__"):
+			return "🌐 " + strings.TrimPrefix(toolName, "mcp__jina__")
+		case strings.HasPrefix(toolName, "mcp__codegraph__"):
+			return "🧬 " + strings.TrimPrefix(toolName, "mcp__codegraph__")
+		default:
+			// Fallback: try to find a string arg for display.
+			if args != nil {
+				for _, v := range args {
+					if s, ok := v.(string); ok && len(s) > 0 && len(s) < 100 {
+						return "⚡ " + trimUTF8Bytes(s, 80)
+					}
+				}
+			}
+			return "⚡ " + toolName
 		}
 	}
-	return ""
 }
+
+
 
 // formatToolResult formats tool output for compact Telegram display.
 func isHookOnlyOutput(output string) bool {

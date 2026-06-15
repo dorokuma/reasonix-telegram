@@ -349,7 +349,9 @@ func (a *App) sendTextParts(chatID int64, text string, editFirstMsgID *int, noFi
 	if text == "" {
 		return 1
 	}
-	// Try Rich Messages (sendRichMessage / editMessageText+rich_message) with raw markdown.
+	// Try Rich Messages with raw markdown.
+	// sendRichMessage alone omits .Text, breaking quote/reply extraction.
+	// After sending, we immediately editMessageText to backfill .Text.
 	var editID int
 	if editFirstMsgID != nil {
 		editID = *editFirstMsgID
@@ -357,8 +359,6 @@ func (a *App) sendTextParts(chatID int64, text string, editFirstMsgID *int, noFi
 	if a.tryRichMessage(chatID, text, editID) > 0 {
 		return 1
 	}
-	log.Printf("chat=%d: sendRichMessage failed or unavailable, falling back to plain text", chatID)
-	// Fallback: send as plain text
 	return a.sendFormattedParts(chatID, capTelegramMessage(text), editFirstMsgID, "")
 }
 
@@ -516,6 +516,8 @@ func (a *App) tryRichMessage(chatID int64, text string, editMsgID ...int) int {
 		log.Printf("chat=%d: sendRichMessage: parse response: %v", chatID, err)
 		return 1 // assume success, return 1 as fallback
 	}
+	// sendRichMessage already populates .Text from rich_message content
+	// (confirmed by "message is not modified" on redundant edit).
 	return msg.MessageID
 }
 

@@ -285,9 +285,16 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 		if quote == "" {
 			quote = m.ReplyToMessage.Caption
 		}
+		log.Printf("chat=%d: reply quote len=%d textPreview=%q captionPreview=%q fromBot=%v fromUser=%d",
+			m.Chat.ID, len(quote), logPreview(m.ReplyToMessage.Text, 60),
+			logPreview(m.ReplyToMessage.Caption, 60),
+			m.ReplyToMessage.From != nil && m.ReplyToMessage.From.IsBot,
+			m.ReplyToMessage.From.ID)
 		if quote != "" {
 			text = fmt.Sprintf("[回复消息: %s]\n%s", quote, text)
 		}
+	} else {
+		log.Printf("chat=%d: no ReplyToMessage (msgID=%d)", m.Chat.ID, m.MessageID)
 	}
 
 	a.runTask(m.Chat.ID, m.MessageID, text)
