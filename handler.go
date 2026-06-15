@@ -288,6 +288,11 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 		// sendRichMessage omits .Text; try our local cache.
 		if quote == "" {
 			quote = a.lookupSentText(m.ReplyToMessage.MessageID)
+			if quote != "" {
+				log.Printf("chat=%d: reply quote from cache msgID=%d len=%d", m.Chat.ID, m.ReplyToMessage.MessageID, len(quote))
+			} else {
+				log.Printf("chat=%d: reply cache miss msgID=%d", m.Chat.ID, m.ReplyToMessage.MessageID)
+			}
 		}
 		log.Printf("chat=%d: reply quote len=%d textPreview=%q captionPreview=%q fromBot=%v fromUser=%d",
 			m.Chat.ID, len(quote), logPreview(m.ReplyToMessage.Text, 60),
