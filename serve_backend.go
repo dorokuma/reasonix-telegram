@@ -958,7 +958,7 @@ func formatToolArgs(toolName, argsJSON string) string {
 			if len(cmd) > capLen {
 				cmd = trimUTF8Bytes(cmd, capLen-3) + "..."
 			}
-			return fmt.Sprintf("💻 bash\n```\n%s\n```", cmd)
+			return fmt.Sprintf("💻 bash\n\n```\n%s\n```", cmd)
 		}
 		return "💻 bash"
 	case "ls":
