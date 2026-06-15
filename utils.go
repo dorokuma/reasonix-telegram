@@ -121,21 +121,19 @@ func (a *App) deleteMessage(chatID int64, messageID int) {
 }
 
 // editCommentary updates a tool-dispatch message. Caps length and treats
-// "message is not modified" as success. Tries rich message first,
-// then legacy Markdown, then plain text.
+// "message is not modified" as success. Tries legacy Markdown first,
+// then plain text. (editMessageText+rich_message is unreliable, so
+// tryRichMessage is not used here.)
 func (a *App) editCommentary(chatID int64, messageID int, appendText string) error {
 	text := capTelegramMessage(appendText)
-	if a.tryRichMessage(chatID, text, messageID) > 0 {
-		return nil
-	}
-	// Fallback: legacy Markdown with code-block support.
+	// Try legacy Markdown (supports ``` code blocks without MarkdownV2 escaping).
 	edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
 	edit.ParseMode = tgbotapi.ModeMarkdown
 	_, err := a.sendWithRetry(edit, chatID)
 	if telegramEditOK(err) {
 		return nil
 	}
-	// Final fallback: plain text edit.
+	// Fallback: plain text edit.
 	edit.ParseMode = ""
 	_, err = a.sendWithRetry(edit, chatID)
 	if telegramEditOK(err) {
