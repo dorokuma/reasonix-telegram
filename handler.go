@@ -279,11 +279,15 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 	}
 
 	// If this is a reply, include the original message as context.
-	// Read from Text first, fall back to Caption for media messages.
+	// Read from Text first, fall back to Caption, then local cache.
 	if m.ReplyToMessage != nil {
 		quote := m.ReplyToMessage.Text
 		if quote == "" {
 			quote = m.ReplyToMessage.Caption
+		}
+		// sendRichMessage omits .Text; try our local cache.
+		if quote == "" {
+			quote = a.lookupSentText(m.ReplyToMessage.MessageID)
 		}
 		log.Printf("chat=%d: reply quote len=%d textPreview=%q captionPreview=%q fromBot=%v fromUser=%d",
 			m.Chat.ID, len(quote), logPreview(m.ReplyToMessage.Text, 60),

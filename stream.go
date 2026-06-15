@@ -361,6 +361,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				text = capTelegramMessage(text)
 				// Try rich message (native Markdown) first.
 				if msgID := a.tryRichMessage(chatID, text); msgID > 0 {
+					a.recordSentText(msgID, text)
 					replyDelivered = true
 					return msgID
 				}
@@ -378,6 +379,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 					}
 				}
 				replyDelivered = true
+				a.recordSentText(sent.MessageID, text)
 				return sent.MessageID
 			},
 			func(askID string, questions []askQuestionData) {

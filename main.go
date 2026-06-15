@@ -288,6 +288,7 @@ type App struct {
 	draftSeq       uint64 // per-process draft_id sequence (avoids same-second collisions)
 	clarifySeq     uint64 // monotonic counter for clarify IDs
 	mode           atomic.Value // string: ModeChat or ModeTool
+	sentTextCache  sync.Map     // message_id → sent text (for reply/quote extraction)
 }
 
 type tokenRedactingTransport struct {

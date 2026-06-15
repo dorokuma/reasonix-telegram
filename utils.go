@@ -209,3 +209,34 @@ func userFacingError(err error) string {
 		return s
 	}
 }
+
+// recordSentText stores the text of a sent message by its ID for later
+// reply/quote extraction. sendRichMessage omits .Text from the Telegram
+// message object, so ReplyToMessage.Text is empty when users reply.
+func (a *App) recordSentText(msgID int, text string) {
+	// Cap at 500 entries to avoid unbounded growth.
+	count := 0
+	a.sentTextCache.Range(func(_, _ any) bool { count++; return count < 500 })
+	if count >= 500 {
+		// Evict oldest entries (approximate: clear half).
+		n := 0
+		a.sentTextCache.Range(func(k, _ any) bool {
+			if n < 250 {
+				a.sentTextCache.Delete(k)
+				n++
+			}
+			return true
+		})
+	}
+	a.sentTextCache.Store(msgID, text)
+}
+
+// lookupSentText retrieves the stored text for a message ID, or "" if not found.
+func (a *App) lookupSentText(msgID int) string {
+	if v, ok := a.sentTextCache.Load(msgID); ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return ""
+}
