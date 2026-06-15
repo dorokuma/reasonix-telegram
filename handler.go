@@ -121,28 +121,23 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 	case text == "/start" || text == "/help":
 		a.reply(m.Chat.ID, strings.Join([]string{
 			"*🤖 Reasonix Telegram*",
-			"",
 			fmt.Sprintf("模式：%s", a.modeLabel()),
-			"",
 			"*常用指令*",
 			"/stop — 中止当前回复",
 			"/new — 新对话",
 			"/model — 切换模型",
 			"/effort — 推理深度",
-			"",
 			"*状态查看*",
 			"/status — 当前状态",
 			"/health — 服务状态",
 			"/sessions — 活跃会话",
-			"",
 			"*模式切换*",
 			"/chat — 聊天模式",
 			"/code — 编程模式",
-			"",
 			"*其他*",
 			"/restart — 重启桥接",
 			fmt.Sprintf("缓冲 %d 字节 · 超时 %d 分钟", a.cfg.MaxOutputBytes, a.cfg.MaxDuration),
-		}, "\n"))
+		}, "\n\n"))
 		return
 
 	case text == "/stop" || text == "/cancel":
