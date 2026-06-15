@@ -356,7 +356,19 @@ func (a *App) sendTextParts(chatID int64, text string, editFirstMsgID *int, noFi
 	if editFirstMsgID != nil {
 		editID = *editFirstMsgID
 	}
-	if a.tryRichMessage(chatID, text, editID) > 0 {
+	if msgID := a.tryRichMessage(chatID, text, editID); msgID > 0 {
+		// Backfill .Text via editMessageText so reply/quote extraction works.
+		// sendRichMessage alone omits .Text from the stored message.
+		richMsg := mustMarshal(map[string]any{"markdown": text})
+		backfill := tgbotapi.Params{
+			"chat_id":    strconv.FormatInt(chatID, 10),
+			"message_id": strconv.FormatInt(int64(msgID), 10),
+			"text":       text,
+			"rich_message": richMsg,
+		}
+		if _, err := a.bot.MakeRequest("editMessageText", backfill); err != nil {
+			log.Printf("chat=%d: editMessageText backfill failed: %v", chatID, err)
+		}
 		return 1
 	}
 	return a.sendFormattedParts(chatID, capTelegramMessage(text), editFirstMsgID, "")
