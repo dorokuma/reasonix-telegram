@@ -490,8 +490,6 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 
 	var turnErr error
 	var gotTextDelta bool
-	var sawToolDispatch bool
-	var reasoningBuf strings.Builder
 	var cancelOnce sync.Once
 	var lastToolMsgID int
 	var lastToolText string // raw text of last tool dispatch (for appending result)
@@ -522,22 +520,6 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 		}
 	}()
 
-	// Hermes handles reasoning-only turns in the agent loop (prefill continuation
-	// + retries). Reasonix accepts them as a successful final answer, so the bridge
-	// must recover visible text from accumulated reasoning when no text deltas arrive.
-	flushReasoningFallback := func() {
-		if !shouldFlushReasoningFallback(gotTextDelta, sawToolDispatch) {
-			return
-		}
-		body, ok := reasoningFallbackBody(reasoningBuf.String())
-		if !ok {
-			return
-		}
-		gotTextDelta = true
-		log.Printf("chat=%d: reasoning-only fallback len=%d runes=%d", chatID, len(body), utf8RuneCount(body))
-		onChunk(body)
-	}
-
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
 	for sc.Scan() {
@@ -566,18 +548,8 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 			// Full answer at end of an agent sub-step; normally duplicates "text" deltas.
 			// Never signal onComplete here — only turn_done ends the Telegram stream.
 			// Mid-turn message events (tool rounds, prefill) used to finalize early and
-			// drop the real answer after web_search / multi-step tools.
-			if ev.Reasoning != "" {
-				reasoningBuf.WriteString(ev.Reasoning)
-				// DeepSeek V4 reasoning bug: model places reply in reasoning_content
-				// instead of content. Try early fallback when text is missing.
-				if ev.Text == "" && !gotTextDelta && !sawToolDispatch {
-					if body, ok := reasoningFallbackBody(ev.Reasoning); ok {
-						gotTextDelta = true
-						onChunk(body)
-					}
-				}
-			}
+			// drop the real answer after web_search / multi-step tools. The agent's own
+			// empty-text recovery handles reasoning-only turns — no bridge-side fallback.
 			if ev.Text != "" && !gotTextDelta && !isReasonixNoise(ev.Text) {
 				gotTextDelta = true
 				if !bufferingAsk {
@@ -585,12 +557,8 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 				}
 			}
 		case "reasoning":
-			// Accumulate for end-of-turn fallback; do not stream live (too verbose).
-			if ev.Text != "" {
-				reasoningBuf.WriteString(ev.Text)
-			} else if ev.Reasoning != "" {
-				reasoningBuf.WriteString(ev.Reasoning)
-			}
+			// The agent's own empty-text recovery handles reasoning-only turns.
+			// Do not buffer or forward reasoning content — it is internal chain-of-thought.
 			continue
 		case "tool_dispatch":
 			if a.getMode() == ModeChat {
@@ -606,7 +574,6 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 			} else {
 				// tool mode: signal tool boundary, then send commentary
 				if ev.Tool != nil && !ev.Tool.Partial && ev.Tool.Name != "" {
-					sawToolDispatch = true
 					// ask tool: buffer text as question, handled by ask_request event
 					if ev.Tool.Name == "ask" {
 						bufferingAsk = true
@@ -724,7 +691,6 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 			if ev.Err != "" {
 				turnErr = fmt.Errorf("%s", ev.Err)
 			}
-			flushReasoningFallback()
 			if onComplete != nil {
 				log.Printf("chat=%d: onComplete via turn_done", chatID)
 				onComplete()
@@ -780,105 +746,7 @@ func stripThinkBlocks(s string) string {
 	return s
 }
 
-func shouldFlushReasoningFallback(gotTextDelta, sawToolDispatch bool) bool {
-	return !gotTextDelta && !sawToolDispatch
-}
 
-// reasoningFallbackBody returns visible text when a turn produced only reasoning.
-// hasCJK returns true when s contains any CJK Unified Ideograph (Chinese/Japanese/Korean).
-func hasCJK(s string) bool {
-	for _, r := range s {
-		if r >= 0x4E00 && r <= 0x9FFF {
-			return true
-		}
-	}
-	return false
-}
-
-// isPureEnglish returns true when s has meaningful English content but zero CJK characters.
-// Reasoning/thinking from the model is nearly always English; a Chinese-locale response
-// almost always contains CJK characters (even if mixed with code/terms).
-func isPureEnglish(s string) bool {
-	letterCount := 0
-	for _, r := range s {
-		if r >= 0x4E00 && r <= 0x9FFF {
-			return false
-		}
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') {
-			letterCount++
-		}
-	}
-	return letterCount > 5
-}
-
-// thinkingOpeners are phrases (lowercased) that indicate the text is self-directed
-// reasoning/thinking rather than a user-facing response. When the fallback body
-// begins with any of these, it is still thinking, not an answer.
-var thinkingOpeners = []string{
-	// Chinese self-directed analysis
-	"让我", "我先", "我需要", "我们先",
-	"首先", "第一步",
-	"我来看看", "让我看看",
-	"这个问题", "这需要",
-	// English self-directed analysis
-	"let me", "let's", "i need", "i want", "i should",
-	"first,", "first i", "firstly",
-	"the user", "the model",
-}
-
-// isLikelyThinking returns true when the text reads like internal reasoning
-// rather than a direct response. Used to reject reasoning-only fallback that
-// would leak the model's chain-of-thought to the user.
-func isLikelyThinking(s string) bool {
-	trimmed := strings.TrimSpace(s)
-	lower := strings.ToLower(trimmed)
-	// Check for thinking opener patterns on the first line / beginning of text.
-	for _, p := range thinkingOpeners {
-		if strings.HasPrefix(lower, p) {
-			return true
-		}
-	}
-	// English-only text in a reasoning-only turn is almost certainly thinking.
-	if isPureEnglish(trimmed) {
-		return true
-	}
-	return false
-}
-
-// reasoningFallbackBody returns visible text when a turn produced only reasoning.
-func reasoningFallbackBody(reasoning string) (string, bool) {
-	body := strings.TrimSpace(stripThinkBlocks(stripANSI(reasoning)))
-	if body == "" {
-		return "", false
-	}
-	// Split into paragraphs by double newline; prefer keeping the last paragraph
-	// as the model's actual response (earlier content is chain-of-thought).
-	// When the last paragraph is less than half the total, the answer likely
-	// spans multiple paragraphs — return the full body instead.
-	original := body
-	for _, delim := range []string{"\n\n", "\n\t"} {
-		if parts := strings.Split(body, delim); len(parts) > 1 {
-			last := strings.TrimSpace(parts[len(parts)-1])
-			if last != "" {
-				body = last
-				break
-			}
-		}
-	}
-	// If stripping to one paragraph loses >50% of content, the answer has
-	// multiple relevant paragraphs — keep the full body.
-	if len(body) < len(original)/2 && utf8RuneCount(original) > len(body)+80 {
-		body = original
-	}
-	if body == "" || isReasonixNoise(body) || isSilenceOnly(body) || isLikelyThinking(body) {
-		return "", false
-	}
-	return body, true
-}
-
-func utf8RuneCount(s string) int {
-	return len([]rune(s))
-}
 
 // isSilenceOnly returns true if the string is just a "silence" narration
 // (model telling itself to be quiet). Used to suppress empty-looking replies.

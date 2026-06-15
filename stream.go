@@ -360,7 +360,8 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				// Don't touch draftMu to avoid contention with pusher goroutine.
 				text = capTelegramMessage(text)
 				msg := newMessage(chatID, text)
-				msg.ParseMode = "MarkdownV2" // still needed for inline keyboard fallback
+				// Pure text — formatForTelegram was removed, and tool args
+				// contain raw MarkdownV2 special chars that can't be safely escaped.
 				sent, err := a.sendWithRetry(msg, chatID)
 				if err != nil {
 					log.Printf("chat=%d: commentary send failed: %v", chatID, err)

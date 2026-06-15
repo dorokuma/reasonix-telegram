@@ -125,7 +125,7 @@ func (a *App) deleteMessage(chatID int64, messageID int) {
 func (a *App) editCommentary(chatID int64, messageID int, appendText string) error {
 	text := capTelegramMessage(appendText)
 	edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
-	edit.ParseMode = "MarkdownV2"
+	// Pure text — same reason as onCommentary.
 	_, err := a.sendWithRetry(edit, chatID)
 	if telegramEditOK(err) {
 		return nil
