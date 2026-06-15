@@ -484,16 +484,18 @@ func (a *App) tryRichMessage(chatID int64, text string, editMsgID ...int) int {
 	if len(runes) > maxLen {
 		runes = runes[:maxLen]
 	}
+	msgText := string(runes)
+	richMsg := mustMarshal(map[string]any{"markdown": msgText})
 	params := tgbotapi.Params{
-		"rich_message": mustMarshal(map[string]any{
-			"markdown": string(runes),
-		}),
+		"rich_message": richMsg,
 	}
 	endpoint := "sendRichMessage"
 	if len(editMsgID) > 0 && editMsgID[0] > 0 {
 		endpoint = "editMessageText"
 		params["chat_id"] = strconv.FormatInt(chatID, 10)
 		params["message_id"] = strconv.FormatInt(int64(editMsgID[0]), 10)
+		// editMessageText requires a text field even with rich_message.
+		params["text"] = msgText
 	} else {
 		params["chat_id"] = strconv.FormatInt(chatID, 10)
 	}

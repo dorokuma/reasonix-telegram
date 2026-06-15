@@ -364,12 +364,18 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 					replyDelivered = true
 					return msgID
 				}
-				// Fallback to plain text.
+				// Fallback: legacy Markdown with code-block support.
 				msg := newMessage(chatID, text)
+				msg.ParseMode = tgbotapi.ModeMarkdown
 				sent, err := a.sendWithRetry(msg, chatID)
 				if err != nil {
-					log.Printf("chat=%d: commentary send failed: %v", chatID, err)
-					return 0
+					// Parse-entity error or other: retry as plain text.
+					msg.ParseMode = ""
+					sent, err = a.sendWithRetry(msg, chatID)
+					if err != nil {
+						log.Printf("chat=%d: commentary send failed: %v", chatID, err)
+						return 0
+					}
 				}
 				replyDelivered = true
 				return sent.MessageID
