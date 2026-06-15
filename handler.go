@@ -182,7 +182,6 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 		cumCompletion := s.cumCompletion
 		cumTotal := s.cumTotal
 		cumCost := s.cumCost
-		cumCurrency := s.cumCurrency
 		// Session-cumulative cache from serve (if available).
 		sessHit := s.lastUsage.SessionCacheHitTokens
 		sessMiss := s.lastUsage.SessionCacheMissTokens
@@ -191,16 +190,16 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 
 		if cumTotal > 0 || sessTotal > 0 {
 			if cumTotal > 0 {
-				lines = append(lines, fmt.Sprintf("**输入** %d", cumPrompt))
-				lines = append(lines, fmt.Sprintf("**输出** %d", cumCompletion))
-				lines = append(lines, fmt.Sprintf("**总量** %d tokens", cumTotal))
+				lines = append(lines, fmt.Sprintf("**输入** %d 词元", cumPrompt))
+				lines = append(lines, fmt.Sprintf("**输出** %d 词元", cumCompletion))
+				lines = append(lines, fmt.Sprintf("**总量** %d 词元", cumTotal))
 			}
 			if sessTotal > 0 {
 				hitRate := float64(sessHit) / float64(sessTotal) * 100
 				lines = append(lines, fmt.Sprintf("**缓存** %d / %d（%.2f%%）", sessHit, sessTotal, hitRate))
 			}
 			if cumCost > 0 {
-				lines = append(lines, fmt.Sprintf("**花费** %.4f %s", cumCost, cumCurrency))
+				lines = append(lines, fmt.Sprintf("**花费** %.2f 元", cumCost))
 			}
 		}
 		// Context usage from serve.
