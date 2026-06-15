@@ -354,7 +354,7 @@ func (a *App) sendTextParts(chatID int64, text string, editFirstMsgID *int, noFi
 	if editFirstMsgID != nil {
 		editID = *editFirstMsgID
 	}
-	if a.tryRichMessage(chatID, text, editID) {
+	if a.tryRichMessage(chatID, text, editID) > 0 {
 		return 1
 	}
 	log.Printf("chat=%d: sendRichMessage failed or unavailable, falling back to plain text", chatID)
@@ -477,8 +477,8 @@ func (a *App) sendWithRetry(msg tgbotapi.Chattable, chatID int64) (tgbotapi.Mess
 
 // tryRichMessage attempts to send text via sendRichMessage with raw markdown.
 // If editMsgID > 0, it edits the existing message via editMessageText with rich_message.
-// Returns true if the API call succeeded. Falls back silently on failure.
-func (a *App) tryRichMessage(chatID int64, text string, editMsgID ...int) bool {
+// Returns the message ID on success, 0 on failure. For edits, returns editMsgID[0].
+func (a *App) tryRichMessage(chatID int64, text string, editMsgID ...int) int {
 	const maxLen = 32768
 	runes := []rune(text)
 	if len(runes) > maxLen {
@@ -497,12 +497,24 @@ func (a *App) tryRichMessage(chatID int64, text string, editMsgID ...int) bool {
 	} else {
 		params["chat_id"] = strconv.FormatInt(chatID, 10)
 	}
-	_, err := a.bot.MakeRequest(endpoint, params)
+	resp, err := a.bot.MakeRequest(endpoint, params)
 	if err != nil {
 		log.Printf("chat=%d: %s failed: %v", chatID, endpoint, err)
-		return false
+		return 0
 	}
-	return true
+	// For edits, the message ID is already known.
+	if len(editMsgID) > 0 && editMsgID[0] > 0 {
+		return editMsgID[0]
+	}
+	// Parse message ID from response.
+	var msg struct {
+		MessageID int `json:"message_id"`
+	}
+	if err := json.Unmarshal(resp.Result, &msg); err != nil {
+		log.Printf("chat=%d: sendRichMessage: parse response: %v", chatID, err)
+		return 1 // assume success, return 1 as fallback
+	}
+	return msg.MessageID
 }
 
 // mustMarshal JSON-encodes v, panicking on failure (used for API params).

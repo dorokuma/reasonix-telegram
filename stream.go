@@ -355,13 +355,17 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				}
 			},
 			func(text string) int {
-				// onCommentary: send a standalone message (tool progress, result)
+				// onCommentary: send a standalone message (tool progress, result).
 				// Not part of the stream buffer — send immediately as new message.
 				// Don't touch draftMu to avoid contention with pusher goroutine.
 				text = capTelegramMessage(text)
+				// Try rich message (native Markdown) first.
+				if msgID := a.tryRichMessage(chatID, text); msgID > 0 {
+					replyDelivered = true
+					return msgID
+				}
+				// Fallback to plain text.
 				msg := newMessage(chatID, text)
-				// Pure text — formatForTelegram was removed, and tool args
-				// contain raw MarkdownV2 special chars that can't be safely escaped.
 				sent, err := a.sendWithRetry(msg, chatID)
 				if err != nil {
 					log.Printf("chat=%d: commentary send failed: %v", chatID, err)

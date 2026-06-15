@@ -121,11 +121,14 @@ func (a *App) deleteMessage(chatID int64, messageID int) {
 }
 
 // editCommentary updates a tool-dispatch message. Caps length and treats
-// "message is not modified" as success.
+// "message is not modified" as success. Tries rich message first.
 func (a *App) editCommentary(chatID int64, messageID int, appendText string) error {
 	text := capTelegramMessage(appendText)
+	if a.tryRichMessage(chatID, text, messageID) > 0 {
+		return nil
+	}
+	// Fallback to plain text edit.
 	edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
-	// Pure text — same reason as onCommentary.
 	_, err := a.sendWithRetry(edit, chatID)
 	if telegramEditOK(err) {
 		return nil

@@ -28,7 +28,13 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 		a.reply(m.Chat.ID, "🔄 桥接重启中，完成后会自动通知。")
 		return
 	}
-	text := strings.TrimSpace(m.Text)
+	// Read text or caption from the incoming message.
+	// Telegram puts media descriptions in Caption, not Text.
+	text := m.Text
+	if text == "" {
+		text = m.Caption
+	}
+	text = strings.TrimSpace(text)
 	if text == "" {
 		return
 	}
@@ -273,8 +279,15 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 	}
 
 	// If this is a reply, include the original message as context.
-	if m.ReplyToMessage != nil && m.ReplyToMessage.Text != "" {
-		text = fmt.Sprintf("[回复消息: %s]\n%s", m.ReplyToMessage.Text, text)
+	// Read from Text first, fall back to Caption for media messages.
+	if m.ReplyToMessage != nil {
+		quote := m.ReplyToMessage.Text
+		if quote == "" {
+			quote = m.ReplyToMessage.Caption
+		}
+		if quote != "" {
+			text = fmt.Sprintf("[回复消息: %s]\n%s", quote, text)
+		}
 	}
 
 	a.runTask(m.Chat.ID, m.MessageID, text)
