@@ -614,7 +614,9 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 					lastToolName = ev.Tool.Name
 					if lastToolMsgID != 0 {
 						// Append to existing progress message.
-						fullText := lastToolText + "\n" + newLine
+						// Use double newline so Markdown renders each tool as separate
+						// paragraph; single \n would collapse into spaces.
+						fullText := lastToolText + "\n\n" + newLine
 						_ = a.editCommentary(chatID, lastToolMsgID, fullText)
 						lastToolText = fullText
 					} else if onCommentary != nil {
@@ -639,7 +641,7 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 						if ev.Tool.Err != "" {
 							errMsg := stripHookMessages(ev.Tool.Err)
 							if errMsg != "" && !isReasonixNoise(errMsg) {
-								newText := lastToolText + "\n" + trimUTF8Bytes(errMsg, 300)
+								newText := lastToolText + "\n\n" + trimUTF8Bytes(errMsg, 300)
 								_ = a.editCommentary(chatID, lastToolMsgID, newText)
 								lastToolText = newText
 							}
