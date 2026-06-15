@@ -196,7 +196,7 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 			}
 			if sessTotal > 0 {
 				hitRate := float64(sessHit) / float64(sessTotal) * 100
-				lines = append(lines, fmt.Sprintf("**缓存** %d / %d（%.2f%%）", sessHit, sessTotal, hitRate))
+				lines = append(lines, fmt.Sprintf("**缓存** %.2f%%", hitRate))
 			}
 			if cumCost > 0 {
 				lines = append(lines, fmt.Sprintf("**花费** %.2f 元", cumCost))
