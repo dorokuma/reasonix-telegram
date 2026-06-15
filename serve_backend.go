@@ -391,6 +391,11 @@ func (a *App) restorePersistedSessions() {
 			s.servePort = portForChat(rec.ChatID)
 		}
 		s.model = rec.Model
+		s.cumPrompt = rec.CumPrompt
+		s.cumCompletion = rec.CumComplete
+		s.cumTotal = rec.CumTotal
+		s.cumCost = rec.CumCost
+		s.cumCurrency = rec.CumCurrency
 		s.mu.Unlock()
 		go func(chatID int64) {
 			if err := a.startServe(chatID); err != nil {
@@ -401,6 +406,27 @@ func (a *App) restorePersistedSessions() {
 	if len(records) > 0 {
 		log.Printf("restoring %d persisted reasonix session(s)", len(records))
 	}
+}
+
+// fetchServeModelLabel queries the Reasonix serve /status endpoint and returns
+// the model label (e.g. "mimo-v2.5"). Returns "" on failure.
+func (a *App) fetchServeModelLabel(port int) string {
+	if port == 0 {
+		return ""
+	}
+	url := serveBaseURL(port) + "/status"
+	resp, err := localHTTPClient.Get(url)
+	if err != nil {
+		return ""
+	}
+	defer resp.Body.Close()
+	var status struct {
+		Label string `json:"label"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		return ""
+	}
+	return status.Label
 }
 
 func (a *App) waitServeReady(port int, timeout time.Duration) error {

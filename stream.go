@@ -539,6 +539,19 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				if u.Currency != "" {
 					s.cumCurrency = u.Currency
 				}
+				// Persist cumulative values so they survive restart.
+				_ = a.state.upsert(chatRecord{
+					ChatID:      chatID,
+					Workdir:     s.workdir,
+					SessionPath: s.sessionPath,
+					Port:        s.servePort,
+					Model:       s.model,
+					CumPrompt:   s.cumPrompt,
+					CumComplete: s.cumCompletion,
+					CumTotal:    s.cumTotal,
+					CumCost:     s.cumCost,
+					CumCurrency: s.cumCurrency,
+				})
 				s.mu.Unlock()
 			},
 		)

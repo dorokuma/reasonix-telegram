@@ -162,21 +162,12 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 		s := a.getOrCreateSession(m.Chat.ID)
 		s.mu.Lock()
 		busy := s.task != nil
-		model := s.model
+		sessPort := s.servePort
 		s.mu.Unlock()
-		if model == "" {
-			model = a.cfg.Model
-		}
-		modelName, _ := modelByID(model)
+		// Fetch model label from Reasonix serve API (dynamic, reflects current model).
+		modelName := a.fetchServeModelLabel(sessPort)
 		if modelName == "" {
-			modelName = model
-		}
-		// Strip provider prefix: keep only the model name.
-		// "custom-opencode-ai: deepseek-v4-flash ⭐" → "deepseek-v4-flash ⭐"
-		if idx := strings.LastIndex(modelName, ": "); idx >= 0 {
-			modelName = modelName[idx+2:]
-		} else if idx := strings.LastIndex(modelName, "/"); idx >= 0 {
-			modelName = modelName[idx+1:]
+			modelName = a.cfg.Model
 		}
 		stateCN := "空闲"
 		if busy {

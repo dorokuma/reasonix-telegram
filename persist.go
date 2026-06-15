@@ -16,11 +16,16 @@ const defaultStateDir = "/var/lib/reasonix-telegram"
 // chatRecord is persisted across reasonix-telegram restarts so we can resume the
 // same Reasonix conversation (reasonix serve --resume <path>).
 type chatRecord struct {
-	ChatID      int64  `json:"chat_id"`
-	Workdir     string `json:"workdir,omitempty"`
-	SessionPath string `json:"session_path"`
-	Port        int    `json:"port"`
-	Model       string `json:"model,omitempty"` // per-chat model override, survives restart
+	ChatID      int64   `json:"chat_id"`
+	Workdir     string  `json:"workdir,omitempty"`
+	SessionPath string  `json:"session_path"`
+	Port        int     `json:"port"`
+	Model       string  `json:"model,omitempty"` // per-chat model override, survives restart
+	CumPrompt   int     `json:"cum_prompt,omitempty"`
+	CumComplete int     `json:"cum_completion,omitempty"`
+	CumTotal    int     `json:"cum_total,omitempty"`
+	CumCost     float64 `json:"cum_cost,omitempty"`
+	CumCurrency string  `json:"cum_currency,omitempty"`
 }
 
 type stateFile struct {
