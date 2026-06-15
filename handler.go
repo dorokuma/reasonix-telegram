@@ -172,9 +172,9 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 			stateCN = "生成中"
 		}
 		lines := []string{
-			fmt.Sprintf("状态：%s", stateCN),
-			fmt.Sprintf("模式：%s", a.modeLabel()),
-			fmt.Sprintf("模型：%s", modelName),
+			fmt.Sprintf("**状态** %s", stateCN),
+			fmt.Sprintf("**模式** %s", a.modeLabel()),
+			fmt.Sprintf("**模型** %s", modelName),
 		}
 		// Usage stats — cumulative session totals.
 		s.mu.Lock()
@@ -190,16 +190,17 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 		s.mu.Unlock()
 
 		if cumTotal > 0 || sessTotal > 0 {
-			lines = append(lines, "")
 			if cumTotal > 0 {
-				lines = append(lines, fmt.Sprintf("输入 %d / 输出 %d / 共 %d tokens", cumPrompt, cumCompletion, cumTotal))
+				lines = append(lines, fmt.Sprintf("**输入** %d", cumPrompt))
+				lines = append(lines, fmt.Sprintf("**输出** %d", cumCompletion))
+				lines = append(lines, fmt.Sprintf("**总量** %d tokens", cumTotal))
 			}
 			if sessTotal > 0 {
 				hitRate := float64(sessHit) / float64(sessTotal) * 100
-				lines = append(lines, fmt.Sprintf("缓存命中：%d / %d（%.2f%%）", sessHit, sessTotal, hitRate))
+				lines = append(lines, fmt.Sprintf("**缓存** %d / %d（%.2f%%）", sessHit, sessTotal, hitRate))
 			}
 			if cumCost > 0 {
-				lines = append(lines, fmt.Sprintf("总花费：%.4f %s", cumCost, cumCurrency))
+				lines = append(lines, fmt.Sprintf("**花费** %.4f %s", cumCost, cumCurrency))
 			}
 		}
 		// Context usage from serve.
@@ -216,15 +217,14 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 				}
 				shortUsed := shortTokens(used)
 				shortWindow := shortTokens(window)
-				lines = append(lines, "")
 				if left > 0 {
-					lines = append(lines, fmt.Sprintf("上下文：%s / %s（%d%%）· %d%%后压缩", shortUsed, shortWindow, pct, left))
+					lines = append(lines, fmt.Sprintf("**上下文** %s / %s（%d%%）· %d%%后压缩", shortUsed, shortWindow, pct, left))
 				} else {
-					lines = append(lines, fmt.Sprintf("上下文：%s / %s（%d%%）· 即将压缩", shortUsed, shortWindow, pct))
+					lines = append(lines, fmt.Sprintf("**上下文** %s / %s（%d%%）· 即将压缩", shortUsed, shortWindow, pct))
 				}
 			}
 		}
-		a.reply(m.Chat.ID, strings.Join(lines, "\n"))
+		a.reply(m.Chat.ID, strings.Join(lines, "\n\n"))
 		return
 
 	case text == "/new":
