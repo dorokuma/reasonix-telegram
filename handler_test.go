@@ -34,11 +34,11 @@ func TestAllowed(t *testing.T) {
 func TestModeLabel(t *testing.T) {
 	app := &App{}
 	app.setMode(ModeChat)
-	if app.modeLabel() != "💬 聊天模式" {
+	if app.modeLabel() != "聊天模式" {
 		t.Fatalf("chat mode label: got %q", app.modeLabel())
 	}
 	app.setMode(ModeTool)
-	if app.modeLabel() != "⌨️ 编程模式" {
+	if app.modeLabel() != "编程模式" {
 		t.Fatalf("tool mode label: got %q", app.modeLabel())
 	}
 }

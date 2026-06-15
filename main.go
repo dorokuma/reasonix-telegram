@@ -336,9 +336,9 @@ func (a *App) setMode(m string) {
 
 func modeLabelFor(mode string) string {
 	if mode == ModeTool {
-		return "⌨️ 编程模式"
+		return "编程模式"
 	}
-	return "💬 聊天模式"
+	return "聊天模式"
 }
 
 func (a *App) modeLabel() string {
