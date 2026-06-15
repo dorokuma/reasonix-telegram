@@ -954,14 +954,7 @@ func toolDisplayLine(toolName, argsJSON string) string {
 	case "note", "ctx_read", "ctx_search":
 		return "📝 " + toolName
 	case "ctx_run":
-		switch lang := strings.ToLower(str("language")); lang {
-		case "python", "py", "python3":
-			return "🐍 python"
-		case "javascript", "js", "node":
-			return "📜 javascript"
-		default:
-			return "💻 bash"
-		}
+		return "💻 bash"
 	case "audit_finish":
 		return "📋 audit"
 	case "delete_range", "delete_symbol":
