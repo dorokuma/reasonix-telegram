@@ -20,13 +20,12 @@ import (
 	"time"
 )
 
-var portNext int // next port offset, guarded by a.state itself during init
+var portSeq atomic.Int64 // next port offset
 
 func portForChat(chatID int64) int {
 	const base = 18780
 	const span = 8000
-	p := base + (portNext % span)
-	portNext++
+	p := base + (int(portSeq.Add(1)) % span)
 	return p
 }
 

@@ -72,8 +72,8 @@ func TestIsReasonixNoise(t *testing.T) {
 		"✅ something succeeded",
 		"ℹ️ info message",
 		"hook blocked something",
-		"something exit status 1",
-		"something remembered 1 fact",
+		"exit status 1",
+		"remembered 1 fact",
 		"unknown ref \"ctx-2\"",
 		"unknown ref 'ctx-2'",
 		"[ctx] ref=ctx-1 tool=read_file (200 lines): offset 0",
@@ -85,6 +85,8 @@ func TestIsReasonixNoise(t *testing.T) {
 		"  indented but not noise",
 		"· not a tok line",
 		"a ▎ not at start",
+		"something exit status 1",
+		"something remembered 1 fact",
 	}
 	for _, s := range noise {
 		if !isReasonixNoise(s) {

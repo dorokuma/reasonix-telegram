@@ -100,7 +100,8 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		streamDebounce   = 50 * time.Millisecond
 	)
 	var procErr error
-	replyDelivered := false
+	var replyDelivered atomic.Bool
+	lastSentBody := "" // tracks last finalized text to prevent duplicate sends
 	releaseTask := func() {
 		s.mu.Lock()
 		s.task = nil
@@ -133,6 +134,13 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			log.Printf("chat=%d: endStream using lastDraftBody fallback len=%d", chatID, len(body))
 		}
 		log.Printf("chat=%d: endStream useDraft=%v draftID=%d bodyLen=%d bodyPreview=%q", chatID, useDraft, draftID, len(body), logPreview(body, 100))
+		// Dedup: skip if the pusher already sent this exact text.
+		if body == lastSentBody {
+			log.Printf("chat=%d: endStream dedup — body matches lastSentBody, skipping", chatID)
+			streamDone = true
+			releaseTask()
+			return
+		}
 		if body == "" {
 			hadPreview := draftNeedsCleanup(draftShown, liveDraftEver, lastDraftBody)
 			if hadPreview {
@@ -207,7 +215,8 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			}
 		}
 		if n > 0 {
-			replyDelivered = true
+			replyDelivered.Store(true)
+			lastSentBody = body
 			streamDone = true
 			releaseTask()
 		}
@@ -362,7 +371,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				// Try rich message (native Markdown) first.
 				if msgID := a.tryRichMessage(chatID, text); msgID > 0 {
 					a.recordSentText(msgID, text)
-					replyDelivered = true
+					replyDelivered.Store(true)
 					return msgID
 				}
 				// Fallback: legacy Markdown with code-block support.
@@ -378,7 +387,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 						return 0
 					}
 				}
-				replyDelivered = true
+				replyDelivered.Store(true)
 				a.recordSentText(sent.MessageID, text)
 				return sent.MessageID
 			},
@@ -466,7 +475,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 					s.pendingClarify.messageID = sent.MessageID
 					s.mu.Unlock()
 				}
-				replyDelivered = true
+				replyDelivered.Store(true)
 			},
 			func(approvalID, toolName string) {
 				// onApprovalRequest: model needs user approval for a tool.
@@ -490,7 +499,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				streamMsgID = 0
 				msgCreatedAt = time.Now()
 				draftMu.Unlock()
-				replyDelivered = true
+				replyDelivered.Store(true)
 
 				// Show approval prompt with inline buttons
 				var label string
@@ -597,7 +606,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			truncated = false
 			bufMu.Unlock()
 			segHadLiveDraft := draftNeedsCleanup(segDraftShown || draftShown, segLiveDraftEver || liveDraftEver, lastDraftBody)
-			if body != "" {
+			if body != "" && body != lastSentBody {
 				if segUseDraft {
 					a.finalizeDraft(chatID, segDraftID, body, segHadLiveDraft)
 				} else if segStreamMsgID > 0 {
@@ -605,7 +614,8 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				} else {
 					a.sendTextParts(chatID, body, nil)
 				}
-				replyDelivered = true
+				lastSentBody = body
+				replyDelivered.Store(true)
 			}
 			if segHadLiveDraft {
 				a.clearDraftPreview(chatID, segDraftID)
@@ -699,7 +709,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		}
 		streamDone = true
 		draftMu.Unlock()
-		if replyDelivered && errors.Is(procErr, context.Canceled) {
+		if replyDelivered.Load() && errors.Is(procErr, context.Canceled) {
 			log.Printf("chat=%d prompt=%q: canceled after reply delivered (draft cleared)", chatID, logPreview(prompt, 80))
 			return
 		}
@@ -724,8 +734,8 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		empty = true
 	}
 
-	log.Printf("chat=%d: finalCheck empty=%v replyDelivered=%v procErr=%v", chatID, empty, replyDelivered, procErr)
-	if empty && !replyDelivered {
+	log.Printf("chat=%d: finalCheck empty=%v replyDelivered=%v procErr=%v", chatID, empty, replyDelivered.Load(), procErr)
+	if empty && !replyDelivered.Load() {
 		a.reply(chatID, "（模型处理完成，但没有生成可见回复。请再发一次或换种问法。）")
 	}
 	bufMu.Lock()

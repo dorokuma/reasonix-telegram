@@ -109,13 +109,16 @@ func readProcPPID(pid int) int {
 	if err != nil {
 		return 0
 	}
-	// comm can contain spaces/parens; fields after comm are stable.
-	fields := strings.Fields(string(b))
-	if len(fields) < 4 {
-		return 0
+	// Format: pid (comm) state ppid ... — comm can contain spaces/parens.
+	s := string(b)
+	if idx := strings.LastIndex(s, ")"); idx >= 0 {
+		fields := strings.Fields(s[idx+1:])
+		if len(fields) >= 2 {
+			ppid, _ := strconv.Atoi(fields[1])
+			return ppid
+		}
 	}
-	ppid, _ := strconv.Atoi(fields[3])
-	return ppid
+	return 0
 }
 
 func pidsListeningOnTCPPort(port int) []int {

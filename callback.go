@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -248,7 +247,7 @@ func (a *App) modelDisplayName(id string) string {
 
 // fetchContext queries the reasonix serve /context endpoint for used/window tokens.
 func fetchContext(port int) (used, window int) {
-	resp, err := http.Get(serveBaseURL(port) + "/context")
+	resp, err := localHTTPClient.Get(serveBaseURL(port) + "/context")
 	if err != nil {
 		return 0, 0
 	}
