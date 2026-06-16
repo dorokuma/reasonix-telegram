@@ -178,8 +178,17 @@ func loadEnvFile(path, key string) string {
 	}
 	for _, line := range strings.Split(string(b), "\n") {
 		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
 		if strings.HasPrefix(line, key+"=") {
-			return strings.TrimPrefix(line, key+"=")
+			val := strings.TrimPrefix(line, key+"=")
+			val = strings.TrimSpace(val)
+			// Strip surrounding quotes (single or double).
+			if len(val) >= 2 && (val[0] == '"' && val[len(val)-1] == '"' || val[0] == '\'' && val[len(val)-1] == '\'') {
+				val = val[1 : len(val)-1]
+			}
+			return val
 		}
 	}
 	return ""

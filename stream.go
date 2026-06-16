@@ -176,8 +176,10 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		} else {
 			if useFreshFinal && streamMsgID > 0 {
 				log.Printf("chat=%d: fresh final (stale preview >%ds), sending new message", chatID, int(freshFinalAfter.Seconds()))
+				// Delete the stale plain-text preview so only the rich final remains.
+				a.deleteMessage(chatID, streamMsgID)
 			}
-			hadLiveDraft := false
+			hadLiveDraft := draftShown || liveDraftEver
 			if streamMsgID > 0 && !useFreshFinal {
 				if streamEditFallback {
 					tail := streamContinuationText(body, streamVisiblePrefix)
@@ -223,7 +225,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 	}
 
 	retireLiveDraftLocked := func(reason string) {
-		if !false {
+		if !useDraft {
 			return
 		}
 		a.clearDraftPreview(chatID, draftID)

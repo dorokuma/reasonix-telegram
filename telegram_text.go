@@ -120,6 +120,7 @@ func (a *App) sendDocument(chatID int64, path string, caption string) bool {
 }
 
 // extractAndSendMedia scans text for file paths and sends matching files as native media.
+// Only files under the workdir or /tmp are sent to prevent information disclosure.
 func (a *App) extractAndSendMedia(chatID int64, text string) string {
 	lines := strings.Split(text, "\n")
 	var kept []string
@@ -131,7 +132,7 @@ func (a *App) extractAndSendMedia(chatID int64, text string) string {
 		} else if strings.HasPrefix(trimmed, "/") && len(trimmed) > 5 && !strings.Contains(trimmed, " ") {
 			path = trimmed
 		}
-		if path != "" {
+		if path != "" && a.isSafeMediaPath(path) {
 			if a.sendNativeMedia(chatID, path, "") {
 				continue
 			}
@@ -142,6 +143,24 @@ func (a *App) extractAndSendMedia(chatID int64, text string) string {
 		kept = append(kept, line)
 	}
 	return strings.Join(kept, "\n")
+}
+
+// isSafeMediaPath checks if a file path is safe to send as a Telegram attachment.
+// Only files under the workdir or /tmp are allowed, preventing information disclosure
+// of sensitive files like /etc/passwd, session data, or API keys.
+func (a *App) isSafeMediaPath(path string) bool {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return false
+	}
+	workdir := a.chatWorkdir()
+	if workdir != "" && strings.HasPrefix(abs, workdir) {
+		return true
+	}
+	if strings.HasPrefix(abs, "/tmp/") {
+		return true
+	}
+	return false
 }
 
 // splitTelegramText splits s into chunks of at most maxRunes, preferring line breaks.
