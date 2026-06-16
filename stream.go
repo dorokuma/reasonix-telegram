@@ -142,7 +142,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			return
 		}
 		if body == "" {
-			hadPreview := draftNeedsCleanup(draftShown, liveDraftEver, lastDraftBody)
+			hadPreview := false
 			if hadPreview {
 				a.clearDraftPreview(chatID, draftID)
 				draftShown = false
@@ -166,7 +166,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		useFreshFinal := !msgCreatedAt.IsZero() && time.Since(msgCreatedAt) > freshFinalAfter
 		var n int
 		if useDraft && !useFreshFinal {
-			n = a.finalizeDraft(chatID, draftID, body, draftNeedsCleanup(draftShown, liveDraftEver, lastDraftBody))
+			n = a.finalizeDraft(chatID, draftID, body, false)
 			if n > 0 {
 				draftShown = false
 				liveDraftEver = false
@@ -177,7 +177,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			if useFreshFinal && streamMsgID > 0 {
 				log.Printf("chat=%d: fresh final (stale preview >%ds), sending new message", chatID, int(freshFinalAfter.Seconds()))
 			}
-			hadLiveDraft := draftNeedsCleanup(draftShown, liveDraftEver, lastDraftBody)
+			hadLiveDraft := false
 			if streamMsgID > 0 && !useFreshFinal {
 				if streamEditFallback {
 					tail := streamContinuationText(body, streamVisiblePrefix)
@@ -223,7 +223,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 	}
 
 	retireLiveDraftLocked := func(reason string) {
-		if !draftNeedsCleanup(draftShown, liveDraftEver, lastDraftBody) {
+		if !false {
 			return
 		}
 		a.clearDraftPreview(chatID, draftID)
@@ -399,9 +399,6 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 
 				// Reset stream state so post-answer output can flow in a fresh draft.
 				draftMu.Lock()
-				if draftNeedsCleanup(draftShown, liveDraftEver, lastDraftBody) {
-					a.clearDraftPreview(chatID, draftID)
-				}
 				draftShown = false
 				liveDraftEver = false
 				streamDone = false
@@ -483,9 +480,6 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				signalFlush()
 				// Reset stream state so post-approval output can flow in a fresh draft.
 				draftMu.Lock()
-				if draftNeedsCleanup(draftShown, liveDraftEver, lastDraftBody) {
-					a.clearDraftPreview(chatID, draftID)
-				}
 				draftShown = false
 				liveDraftEver = false
 				streamDone = false
@@ -593,8 +587,6 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			draftMu.Lock()
 			streamDone = false
 			segDraftID := draftID
-			segDraftShown := draftShown
-			segLiveDraftEver := liveDraftEver
 			segUseDraft := useDraft
 			segStreamMsgID := streamMsgID
 			draftMu.Unlock()
@@ -605,7 +597,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			buf.Reset()
 			truncated = false
 			bufMu.Unlock()
-			segHadLiveDraft := draftNeedsCleanup(segDraftShown || draftShown, segLiveDraftEver || liveDraftEver, lastDraftBody)
+			segHadLiveDraft := false
 			if body != "" && body != lastSentBody {
 				if segUseDraft {
 					a.finalizeDraft(chatID, segDraftID, body, segHadLiveDraft)
@@ -702,11 +694,6 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 
 	if procErr != nil {
 		draftMu.Lock()
-		if draftNeedsCleanup(draftShown, liveDraftEver, lastDraftBody) {
-			a.clearDraftPreview(chatID, draftID)
-			draftShown = false
-			liveDraftEver = false
-		}
 		streamDone = true
 		draftMu.Unlock()
 		if replyDelivered.Load() && errors.Is(procErr, context.Canceled) {
@@ -767,9 +754,6 @@ func draftHadPreview(lastDraftBody string) bool {
 	return strings.TrimSpace(lastDraftBody) != ""
 }
 
-func draftNeedsCleanup(draftShown, liveDraftEver bool, lastDraftBody string) bool {
-	return false // sendRichMessage auto-replaces drafts; no manual cleanup needed
-}
 
 // clearDraftPreview clears session draft state. No API call needed —
 // sendRichMessage replaces the draft automatically.
