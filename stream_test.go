@@ -73,6 +73,7 @@ func TestIsReasonixNoise(t *testing.T) {
 		"ℹ️ info message",
 		"hook blocked something",
 		"exit status 1",
+		"command exited: exit status 1",
 		"remembered 1 fact",
 		"unknown ref \"ctx-2\"",
 		"unknown ref 'ctx-2'",
