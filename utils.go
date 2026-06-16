@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -173,7 +172,7 @@ func (a *App) submitClarifyAnswers(pc *clarifyState, chatID int64) {
 		"answers": answersPayload,
 	})
 	url := fmt.Sprintf("http://127.0.0.1:%d/answer", pc.port)
-	resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+	resp, err := localHTTPClient.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
 		log.Printf("chat=%d: post answer failed: %v", chatID, err)
 		return

@@ -318,9 +318,15 @@ func (t *tokenRedactingTransport) RoundTrip(req *http.Request) (*http.Response, 
 
 // redactSecrets returns s with known secrets replaced by "***".
 // Apply to any log string that might contain tokens or API keys.
-func redactSecrets(s string) string {
+func redactSecrets(s string, extraSecrets ...string) string {
+	secrets := extraSecrets
 	for _, env := range []string{"TG_BOT_TOKEN", "DEEPSEEK_API_KEY", "CF_TOKEN"} {
 		if v := os.Getenv(env); v != "" && v != s {
+			secrets = append(secrets, v)
+		}
+	}
+	for _, v := range secrets {
+		if v != "" && v != s {
 			s = strings.ReplaceAll(s, v, "***")
 		}
 	}
@@ -372,7 +378,7 @@ func main() {
 
 	bot, err := tgbotapi.NewBotAPI(cfg.BotToken)
 	if err != nil {
-		log.Fatalf("telegram auth failed: %v", redactSecrets(err.Error()))
+		log.Fatalf("telegram auth failed: %v", redactSecrets(err.Error(), cfg.BotToken))
 	}
 	bot.Debug = false
 	// Wrap HTTP client to redact bot token from error logs

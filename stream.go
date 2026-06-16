@@ -550,7 +550,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			buf.Reset()
 			truncated = false
 			bufMu.Unlock()
-			segHadLiveDraft := false
+			segHadLiveDraft := draftShown || liveDraftEver
 			if body != "" && body != lastSentBody {
 				if segUseDraft {
 					a.finalizeDraft(chatID, segDraftID, body, segHadLiveDraft)
@@ -703,9 +703,6 @@ func (a *App) nextDraftID() int64 {
 	return int64(time.Now().Unix()%1_000_000_000)*10000 + int64(seq%10000)
 }
 
-func draftHadPreview(lastDraftBody string) bool {
-	return strings.TrimSpace(lastDraftBody) != ""
-}
 
 
 // clearDraftPreview clears session draft state. No API call needed —
@@ -728,12 +725,6 @@ func (a *App) finalizeDraft(chatID int64, draftID int64, text string, hadLiveDra
 	return a.sendTextParts(chatID, text, nil)
 }
 
-func (a *App) trackSessionDraft(chatID int64, draftID int64) {
-	s := a.getOrCreateSession(chatID)
-	s.mu.Lock()
-	s.liveDraftID = draftID
-	s.mu.Unlock()
-}
 
 func (a *App) clearSessionDraft(chatID int64, draftID int64) {
 	s := a.getOrCreateSession(chatID)
@@ -753,25 +744,6 @@ func (a *App) dismissSessionDraft(chatID int64) {
 
 // sendDraft pushes streaming preview via sendRichMessageDraft (Bot API 10.1+).
 // The same draft_id auto-animates updates. Final sendRichMessage replaces the draft.
-func (a *App) sendDraft(chatID int64, draftID int64, text string) bool {
-	text = telegramPreviewTail(text, telegramMaxMessageRunes)
-	if text == "" {
-		return false
-	}
-	_, err := a.bot.MakeRequest("sendRichMessageDraft", tgbotapi.Params{
-		"chat_id":  strconv.FormatInt(chatID, 10),
-		"draft_id": strconv.FormatInt(draftID, 10),
-		"rich_message": mustMarshal(map[string]any{
-			"markdown": text,
-		}),
-	})
-	if err != nil {
-		log.Printf("sendRichMessageDraft failed (fallback to edit): %v", err)
-		return false
-	}
-	return true
-}
 
 // dismissDraft is no longer needed — sendRichMessage replaces drafts automatically.
 // Kept as no-op for callers that haven't been migrated yet.
-func (a *App) dismissDraft(chatID int64, draftID int64) {}

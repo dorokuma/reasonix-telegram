@@ -148,16 +148,23 @@ func (a *App) extractAndSendMedia(chatID int64, text string) string {
 // isSafeMediaPath checks if a file path is safe to send as a Telegram attachment.
 // Only files under the workdir or /tmp are allowed, preventing information disclosure
 // of sensitive files like /etc/passwd, session data, or API keys.
+// Resolves symlinks to prevent bypass via symlinked paths.
 func (a *App) isSafeMediaPath(path string) bool {
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return false
 	}
+	// Resolve symlinks to get the real target.
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		// If resolution fails (broken symlink, permission denied), treat as unsafe.
+		return false
+	}
 	workdir := a.chatWorkdir()
-	if workdir != "" && strings.HasPrefix(abs, workdir) {
+	if workdir != "" && strings.HasPrefix(resolved, workdir) {
 		return true
 	}
-	if strings.HasPrefix(abs, "/tmp/") {
+	if strings.HasPrefix(resolved, "/tmp/") {
 		return true
 	}
 	return false
@@ -468,8 +475,8 @@ func (a *App) sendWithRetry(msg tgbotapi.Chattable, chatID int64) (tgbotapi.Mess
 		}
 		if telegramErrorIsFlood(err) {
 			var waitSec int
-			if m := reFloodWait.FindStringSubmatch(err.Error()); len(m) > 1 {
-				if ws, err := strconv.Atoi(m[1]); err == nil && ws > 0 {
+			if match := reFloodWait.FindStringSubmatch(err.Error()); len(match) > 1 {
+				if ws, err := strconv.Atoi(match[1]); err == nil && ws > 0 {
 					waitSec = ws
 				}
 			}
