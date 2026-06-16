@@ -88,7 +88,6 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		streamDone     bool
 		lastDraftBody  string
 		msgCreatedAt   time.Time // when first draft/stream msg was sent
-		draftFailCount       int  // consecutive draft failures in this turn
 		editFailCount        int  // consecutive edit failures in this turn
 		streamEditFallback   bool // edit flood-silenced: finalize via sendMessage tail
 		streamVisiblePrefix  string // last raw preview successfully shown (edit/draft)
@@ -175,9 +174,11 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			log.Printf("chat=%d draftID=%d: finalize %d part(s) total=%d runes", chatID, draftID, n, utf8.RuneCountInString(body))
 		} else {
 			if useFreshFinal && streamMsgID > 0 {
-				log.Printf("chat=%d: fresh final (stale preview >%ds), sending new message", chatID, int(freshFinalAfter.Seconds()))
-				// Delete the stale plain-text preview so only the rich final remains.
-				a.deleteMessage(chatID, streamMsgID)
+				// Stale preview — upgrade it to rich text in-place instead of
+				// deleting + resending (avoids duplicate messages).
+				log.Printf("chat=%d: fresh final (stale preview >%ds), upgrading in-place", chatID, int(freshFinalAfter.Seconds()))
+				editID := streamMsgID
+				n = a.sendTextParts(chatID, body, &editID)
 			}
 			hadLiveDraft := draftShown || liveDraftEver
 			if streamMsgID > 0 && !useFreshFinal {
@@ -224,17 +225,6 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		}
 	}
 
-	retireLiveDraftLocked := func(reason string) {
-		if !useDraft {
-			return
-		}
-		a.clearDraftPreview(chatID, draftID)
-		draftShown = false
-		liveDraftEver = false
-		lastDraftBody = ""
-		log.Printf("chat=%d: retired live draft (%s) draftID=%d", chatID, reason, draftID)
-	}
-
 	pushDraft := func() {
 		draftMu.Lock()
 		defer draftMu.Unlock()
@@ -249,51 +239,12 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			log.Printf("chat=%d: pushDraft skip (empty buffer)", chatID)
 			return
 		}
-		preview := telegramPreviewTail(body, telegramMaxMessageRunes)
-		// Native drafts and edit-in-place must not mix: an open sendRichMessageDraft
-		// blocks the user's input even when the preview is invisible. Once we have
-		// a stream message to edit, stay on the edit path for this segment.
-		if useDraft && streamMsgID == 0 {
-			if preview == lastDraftBody {
-				return
-			}
-			if a.sendDraft(chatID, draftID, preview) {
-				draftFailCount = 0
-				lastDraftBody = preview
-				draftShown = true
-				liveDraftEver = true
-				a.trackSessionDraft(chatID, draftID)
-				if msgCreatedAt.IsZero() {
-					msgCreatedAt = time.Now()
-				}
-				return
-			}
-			draftFailCount++
-			if draftFailCount >= maxDraftFailures {
-				log.Printf("chat=%d: disabling draft stream after %d failures", chatID, draftFailCount)
-			}
-			retireLiveDraftLocked("draft_send_failed")
-			useDraft = false
-			draftID = a.nextDraftID()
-		}
+		// No preview — the typing indicator is sufficient feedback.
+		// Only edit an existing stream message; never create a new one here.
 		if streamMsgID == 0 {
-			msg := newMessage(chatID, preview)
-			msg.ParseMode = "" // plain text preview; final send uses Rich Messages
-			sent, err := a.sendWithRetry(msg, chatID)
-			if err != nil {
-				log.Printf("chat=%d: stream send failed: %v", chatID, err)
-				editFailCount++
-				return
-			}
-			editFailCount = 0
-			streamMsgID = sent.MessageID
-			lastDraftBody = preview
-			streamVisiblePrefix = preview
-			if msgCreatedAt.IsZero() {
-				msgCreatedAt = time.Now()
-			}
 			return
 		}
+		preview := telegramPreviewTail(body, telegramMaxMessageRunes)
 		if streamEditFallback {
 			return
 		}
