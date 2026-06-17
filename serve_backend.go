@@ -548,6 +548,14 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 	sc := bufio.NewScanner(resp.Body)
 	sc.Buffer(make([]byte, 64*1024), 1024*1024)
 	for sc.Scan() {
+		// If context was cancelled (pre-empted by a newer turn), stop processing events
+		// immediately to avoid duplicate messages from concurrent goroutines.
+		select {
+		case <-ctx.Done():
+			log.Printf("port=%d: SSE context cancelled, stopping event processing", port)
+			return turnResult{err: ctx.Err()}
+		default:
+		}
 		atomic.StoreInt64(&lastActivityUnix, time.Now().Unix())
 		line := sc.Text()
 		if !strings.HasPrefix(line, "data: ") {
@@ -623,19 +631,18 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 							newSuffix := fmt.Sprintf(" (x%d)", toolCount)
 							updated = strings.Replace(lastToolText, oldSuffix, newSuffix, 1)
 						}
-						_ = a.editCommentary(chatID, lastToolMsgID, updated)
+						if newID, err := a.editCommentary(chatID, lastToolMsgID, updated); newID != 0 {
+							lastToolMsgID = newID
+						} else if err != nil {
+							log.Printf("chat=%d: commentary consolidation failed: %v", chatID, err)
+						}
 						lastToolText = updated
 						continue
 					}
-					// Different tool (or first tool): start a new line.
+					// Different tool (or first tool): always send a new bubble.
 					toolCount = 1
 					lastToolName = ev.Tool.Name
-					if lastToolMsgID != 0 {
-						// Append to existing progress message.
-						fullText := lastToolText + "\n\n" + newLine
-						_ = a.editCommentary(chatID, lastToolMsgID, fullText)
-						lastToolText = fullText
-					} else if onCommentary != nil {
+					if onCommentary != nil {
 						lastToolMsgID = onCommentary(newLine)
 						lastToolText = newLine
 					}
@@ -645,10 +652,6 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 		case "tool_result":
 			if a.getMode() != ModeChat {
 				if ev.Tool != nil {
-					// Reset consolidation first so hook-only skip doesn't bypass it.
-					lastToolName = ""
-					toolCount = 0
-
 					// Skip hook-only noise.
 					if isHookOnlyOutput(ev.Tool.Err) || isHookOnlyOutput(ev.Tool.Output) {
 						continue
@@ -657,8 +660,12 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 						if ev.Tool.Err != "" {
 							errMsg := stripHookMessages(ev.Tool.Err)
 							if errMsg != "" && !isReasonixNoise(errMsg) {
-								newText := lastToolText + "\n\n" + trimUTF8Bytes(errMsg, 300)
-								_ = a.editCommentary(chatID, lastToolMsgID, newText)
+								newText := lastToolText + "\n" + trimUTF8Bytes(errMsg, 300)
+								if newID, e := a.editCommentary(chatID, lastToolMsgID, newText); newID != 0 {
+									lastToolMsgID = newID
+								} else if e != nil {
+									log.Printf("chat=%d: commentary tool_result failed: %v", chatID, e)
+								}
 								lastToolText = newText
 							}
 						}
@@ -898,9 +905,10 @@ func toolDisplayLine(toolName, argsJSON string) string {
 		if cmd == "" {
 			return "💻 bash"
 		}
-		const capLen = 200
-		if len(cmd) > capLen {
-			cmd = trimUTF8Bytes(cmd, capLen-3) + "..."
+		const capRunes = 300
+		runes := []rune(cmd)
+		if len(runes) > capRunes {
+			cmd = string(runes[:capRunes]) + "…"
 		}
 		return fmt.Sprintf("💻 bash\n```\n%s\n```", cmd)
 	case "python", "python3", "execute_code", "code":

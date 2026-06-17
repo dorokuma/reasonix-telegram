@@ -119,30 +119,52 @@ func (a *App) deleteMessage(chatID int64, messageID int) {
 	}
 }
 
-// editCommentary updates a tool-dispatch message. Caps length and treats
-// "message is not modified" as success. Tries sendRichMessage edit first,
-// then legacy Markdown, then plain text.
-func (a *App) editCommentary(chatID int64, messageID int, appendText string) error {
+// editCommentary updates a tool-dispatch message.  Renders markdown via
+// MarkdownV2 (Hermes pattern: formatMessage → parse → plain fallback).
+// On edit failure, deletes the old message and resends — never gives up.
+// Returns the new message ID when a resend occurred (0 if edit succeeded in-place).
+func (a *App) editCommentary(chatID int64, messageID int, appendText string) (int, error) {
 	text := capTelegramMessage(appendText)
-	// Markdown edit (sendRichMessage drafts cannot be editMessageText-ed).
-	edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
-	edit.ParseMode = tgbotapi.ModeMarkdown
+	// MDV2 path: formatMessage converts standard Markdown → MarkdownV2.
+	formatted := formatMessage(text)
+	edit := tgbotapi.NewEditMessageText(chatID, messageID, formatted)
+	edit.ParseMode = tgbotapi.ModeMarkdownV2
 	_, err := a.sendWithRetry(edit, chatID)
 	if telegramEditOK(err) {
-		return nil
+		return 0, nil
 	}
-	// Fallback: plain text edit.
-	edit.ParseMode = ""
-	_, err = a.sendWithRetry(edit, chatID)
-	if telegramEditOK(err) {
-		return nil
+	// MDV2 parse failure — strip formatting and retry as plain text.
+	if telegramErrorIsParseEntities(err) {
+		plain := stripMdv2(text)
+		edit2 := tgbotapi.NewEditMessageText(chatID, messageID, plain)
+		edit2.ParseMode = ""
+		if _, err2 := a.sendWithRetry(edit2, chatID); telegramEditOK(err2) {
+			return 0, nil
+		}
 	}
-	log.Printf("chat=%d: edit commentary failed: %v", chatID, err)
-	return err
+	// Edit failed — delete + resend with MDV2.
+	log.Printf("chat=%d: edit commentary failed (%v), delete+resend", chatID, err)
+	a.deleteMessage(chatID, messageID)
+	msg := newMessage(chatID, formatted)
+	msg.ParseMode = tgbotapi.ModeMarkdownV2
+	sent, sendErr := a.sendWithRetry(msg, chatID)
+	if sendErr != nil {
+		// MDV2 resend failed — retry as plain text.
+		plain := stripMdv2(text)
+		msg2 := newMessage(chatID, plain)
+		msg2.ParseMode = ""
+		sent, sendErr2 := a.sendWithRetry(msg2, chatID)
+		if sendErr2 != nil {
+			log.Printf("chat=%d: commentary resend failed: %v", chatID, sendErr2)
+			return 0, sendErr2
+		}
+		return sent.MessageID, nil
+	}
+	return sent.MessageID, nil
 }
 
 // appendToCommentary replaces a tool-dispatch message (same caps as editCommentary).
-func (a *App) appendToCommentary(chatID int64, messageID int, appendText string) error {
+func (a *App) appendToCommentary(chatID int64, messageID int, appendText string) (int, error) {
 	return a.editCommentary(chatID, messageID, appendText)
 }
 

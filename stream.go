@@ -60,13 +60,17 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		ctx, cancel = context.WithCancel(context.Background())
 	}
 	s.mu.Lock()
-	s.task = &runningTask{cancel: cancel}
+	thisTask := &runningTask{cancel: cancel}
+	s.task = thisTask
 	s.mu.Unlock()
 
 	defer func() {
 		s.mu.Lock()
-		s.task = nil
-		s.wakePusher = nil
+		// Only clear if we're still the owner — a newer turn may have replaced us.
+		if s.task == thisTask {
+			s.task = nil
+			s.wakePusher = nil
+		}
 		s.mu.Unlock()
 		cancel()
 	}()
@@ -267,12 +271,6 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			streamVisiblePrefix = preview
 			return
 		}
-		if telegramErrorIsRichMessageRequired(err) {
-			streamEditFallback = true
-			streamVisiblePrefix = lastDraftBody
-			log.Printf("chat=%d: stream edit fallback (rich message draft)", chatID)
-			return
-		}
 		editFailCount++
 		if telegramErrorIsFlood(err) || editFailCount >= maxEditFailures {
 			streamEditFallback = true
@@ -333,18 +331,21 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				// onCommentary: send a standalone message (tool progress, result).
 				// Not part of the stream buffer — send immediately as new message.
 				// Don't touch draftMu to avoid contention with pusher goroutine.
+				// MDV2 path (Hermes pattern): formatMessage → MDV2 → plain fallback.
 				text = capTelegramMessage(text)
-				// Use Markdown (editable via editMessageText, unlike sendRichMessage drafts).
-				msg := newMessage(chatID, text)
-				msg.ParseMode = tgbotapi.ModeMarkdown
+				formatted := formatMessage(text)
+				msg := newMessage(chatID, formatted)
+				msg.ParseMode = tgbotapi.ModeMarkdownV2
 				// In "important" notification mode, suppress notification for tool progress.
 				if a.cfg.NotificationMode == "important" {
 					msg.DisableNotification = true
 				}
 				sent, err := a.sendWithRetry(msg, chatID)
 				if err != nil {
-					// Parse-entity error or other: retry as plain text.
+					// MDV2 parse error — strip formatting and retry as plain text.
+					plain := stripMdv2(text)
 					msg.ParseMode = ""
+					msg.Text = plain
 					sent, err = a.sendWithRetry(msg, chatID)
 					if err != nil {
 						log.Printf("chat=%d: commentary send failed: %v", chatID, err)

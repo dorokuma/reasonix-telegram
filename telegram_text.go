@@ -305,15 +305,6 @@ func telegramErrorIsFlood(err error) bool {
 		strings.Contains(s, "too many requests")
 }
 
-// telegramErrorIsRichMessageRequired reports whether an edit failed because
-// a rich message draft can't be edited with plain text.
-func telegramErrorIsRichMessageRequired(err error) bool {
-	if err == nil {
-		return false
-	}
-	return strings.Contains(err.Error(), "RICH_MESSAGE_CONTENT_REQUIRED")
-}
-
 // telegramEditOK reports whether an edit failure can be treated as success.
 func telegramEditOK(err error) bool {
 	return err == nil || telegramErrorIsNotModified(err)
@@ -409,6 +400,11 @@ func (a *App) sendTextParts(chatID int64, text string, editFirstMsgID *int, noFi
 }
 
 func (a *App) sendFormattedParts(chatID int64, displayText string, editFirstMsgID *int, parseMode string) int {
+	// If no parseMode specified, use MDV2 with formatMessage (Hermes pattern).
+	if parseMode == "" {
+		displayText = formatMessage(displayText)
+		parseMode = tgbotapi.ModeMarkdownV2
+	}
 	parts := splitTelegramText(displayText, telegramMaxMessageRunes)
 	if len(parts) == 0 {
 		return 0
@@ -438,6 +434,21 @@ func (a *App) editOverflowSplit(chatID int64, messageID int, parts []string, par
 				return a.editOverflowSplit(chatID, messageID, sub, parseMode)
 			}
 		}
+		if telegramErrorIsParseEntities(err) && parseMode == tgbotapi.ModeMarkdownV2 {
+			// MDV2 parse failure — strip formatting and retry as plain text.
+			plain := stripMdv2(parts[0])
+			edit2 := tgbotapi.NewEditMessageText(chatID, messageID, plain)
+			edit2.ParseMode = ""
+			if _, err2 := a.sendWithRetry(edit2, chatID); telegramEditOK(err2) {
+				if len(parts) == 1 {
+					return 1
+				}
+				sent := 1
+				replyTo := messageID
+				sent += a.sendMessageParts(chatID, parts[1:], parseMode, replyTo)
+				return sent
+			}
+		}
 		if telegramErrorIsParseEntities(err) {
 			return 0
 		}
@@ -465,11 +476,22 @@ func (a *App) sendMessageParts(chatID int64, parts []string, parseMode string, r
 		}
 		m, err := a.sendWithRetry(msg, chatID)
 		if err != nil {
-			if telegramErrorIsParseEntities(err) {
+			if telegramErrorIsParseEntities(err) && parseMode == tgbotapi.ModeMarkdownV2 {
+				// MDV2 parse failure — strip formatting and retry as plain text.
+				plain := stripMdv2(part)
+				msg.Text = plain
+				msg.ParseMode = ""
+				m, err = a.sendWithRetry(msg, chatID)
+				if err != nil {
+					log.Printf("chat=%d: send part %d/%d failed (even plain): %v", chatID, i+1, len(parts), err)
+					return sent
+				}
+			} else if telegramErrorIsParseEntities(err) {
+				return sent
+			} else {
+				log.Printf("chat=%d: send part %d/%d failed: %v", chatID, i+1, len(parts), err)
 				return sent
 			}
-			log.Printf("chat=%d: send part %d/%d failed: %v", chatID, i+1, len(parts), err)
-			return sent
 		}
 		sent++
 		replyTo = m.MessageID
