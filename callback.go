@@ -168,7 +168,7 @@ func (a *App) sendModelPicker(chatID int64, page int) {
 	}
 
 	text := fmt.Sprintf("🤖 选择模型（当前：%s）", a.modelDisplayName(current))
-	msg := newMessage(chatID, text)
+	msg := newMessage(chatID, _escapeMdv2(text))
 	msg.ParseMode = "MarkdownV2"
 	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
 	a.sendSafe(msg)
@@ -228,7 +228,7 @@ func (a *App) editModelPicker(chatID int64, messageID int, page int) {
 	}
 
 	text := fmt.Sprintf("🤖 选择模型（当前：%s）", a.modelDisplayName(current))
-	edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
+	edit := tgbotapi.NewEditMessageText(chatID, messageID, _escapeMdv2(text))
 	edit.ParseMode = "MarkdownV2"
 	edit.ReplyMarkup = &tgbotapi.InlineKeyboardMarkup{InlineKeyboard: rows}
 	if _, err := a.bot.Request(edit); err != nil {
