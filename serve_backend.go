@@ -917,17 +917,17 @@ func toolDisplayLine(toolName, argsJSON string) string {
 		if p := str("path"); p != "" && len(p) > 3 {
 			return "📖 " + trimUTF8Bytes(p, 80)
 		}
-		return "📖"
+		return "📖 read_file"
 	case "write_file", "edit_file", "multi_edit":
 		if p := str("path"); p != "" && len(p) > 3 {
 			return "✍️ " + trimUTF8Bytes(p, 80)
 		}
-		return "✍️"
+		return "✍️ write"
 	case "grep", "search_files":
 		if q := str("pattern"); q != "" && len(q) > 1 {
 			return "🔎 " + trimUTF8Bytes(q, 80)
 		}
-		return "🔎"
+		return "🔎 grep"
 	case "glob", "ls":
 		if p := str("path"); p != "" && len(p) > 2 {
 			return "📁 " + trimUTF8Bytes(p, 80)
@@ -935,12 +935,12 @@ func toolDisplayLine(toolName, argsJSON string) string {
 		if p := str("pattern"); p != "" && len(p) > 2 {
 			return "📁 " + p
 		}
-		return "📁"
+		return "📁 ls"
 	case "codegraph_search":
 		if q := str("pattern"); q != "" && len(q) > 1 {
 			return "🔍 " + trimUTF8Bytes(q, 80)
 		}
-		return "🔍"
+		return "🔍 codegraph_search"
 	case "codegraph_callees", "codegraph_callers", "codegraph_impact":
 		if q := str("name"); q != "" {
 			return "🏷 " + q
@@ -963,27 +963,27 @@ func toolDisplayLine(toolName, argsJSON string) string {
 		if p := str("pattern"); p != "" {
 			return "📁 " + p
 		}
-		return "📁"
+		return "📁 codegraph_files"
 	case "search_web", "web_search":
 		if q := str("query"); q != "" {
 			return "🌐 " + trimUTF8Bytes(q, 80)
 		}
-		return "🌐"
+		return "🌐 search"
 	case "web_fetch", "read_url":
 		if u := str("url"); u != "" {
 			return "🌐 " + trimUTF8Bytes(u, 80)
 		}
-		return "🌐"
+		return "🌐 fetch"
 	case "curl", "wget":
 		if u := str("url"); u != "" {
 			return "📄 " + trimUTF8Bytes(u, 80)
 		}
-		return "📄"
+		return "📄 curl"
 	case "remember", "memory_save", "memory":
 		if t := str("title"); t != "" {
 			return "🧠 " + t
 		}
-		return "🧠"
+		return "🧠 remember"
 	case "note", "ctx_read", "ctx_search":
 		return "📝 " + toolName
 	case "ctx_run":
