@@ -258,7 +258,7 @@ func (a *App) startServe(chatID int64) error {
 	args := []string{"serve", "--addr", serveAddr(port)}
 	// Use per-session model if set, otherwise fall back to global config.
 	if model == "" {
-		model = a.cfg.Model
+		model = reasonixDefaultModel
 	}
 	if model != "" {
 		args = append(args, "--model", model)
@@ -426,6 +426,31 @@ func (a *App) fetchServeModelLabel(port int) string {
 		return ""
 	}
 	return status.Label
+}
+
+// fetchServeCache queries the Reasonix serve /status endpoint and returns
+// session-cumulative cache hit/miss token counts. Unlike s.lastUsage (which
+// reflects only the current agent's state and resets on serve restart), these
+// come from Controller.SessionCache() — the true session-wide aggregates.
+// Returns (0, 0) on failure.
+func (a *App) fetchServeCache(port int) (hit, miss int) {
+	if port == 0 {
+		return 0, 0
+	}
+	url := serveBaseURL(port) + "/status"
+	resp, err := localHTTPClient.Get(url)
+	if err != nil {
+		return 0, 0
+	}
+	defer resp.Body.Close()
+	var status struct {
+		Hit  int `json:"cacheHit"`
+		Miss int `json:"cacheMiss"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
+		return 0, 0
+	}
+	return status.Hit, status.Miss
 }
 
 func (a *App) waitServeReady(port int, timeout time.Duration) error {

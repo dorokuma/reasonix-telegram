@@ -102,6 +102,10 @@ var availableModels = []struct {
 	Name string
 }{}
 
+// reasonixDefaultModel is the default_model from reasonix config.toml,
+// populated from reasonix doctor --json at startup. Used instead of env MODEL.
+var reasonixDefaultModel string
+
 func loadModelsFromReasonix(bin string) {
 	cmd := exec.Command(bin, "doctor", "--json")
 	out, err := cmd.Output()
@@ -115,6 +119,7 @@ func loadModelsFromReasonix(bin string) {
 		} `json:"config"`
 		Providers []struct {
 			Name        string   `json:"name"`
+			Model       string   `json:"model"`
 			Models      []string `json:"models"`
 			IsDefault   bool     `json:"is_default"`
 		} `json:"providers"`
@@ -123,21 +128,33 @@ func loadModelsFromReasonix(bin string) {
 		log.Printf("loadModels: parse doctor json: %v", err)
 		return
 	}
-	// Default provider name.
-	defProv := doc.Config.DefaultModel
+	// Find default provider and its active model.
+	reasonixDefaultModel = ""
 	availableModels = availableModels[:0]
 	for _, p := range doc.Providers {
-		isDefProv := p.Name == defProv
+		if !p.IsDefault {
+			continue
+		}
+		if p.Model != "" {
+			reasonixDefaultModel = p.Model
+		}
 		for _, m := range p.Models {
-			id := p.Name + "/" + m
-			display := p.Name + ": " + m
-			if isDefProv {
+			id := m
+			display := m
+			if reasonixDefaultModel != "" && m == reasonixDefaultModel {
 				display += " ⭐"
 			}
 			availableModels = append(availableModels, struct {
 				ID   string
 				Name string
 			}{id, display})
+		}
+	}
+	// Fallback: use last provider's first model.
+	if reasonixDefaultModel == "" && len(doc.Providers) > 0 {
+		p := doc.Providers[len(doc.Providers)-1]
+		if len(p.Models) > 0 {
+			reasonixDefaultModel = p.Models[0]
 		}
 	}
 	log.Printf("loadModels: loaded %d models from reasonix: %v", len(availableModels), func() []string {
@@ -165,7 +182,6 @@ type Config struct {
 	AllowedUsers []int64 // ALLOWED_USERS, comma-separated TG user IDs; empty = anyone
 	MaxOutputBytes int     // MAX_OUTPUT_BYTES, default 524288 (stream buffer before split-send)
 	MaxDuration    int     // MAX_DURATION_MIN, default 30
-	Model          string  // MODEL, default "" (reasonix default)
 	StateDir string // STATE_DIR, default /var/lib/reasonix-telegram
 	Mode     string // MODE: "chat" (default, tools locked) or "tool" (full agent access)
 	DeepSeekKey string // read from /etc/reasonix-api.env, never in os.Environ
@@ -205,7 +221,6 @@ func loadConfig() Config {
 		ReasonixBin:    getenv("REASONIX_BIN", "reasonix"),
 		MaxOutputBytes: atoi(getenv("MAX_OUTPUT_BYTES", "524288")),
 		MaxDuration:    atoi(getenv("MAX_DURATION_MIN", "30")),
-		Model:          os.Getenv("MODEL"),
 		StateDir: getenv("STATE_DIR", defaultStateDir),
 		Mode:           mode,
 		DeepSeekKey: loadEnvFile("/etc/reasonix-api.env", "DEEPSEEK_API_KEY"),

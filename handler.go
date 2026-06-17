@@ -191,11 +191,15 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 		s.mu.Lock()
 		busy := s.task != nil
 		sessPort := s.servePort
+		sessModel := s.model
 		s.mu.Unlock()
 		// Fetch model label from Reasonix serve API (dynamic, reflects current model).
 		modelName := a.fetchServeModelLabel(sessPort)
 		if modelName == "" {
-			modelName = a.cfg.Model
+			modelName = sessModel // per-session override
+		}
+		if modelName == "" {
+			modelName = reasonixDefaultModel
 		}
 		stateCN := "空闲"
 		if busy {
@@ -212,11 +216,11 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 		cumCompletion := s.cumCompletion
 		cumTotal := s.cumTotal
 		cumCost := s.cumCost
-		// Session-cumulative cache from serve (if available).
-		sessHit := s.lastUsage.SessionCacheHitTokens
-		sessMiss := s.lastUsage.SessionCacheMissTokens
-		sessTotal := sessHit + sessMiss
 		s.mu.Unlock()
+
+		// Session-cumulative cache from serve /status API (survives serve restart).
+		sessHit, sessMiss := a.fetchServeCache(sessPort)
+		sessTotal := sessHit + sessMiss
 
 		if cumTotal > 0 || sessTotal > 0 {
 			if cumTotal > 0 {

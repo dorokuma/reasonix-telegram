@@ -101,7 +101,7 @@ func (a *App) modelHandler(m *tgbotapi.Message, arg string) {
 	s.mu.Lock()
 	current := s.model
 	if current == "" {
-		current = a.cfg.Model
+		current = reasonixDefaultModel
 	}
 	s.mu.Unlock()
 
@@ -135,7 +135,7 @@ func (a *App) sendModelPicker(chatID int64, page int) {
 	s.mu.Lock()
 	current := s.model
 	if current == "" {
-		current = a.cfg.Model
+		current = reasonixDefaultModel
 	}
 	s.mu.Unlock()
 
@@ -195,7 +195,7 @@ func (a *App) editModelPicker(chatID int64, messageID int, page int) {
 	s.mu.Lock()
 	current := s.model
 	if current == "" {
-		current = a.cfg.Model
+		current = reasonixDefaultModel
 	}
 	s.mu.Unlock()
 
@@ -472,7 +472,7 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 		s.mu.Lock()
 		current := s.model
 		if current == "" {
-			current = a.cfg.Model
+			current = reasonixDefaultModel
 		}
 		s.mu.Unlock()
 		// Delete the picker message entirely — bubble + buttons both gone.
