@@ -32,8 +32,10 @@ func isMediaFilePath(path string) (mediaType string, ok bool) {
 			ext = ext[:qi]
 		}
 		switch ext {
-		case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp":
+		case ".jpg", ".jpeg", ".png", ".webp", ".bmp":
 			return "photo", true
+		case ".gif":
+			return "animation", true
 		case ".mp4", ".webm", ".mov", ".avi", ".mkv":
 			return "video", true
 		case ".mp3", ".ogg", ".wav", ".flac", ".m4a":
@@ -77,6 +79,16 @@ func (a *App) sendNativeMedia(chatID int64, path string, caption string) bool {
 		}
 		if _, err := a.sendWithRetry(msg, chatID); err != nil {
 			log.Printf("chat=%d: sendVideo %s: %v", chatID, path, err)
+			return false
+		}
+		return true
+	case "animation":
+		msg := tgbotapi.NewAnimation(chatID, file)
+		if caption != "" {
+			msg.Caption = caption
+		}
+		if _, err := a.sendWithRetry(msg, chatID); err != nil {
+			log.Printf("chat=%d: sendAnimation %s: %v", chatID, path, err)
 			return false
 		}
 		return true
@@ -291,6 +303,15 @@ func telegramErrorIsFlood(err error) bool {
 	return strings.Contains(s, "retry after") ||
 		strings.Contains(s, "flood") ||
 		strings.Contains(s, "too many requests")
+}
+
+// telegramErrorIsRichMessageRequired reports whether an edit failed because
+// a rich message draft can't be edited with plain text.
+func telegramErrorIsRichMessageRequired(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), "RICH_MESSAGE_CONTENT_REQUIRED")
 }
 
 // telegramEditOK reports whether an edit failure can be treated as success.

@@ -124,11 +124,7 @@ func (a *App) deleteMessage(chatID int64, messageID int) {
 // then legacy Markdown, then plain text.
 func (a *App) editCommentary(chatID int64, messageID int, appendText string) error {
 	text := capTelegramMessage(appendText)
-	// Try rich_message edit (native Markdown with code-block support).
-	if a.tryRichMessage(chatID, text, messageID) > 0 {
-		return nil
-	}
-	// Fallback: legacy Markdown (supports ``` code blocks without MarkdownV2 escaping).
+	// Markdown edit (sendRichMessage drafts cannot be editMessageText-ed).
 	edit := tgbotapi.NewEditMessageText(chatID, messageID, text)
 	edit.ParseMode = tgbotapi.ModeMarkdown
 	_, err := a.sendWithRetry(edit, chatID)

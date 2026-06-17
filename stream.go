@@ -140,6 +140,13 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			releaseTask()
 			return
 		}
+		// Silence marker: model returned [SILENT] or NO_REPLY — suppress sending.
+		if isIntentionalSilence(body) {
+			log.Printf("chat=%d: silence detected, suppressing send", chatID)
+			streamDone = true
+			releaseTask()
+			return
+		}
 		if body == "" {
 			hadPreview := false
 			if hadPreview {
@@ -260,6 +267,12 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			streamVisiblePrefix = preview
 			return
 		}
+		if telegramErrorIsRichMessageRequired(err) {
+			streamEditFallback = true
+			streamVisiblePrefix = lastDraftBody
+			log.Printf("chat=%d: stream edit fallback (rich message draft)", chatID)
+			return
+		}
 		editFailCount++
 		if telegramErrorIsFlood(err) || editFailCount >= maxEditFailures {
 			streamEditFallback = true
@@ -321,15 +334,13 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				// Not part of the stream buffer — send immediately as new message.
 				// Don't touch draftMu to avoid contention with pusher goroutine.
 				text = capTelegramMessage(text)
-				// Try rich message (native Markdown) first.
-				if msgID := a.tryRichMessage(chatID, text); msgID > 0 {
-					a.recordSentText(msgID, text)
-					replyDelivered.Store(true)
-					return msgID
-				}
-				// Fallback: legacy Markdown with code-block support.
+				// Use Markdown (editable via editMessageText, unlike sendRichMessage drafts).
 				msg := newMessage(chatID, text)
 				msg.ParseMode = tgbotapi.ModeMarkdown
+				// In "important" notification mode, suppress notification for tool progress.
+				if a.cfg.NotificationMode == "important" {
+					msg.DisableNotification = true
+				}
 				sent, err := a.sendWithRetry(msg, chatID)
 				if err != nil {
 					// Parse-entity error or other: retry as plain text.

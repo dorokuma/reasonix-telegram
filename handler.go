@@ -35,6 +35,36 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 		text = m.Caption
 	}
 	text = strings.TrimSpace(text)
+
+	// Media group aggregation: batch consecutive photos sharing a media_group_id.
+	if a.enqueueMediaGroup(m) {
+		// Photo was enqueued into an album batch — the timer will flush and
+		// call runTask with the aggregated prompt. Don't process individually.
+		return
+	}
+
+	// Handle non-batched media (photo, document, video, GIF, voice, audio)
+	// and stickers. Build a prompt fragment describing the content.
+	parts := ""
+	if mp := a.handleIncomingMedia(m); mp != "" {
+		parts = mp
+	}
+	if sp := a.handleSticker(m); sp != "" {
+		if parts != "" {
+			parts += "\n" + sp
+		} else {
+			parts = sp
+		}
+	}
+	if parts != "" {
+		if text != "" {
+			text = parts + "\n" + text
+		} else {
+			text = parts
+		}
+	}
+
+	text = strings.TrimSpace(text)
 	if text == "" {
 		return
 	}

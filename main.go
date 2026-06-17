@@ -169,6 +169,7 @@ type Config struct {
 	StateDir string // STATE_DIR, default /var/lib/reasonix-telegram
 	Mode     string // MODE: "chat" (default, tools locked) or "tool" (full agent access)
 	DeepSeekKey string // read from /etc/reasonix-api.env, never in os.Environ
+	NotificationMode string // NOTIFICATION_MODE: "important" (default) or "all"
 }
 
 func loadEnvFile(path, key string) string {
@@ -208,6 +209,7 @@ func loadConfig() Config {
 		StateDir: getenv("STATE_DIR", defaultStateDir),
 		Mode:           mode,
 		DeepSeekKey: loadEnvFile("/etc/reasonix-api.env", "DEEPSEEK_API_KEY"),
+		NotificationMode: getenv("NOTIFICATION_MODE", "important"),
 	}
 	if s := os.Getenv("ALLOWED_USERS"); s != "" {
 		for _, p := range strings.Split(s, ",") {
@@ -298,6 +300,9 @@ type App struct {
 	clarifySeq     uint64 // monotonic counter for clarify IDs
 	mode           atomic.Value // string: ModeChat or ModeTool
 	sentTextCache  sync.Map     // message_id → sent text (for reply/quote extraction)
+
+	mediaGroupsMu sync.Mutex
+	mediaGroups   map[int64]map[string]*mediaGroupBatch // chatID → mediaGroupID → batch
 }
 
 type tokenRedactingTransport struct {
@@ -382,11 +387,13 @@ func main() {
 	}
 	bot.Debug = false
 	// Wrap HTTP client to redact bot token from error logs
+	// and enable fallback transport for GFW-broken networks.
+	innerTransport := &tokenRedactingTransport{
+		inner: http.DefaultTransport,
+		token: cfg.BotToken,
+	}
 	bot.Client = &http.Client{
-		Transport: &tokenRedactingTransport{
-			inner: http.DefaultTransport,
-			token: cfg.BotToken,
-		},
+		Transport: NewTelegramFallbackTransport(innerTransport, os.Getenv("TELEGRAM_FALLBACK_IPS")),
 	}
 	log.Printf("authorized as @%s (id=%d)", bot.Self.UserName, bot.Self.ID)
 
@@ -400,7 +407,13 @@ func main() {
 	if err != nil {
 		log.Fatalf("state dir: %v", err)
 	}
-	app := &App{cfg: cfg, bot: bot, state: st, sess: map[int64]*session{}}
+	app := &App{
+		cfg:         cfg,
+		bot:         bot,
+		state:       st,
+		sess:        map[int64]*session{},
+		mediaGroups: map[int64]map[string]*mediaGroupBatch{},
+	}
 	app.setMode(cfg.Mode)
 	if err := app.ensureChatWorkdir(); err != nil {
 		log.Fatalf("chat workdir: %v", err)
