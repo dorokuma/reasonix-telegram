@@ -127,20 +127,18 @@ func loadModelsFromReasonix(bin string) {
 		log.Printf("loadModels: parse doctor json: %v", err)
 		return
 	}
-	// Find default provider and its active model.
+	// Collect models from all providers, marking the default.
 	reasonixDefaultModel = ""
 	availableModels = availableModels[:0]
 	for _, p := range doc.Providers {
-		if !p.IsDefault {
-			continue
-		}
-		if p.Model != "" {
-			reasonixDefaultModel = p.Model
-		}
 		for _, m := range p.Models {
-			id := m
-			display := m
-			if reasonixDefaultModel != "" && m == reasonixDefaultModel {
+			id := p.Name + "/" + m
+			display := p.Name + "/" + m
+			if doc.Config.DefaultModel != "" && doc.Config.DefaultModel == id {
+				reasonixDefaultModel = id
+				display += " ⭐"
+			} else if reasonixDefaultModel == "" && p.Model != "" && m == p.Model {
+				reasonixDefaultModel = id
 				display += " ⭐"
 			}
 			availableModels = append(availableModels, struct {
@@ -149,20 +147,11 @@ func loadModelsFromReasonix(bin string) {
 			}{id, display})
 		}
 	}
-	// Fallback: use last provider's first model.
-	if reasonixDefaultModel == "" && len(doc.Providers) > 0 {
-		p := doc.Providers[len(doc.Providers)-1]
-		if len(p.Models) > 0 {
-			reasonixDefaultModel = p.Models[0]
-		}
+	// Fallback: use first model of first provider.
+	if reasonixDefaultModel == "" && len(availableModels) > 0 {
+		reasonixDefaultModel = availableModels[0].ID
 	}
-	log.Printf("loadModels: loaded %d models from reasonix: %v", len(availableModels), func() []string {
-		ids := make([]string, len(availableModels))
-		for i, m := range availableModels {
-			ids[i] = m.ID
-		}
-		return ids
-	}())
+	log.Printf("loadModels: loaded %d models from reasonix, default=%s", len(availableModels), reasonixDefaultModel)
 }
 
 func modelByID(id string) (string, bool) {
