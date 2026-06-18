@@ -193,13 +193,16 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 		sessPort := s.servePort
 		sessModel := s.model
 		s.mu.Unlock()
-		// Fetch model label from Reasonix serve API (dynamic, reflects current model).
-		modelName := a.fetchServeModelLabel(sessPort)
-		if modelName == "" {
-			modelName = sessModel // per-session override
-		}
+		modelName := sessModel
 		if modelName == "" {
 			modelName = reasonixDefaultModel
+		}
+		if name, ok := modelByID(modelName); ok {
+			modelName = name
+		} else if i := strings.LastIndex(modelName, "/"); i >= 0 {
+			if name, ok := modelByID(modelName[i+1:]); ok {
+				modelName = name
+			}
 		}
 		stateCN := "空闲"
 		if busy {

@@ -12,14 +12,8 @@ EnvironmentFile=/etc/reasonix-telegram.env
 ExecStart=/usr/local/bin/reasonix-telegram
 Restart=on-failure
 RestartSec=5s
-TimeoutStopSec=310
-
-# Security hardening
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=/var/lib/reasonix-telegram
-PrivateTmp=true
-NoNewPrivileges=true
+TimeoutStopSec=30s
+ExecReload=/bin/kill -HUP $MAINPID
 
 StandardOutput=journal
 StandardError=journal

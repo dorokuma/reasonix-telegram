@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -35,6 +36,45 @@ func serveAddr(port int) string {
 
 func serveBaseURL(port int) string {
 	return fmt.Sprintf("http://%s", serveAddr(port))
+}
+
+// readProcCWD reads a process's current working directory from /proc/PID/cwd.
+func readProcCWD(pid int) string {
+	link, err := os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "cwd"))
+	if err != nil {
+		return ""
+	}
+	return link
+}
+
+// isServeStale checks whether the reasonix serve process listening on port
+// was started with different arguments or CWD than what we'd launch now.
+// If no reasonix serve is found on the port, returns false (not stale — caller
+// should proceed to start a fresh one).
+func (a *App) isServeStale(port int, expectedArgs []string, expectedCWD string) bool {
+	pids := pidsListeningOnTCPPort(port)
+	for _, pid := range pids {
+		if pid == os.Getpid() {
+			continue
+		}
+		cmdline := readProcCmdline(pid)
+		if !isReasonixServeCmd(cmdline, a.cfg.ReasonixBin) {
+			continue
+		}
+		// Compare CWD.
+		if readProcCWD(pid) != expectedCWD {
+			return true
+		}
+		// Build expected cmdline suffix: "serve --addr ... --model ... --config-dir ... --resume ...".
+		// We check every expected arg is present in the actual cmdline. This catches
+		// missing --config-dir, different --model, different binary path, etc.
+		expectedSuffix := strings.Join(expectedArgs, " ")
+		if !strings.Contains(cmdline, expectedSuffix) {
+			return true
+		}
+		return false // all checks passed, process matches
+	}
+	return false // no reasonix serve found on this port
 }
 
 // localHTTPClient is a shared HTTP client for local reasonix serve communication.
@@ -197,6 +237,7 @@ func (a *App) stopSessionServe(s *session, chatID int64) {
 	s.mu.Lock()
 	cmd := s.serveCmd
 	s.serveCmd = nil
+	port := s.servePort
 	s.mu.Unlock()
 	if cmd != nil && cmd.Process != nil {
 		// The bridge already sent /cancel via cancelAllTasks + waitTasksDone.
@@ -217,6 +258,21 @@ func (a *App) stopSessionServe(s *session, chatID int64) {
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 			<-waitDone
 		}
+	} else if port > 0 {
+		// Untracked serve (adopted from a previous bridge instance).
+		// Find it by port and kill.
+		log.Printf("chat=%d: stopping untracked serve on port %d", chatID, port)
+		pids := pidsListeningOnTCPPort(port)
+		for _, pid := range pids {
+			if pid == os.Getpid() {
+				continue
+			}
+			cmdline := readProcCmdline(pid)
+			if isReasonixServeCmd(cmdline, a.cfg.ReasonixBin) {
+				terminateProcessGroup(pid, 8*time.Second)
+				break
+			}
+		}
 	}
 }
 
@@ -230,8 +286,9 @@ func (a *App) startServe(chatID int64) error {
 		s.mu.Unlock()
 		return nil
 	}
-	wd := a.chatWorkdir()
-	s.workdir = wd
+	wd := a.chatWorkdir()            // config directory (reasonix.toml lives here)
+	workDir := a.workDir()           // tool workspace (default = chat-wd for backward compat)
+	s.workdir = workDir
 	sessionPath := s.sessionPath
 	port := s.servePort
 	model := s.model // per-session model override
@@ -263,17 +320,36 @@ func (a *App) startServe(chatID int64) error {
 	if model != "" {
 		args = append(args, "--model", model)
 	}
+	// When workDir differs from config directory, point Reasonix at the config
+	// location explicitly so it picks up mode lockdown / rules from chat-wd.
+	if workDir != wd {
+		args = append(args, "--config-dir", wd)
+	}
 	// Always --resume so auto-save stays on sessionPath (not ~/.config/reasonix/sessions).
 	// Reasonix Resume now re-applies the boot system prompt even when the file is empty.
 	args = append(args, "--resume", sessionPath)
 
 	if err := a.waitServeReady(port, 2*time.Second); err == nil {
-		log.Printf("chat=%d: adopting existing reasonix serve on %s", chatID, serveAddr(port))
-		return nil
+		// A serve process is already listening. Check whether it was started
+		// with the same config we'd use now — if not, stop it and start fresh.
+		if a.isServeStale(port, args, workDir) {
+			log.Printf("chat=%d: existing serve stale (config mismatch), restarting", chatID)
+			a.stopServe(chatID)
+			// Wait for the old process to release the port.
+			for i := 0; i < 30; i++ {
+				if err := a.waitServeReady(port, 100*time.Millisecond); err != nil {
+					break
+				}
+				time.Sleep(100 * time.Millisecond)
+			}
+		} else {
+			log.Printf("chat=%d: adopting existing reasonix serve on %s", chatID, serveAddr(port))
+			return nil
+		}
 	}
 
 	cmd := exec.Command(a.cfg.ReasonixBin, args...)
-	cmd.Dir = wd
+	cmd.Dir = workDir
 	cmd.Env = a.reasonixEnv()
 	// Go wires nil Stderr to /dev/null; forward serve diagnostics (RTK/CTX hit/miss) to journal.
 	cmd.Stderr = os.Stderr
@@ -306,9 +382,9 @@ func (a *App) startServe(chatID int64) error {
 		return err
 	}
 	// mode lockdown is handled by reasonix.toml
-	log.Printf("chat=%d: serve cwd=%s mode=%s", chatID, wd, a.getMode())
+	log.Printf("chat=%d: serve cwd=%s config-dir=%s mode=%s", chatID, workDir, wd, a.getMode())
 	if err := a.state.upsert(chatRecord{
-		ChatID: chatID, Workdir: wd, SessionPath: sessionPath, Port: port,
+		ChatID: chatID, Workdir: workDir, SessionPath: sessionPath, Port: port,
 	}); err != nil {
 		log.Printf("chat=%d: persist state failed: %v", chatID, err)
 	}
@@ -317,7 +393,16 @@ func (a *App) startServe(chatID int64) error {
 }
 
 func (a *App) ensureServe(chatID int64) error {
-	if a.serveRunning(a.getOrCreateSession(chatID)) {
+	s := a.getOrCreateSession(chatID)
+	if a.serveRunning(s) {
+		// Process is alive but may still be binding the port (startup race
+		// between restore goroutine's cmd.Start and waitServeReady).
+		s.mu.Lock()
+		port := s.servePort
+		s.mu.Unlock()
+		if port > 0 {
+			return a.waitServeReady(port, 10*time.Second)
+		}
 		return nil
 	}
 	return a.startServe(chatID)
@@ -380,7 +465,7 @@ func (a *App) restorePersistedSessions() {
 	for _, rec := range records {
 		s := a.getOrCreateSession(rec.ChatID)
 		s.mu.Lock()
-		s.workdir = a.chatWorkdir()
+		s.workdir = a.workDir()
 		s.sessionPath = rec.SessionPath
 		if s.sessionPath == "" {
 			s.sessionPath = a.state.sessionPathForChat(rec.ChatID)

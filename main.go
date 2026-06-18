@@ -186,6 +186,7 @@ type Config struct {
 	Mode     string // MODE: "chat" (default, tools locked) or "tool" (full agent access)
 	DeepSeekKey string // read from /etc/reasonix-api.env, never in os.Environ
 	NotificationMode string // NOTIFICATION_MODE: "important" (default) or "all"
+	WorkDir string // WORK_DIR: reasonix serve working directory (tool workspace); default = chat-wd
 }
 
 func loadEnvFile(path, key string) string {
@@ -225,6 +226,7 @@ func loadConfig() Config {
 		Mode:           mode,
 		DeepSeekKey: loadEnvFile("/etc/reasonix-api.env", "DEEPSEEK_API_KEY"),
 		NotificationMode: getenv("NOTIFICATION_MODE", "important"),
+		WorkDir:        os.Getenv("WORK_DIR"),
 	}
 	if s := os.Getenv("ALLOWED_USERS"); s != "" {
 		for _, p := range strings.Split(s, ",") {

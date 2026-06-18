@@ -33,6 +33,16 @@ func (a *App) chatWorkdir() string {
 	return filepath.Join(a.cfg.StateDir, chatWorkdirSubdir)
 }
 
+// workDir returns the agent's tool workspace directory.
+// When WORK_DIR is set, it decouples the workspace from the config directory
+// (chat-wd); otherwise falls back to chat-wd for backward compatibility.
+func (a *App) workDir() string {
+	if a.cfg.WorkDir != "" {
+		return a.cfg.WorkDir
+	}
+	return a.chatWorkdir()
+}
+
 // ensureChatWorkdir prepares the per-chat reasonix workdir and writes a
 // per-mode reasonix.toml that overrides the global config (reasonix.toml
 // in the cwd wins over ~/.config/reasonix/config.toml). Without this, the
