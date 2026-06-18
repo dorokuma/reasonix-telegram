@@ -485,7 +485,10 @@ func main() {
 	updates := bot.GetUpdatesChan(u)
 
 	for upd := range updates {
-		if app.restarting {
+		app.restartMu.Lock()
+		restarting := app.restarting
+		app.restartMu.Unlock()
+		if restarting {
 			break
 		}
 		if upd.Message != nil {

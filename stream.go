@@ -107,8 +107,10 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 	lastSentBody := "" // tracks last finalized text to prevent duplicate sends
 	releaseTask := func() {
 		s.mu.Lock()
-		s.task = nil
-		s.wakePusher = nil
+		if s.task == thisTask {
+			s.task = nil
+			s.wakePusher = nil
+		}
 		s.mu.Unlock()
 	}
 	// endStream mirrors TelePi finalizeResponse: set streamDone first, flush last
