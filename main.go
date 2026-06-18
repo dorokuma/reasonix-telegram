@@ -11,7 +11,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -187,12 +186,20 @@ type Config struct {
 	DeepSeekKey string // read from /etc/reasonix-api.env, never in os.Environ
 	NotificationMode string // NOTIFICATION_MODE: "important" (default) or "all"
 	WorkDir string // WORK_DIR: reasonix serve working directory (tool workspace); default = chat-wd
+	secrets []string // collected at startup for log redaction
 }
 
 func loadEnvFile(path, key string) string {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return ""
+	}
+	// Warn if the file is world-readable (other or group can read).
+	if fi, err := os.Stat(path); err == nil {
+		perm := fi.Mode().Perm()
+		if perm&0o044 != 0 {
+			log.Printf("WARN: %s has permissive mode %o (建议 chmod 600)", path, perm)
+		}
 	}
 	for _, line := range strings.Split(string(b), "\n") {
 		line = strings.TrimSpace(line)
@@ -236,6 +243,16 @@ func loadConfig() Config {
 				log.Printf("config: ALLOWED_USERS ignoring invalid id %q: %v", p, err)
 			}
 		}
+	}
+	// Collect secrets for log redaction (env will be unset after startup).
+	if c.BotToken != "" {
+		c.secrets = append(c.secrets, c.BotToken)
+	}
+	if c.DeepSeekKey != "" {
+		c.secrets = append(c.secrets, c.DeepSeekKey)
+	}
+	if cf := os.Getenv("CF_TOKEN"); cf != "" {
+		c.secrets = append(c.secrets, cf)
 	}
 	return c
 }
@@ -339,25 +356,14 @@ func (t *tokenRedactingTransport) RoundTrip(req *http.Request) (*http.Response, 
 }
 
 // redactSecrets returns s with known secrets replaced by "***".
-// Apply to any log string that might contain tokens or API keys.
-func redactSecrets(s string, extraSecrets ...string) string {
-	secrets := extraSecrets
-	for _, env := range []string{"TG_BOT_TOKEN", "DEEPSEEK_API_KEY", "CF_TOKEN"} {
-		if v := os.Getenv(env); v != "" && v != s {
-			secrets = append(secrets, v)
-		}
-	}
+// Secrets are collected at startup before env is stripped.
+func redactSecrets(s string, secrets []string) string {
 	for _, v := range secrets {
 		if v != "" && v != s {
 			s = strings.ReplaceAll(s, v, "***")
 		}
 	}
 	return s
-}
-
-func logRedact(format string, args ...interface{}) {
-	msg := fmt.Sprintf(format, args...)
-	log.Print(redactSecrets(msg))
 }
 
 func (a *App) getMode() string {
@@ -400,7 +406,7 @@ func main() {
 
 	bot, err := tgbotapi.NewBotAPI(cfg.BotToken)
 	if err != nil {
-		log.Fatalf("telegram auth failed: %v", redactSecrets(err.Error(), cfg.BotToken))
+		log.Fatalf("telegram auth failed: %v", redactSecrets(err.Error(), cfg.secrets))
 	}
 	bot.Debug = false
 	// Wrap HTTP client to redact bot token from error logs

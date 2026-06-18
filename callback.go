@@ -401,6 +401,10 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 	if cq.Message == nil || cq.From == nil {
 		return
 	}
+	if !a.allowed(cq.From) {
+		a.answerCallback(cq.ID, "⛔ 无权限")
+		return
+	}
 	chatID := cq.Message.Chat.ID
 	data := strings.TrimSpace(cq.Data)
 	log.Printf("chat=%d: callback data=%q", chatID, data)

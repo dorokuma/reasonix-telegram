@@ -48,15 +48,15 @@ func (a *App) downloadTelegramFile(fileID string, ext string, category string, c
 	url := tf.Link(a.bot.Token)
 	resp, err := http.Get(url)
 	if err != nil {
-		return "", fmt.Errorf("http get: %w", err)
+		return "", fmt.Errorf("download file %s: %w", fileID, err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("http %d downloading %s", resp.StatusCode, url)
+		return "", fmt.Errorf("download file %s: HTTP %d", fileID, resp.StatusCode)
 	}
 
-	f, err := os.Create(localPath)
+	f, err := os.OpenFile(localPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return "", fmt.Errorf("create: %w", err)
 	}
