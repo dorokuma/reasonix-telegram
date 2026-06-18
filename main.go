@@ -464,11 +464,11 @@ func main() {
 		select {
 		case <-drainDone:
 			log.Printf("shutdown: all message handlers drained")
-		case <-time.After(15 * time.Second):
+		case <-time.After(3 * time.Second):
 			log.Printf("shutdown: drain timeout, proceeding with cancel")
 		}
 		app.cancelAllTasks()
-		app.waitTasksDone(25 * time.Second)
+		app.waitTasksDone(10 * time.Second)
 		log.Printf("shutdown: all tasks done, stopping serves…")
 		app.stopAllServes()
 		close(shutdownCh)

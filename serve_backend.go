@@ -240,11 +240,9 @@ func (a *App) stopSessionServe(s *session, chatID int64) {
 	port := s.servePort
 	s.mu.Unlock()
 	if cmd != nil && cmd.Process != nil {
-		// The bridge already sent /cancel via cancelAllTasks + waitTasksDone.
-		// Give the serve process 3s to flush its session JSONL before SIGTERM,
-		// so the last few messages survive a restart.
-		log.Printf("chat=%d: stopping serve (pid %d), 3s grace for session flush…", chatID, cmd.Process.Pid)
-		time.Sleep(3 * time.Second)
+		// cancelAllTasks already told serve to stop; SIGTERM immediately
+		// so the serve process can flush its session JSONL and exit cleanly.
+		log.Printf("chat=%d: stopping serve (pid %d)", chatID, cmd.Process.Pid)
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 		waitDone := make(chan struct{})
 		go func() {
@@ -254,7 +252,7 @@ func (a *App) stopSessionServe(s *session, chatID int64) {
 		select {
 		case <-waitDone:
 			log.Printf("chat=%d: serve exited cleanly", chatID)
-		case <-time.After(10 * time.Second):
+		case <-time.After(5 * time.Second):
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 			<-waitDone
 		}
