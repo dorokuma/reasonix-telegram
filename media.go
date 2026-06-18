@@ -44,9 +44,13 @@ func (a *App) downloadTelegramFile(fileID string, ext string, category string, c
 		return localPath, nil
 	}
 
-	// Download from Telegram
+	// Download from Telegram (use bot.Client which has tokenRedactingTransport)
 	url := tf.Link(a.bot.Token)
-	resp, err := http.Get(url)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return "", fmt.Errorf("download file %s: %w", fileID, err)
+	}
+	resp, err := a.bot.Client.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("download file %s: %w", fileID, err)
 	}

@@ -396,6 +396,7 @@ func main() {
 	// reasonixEnv() passes it explicitly to child processes from cfg.DeepSeekKey.
 	os.Unsetenv("DEEPSEEK_API_KEY")
 	os.Unsetenv("TG_BOT_TOKEN")
+	os.Unsetenv("CF_TOKEN")
 	if cfg.BotToken == "" {
 		log.Fatal("TG_BOT_TOKEN is required")
 	}

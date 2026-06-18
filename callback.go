@@ -16,22 +16,21 @@ func (a *App) healthHandler(m *tgbotapi.Message) {
 	a.sessMu.Lock()
 	defer a.sessMu.Unlock()
 	lines := []string{fmt.Sprintf("模式: %s", a.modeLabel())}
-	if len(a.sess) == 0 {
-		lines = append(lines, "暂无活跃会话")
+	s, ok := a.sess[m.Chat.ID]
+	if !ok {
+		lines = append(lines, "当前聊天无活跃会话")
 	} else {
-		for chatID, s := range a.sess {
-			s.mu.Lock()
-			busy := s.task != nil
-			running := s.serveCmd != nil && s.serveCmd.Process != nil && s.serveCmd.ProcessState == nil
-			s.mu.Unlock()
-			status := "🟢 运行中"
-			if !running {
-				status = "🔴 已停止"
-			} else if busy {
-				status = "🟡 生成中"
-			}
-			lines = append(lines, fmt.Sprintf("聊天 %d: %s", chatID, status))
+		s.mu.Lock()
+		busy := s.task != nil
+		running := s.serveCmd != nil && s.serveCmd.Process != nil && s.serveCmd.ProcessState == nil
+		s.mu.Unlock()
+		status := "🟢 运行中"
+		if !running {
+			status = "🔴 已停止"
+		} else if busy {
+			status = "🟡 生成中"
 		}
+		lines = append(lines, status)
 	}
 	a.reply(m.Chat.ID, strings.Join(lines, "\n"))
 }
@@ -496,6 +495,17 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 		if level == "" {
 			return
 		}
+		// Validate level against known effort levels.
+		valid := false
+		for _, l := range effortLevels {
+			if l.ID == level {
+				valid = true
+				break
+			}
+		}
+		if !valid {
+			return
+		}
 
 		// Get serve port from session.
 		s := a.getOrCreateSession(chatID)
@@ -637,20 +647,17 @@ func (a *App) formatChoices(choices []string) string {
 func (a *App) sessionsHandler(m *tgbotapi.Message) {
 	a.sessMu.Lock()
 	defer a.sessMu.Unlock()
-	var lines []string
-	if len(a.sess) == 0 {
-		lines = append(lines, "暂无活跃会话")
-	} else {
-		for chatID, s := range a.sess {
-			s.mu.Lock()
-			la := s.lastActivity
-			s.mu.Unlock()
-			line := fmt.Sprintf("聊天 %d", chatID)
-			if !la.IsZero() {
-				line += fmt.Sprintf(" · 最后活跃 %s 前", time.Since(la).Round(time.Second))
-			}
-			lines = append(lines, line)
-		}
+	s, ok := a.sess[m.Chat.ID]
+	if !ok {
+		a.reply(m.Chat.ID, "当前聊天无活跃会话")
+		return
 	}
-	a.reply(m.Chat.ID, strings.Join(lines, "\n"))
+	s.mu.Lock()
+	la := s.lastActivity
+	s.mu.Unlock()
+	line := fmt.Sprintf("聊天 %d", m.Chat.ID)
+	if !la.IsZero() {
+		line += fmt.Sprintf(" · 最后活跃 %s 前", time.Since(la).Round(time.Second))
+	}
+	a.reply(m.Chat.ID, line)
 }
