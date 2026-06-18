@@ -12,8 +12,8 @@ EnvironmentFile=/etc/reasonix-telegram.env
 ExecStart=/usr/local/bin/reasonix-telegram
 Restart=on-failure
 RestartSec=5s
-TimeoutStopSec=30s
-ExecReload=/bin/kill -HUP $MAINPID
+TimeoutStopSec=60s
+KillMode=process
 
 StandardOutput=journal
 StandardError=journal

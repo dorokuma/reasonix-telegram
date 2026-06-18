@@ -468,7 +468,7 @@ func main() {
 			log.Printf("shutdown: drain timeout, proceeding with cancel")
 		}
 		app.cancelAllTasks()
-		app.waitTasksDone(5 * time.Minute)
+		app.waitTasksDone(25 * time.Second)
 		log.Printf("shutdown: all tasks done, stopping serves…")
 		app.stopAllServes()
 		close(shutdownCh)
