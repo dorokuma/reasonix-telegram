@@ -1110,34 +1110,11 @@ func toolDisplayLine(toolName, argsJSON string) string {
 			return "📁 " + p
 		}
 		return "📁 ls"
-	case "codegraph_search":
-		if q := str("pattern"); q != "" && len(q) > 1 {
-			return "🔍 " + trimUTF8Bytes(q, 80)
-		}
-		return "🔍 codegraph_search"
-	case "codegraph_callees", "codegraph_callers", "codegraph_impact":
-		if q := str("name"); q != "" {
-			return "🏷 " + q
-		}
-		return "🔍"
-	case "codegraph_context":
-		if f := str("file"); f != "" {
-			line := ""
-			if args != nil {
-				if l, ok := args["line"].(float64); ok && l > 0 {
-					line = fmt.Sprintf(":%d", int(l))
-				}
-			}
-			return "📄 " + trimUTF8Bytes(f, 60) + line
-		}
-		return "🔍"
-	case "codegraph_explore", "codegraph_trace":
-		return "🔍"
-	case "codegraph_files":
-		if p := str("pattern"); p != "" {
-			return "📁 " + p
-		}
-		return "📁 codegraph_files"
+	// (deleted codegraph_search)
+	// (deleted codegraph_callees/callers/impact)
+	// (deleted codegraph_context)
+	// (deleted codegraph_explore/trace)
+	// (deleted codegraph_files)
 	case "search_web", "web_search":
 		if q := str("query"); q != "" {
 			return "🌐 " + trimUTF8Bytes(q, 80)
@@ -1195,8 +1172,7 @@ func toolDisplayLine(toolName, argsJSON string) string {
 			return "📖 " + strings.TrimPrefix(toolName, "mcp__cf-docs__")
 		case strings.HasPrefix(toolName, "mcp__jina__"):
 			return "🌐 " + strings.TrimPrefix(toolName, "mcp__jina__")
-		case strings.HasPrefix(toolName, "mcp__codegraph__"):
-			return "🧬 " + strings.TrimPrefix(toolName, "mcp__codegraph__")
+		// (deleted mcp__codegraph__)
 		default:
 			// Fallback: try to find a string arg for display.
 			if args != nil {
@@ -1220,6 +1196,3 @@ func isHookOnlyOutput(output string) bool {
 	}
 	return strings.TrimSpace(stripHookMessages(output)) == ""
 }
-
-// stripBackgroundJobs removes reasonix background-job lifecycle blocks from text.
-// These are injected by the controller and are not part of the agent's answer.

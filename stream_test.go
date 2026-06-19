@@ -65,7 +65,6 @@ func TestStripANSI(t *testing.T) {
 func TestIsReasonixNoise(t *testing.T) {
 	noise := []string{
 		"  · 7646 tok · in 7580",
-		"  · codegraph: fetching runtime",
 		"  ▎ thinking",
 		"  ▎ reasoning",
 		"❌ something failed",

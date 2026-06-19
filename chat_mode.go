@@ -10,7 +10,7 @@ import (
 const chatWorkdirSubdir = "chat-wd"
 
 // chatReasonixToml is written into the dedicated chat workdir on every bridge
-// start. Only technical lockdown (tools/plugins/LSP/codegraph) — no system_prompt,
+// start. Only technical lockdown (tools/plugins/LSP) — no system_prompt,
 // persona, or agent behavior overrides; the user's own rules apply via Reasonix.
 const chatReasonixToml = `# reasonix-telegram: chat mode — tool lockdown (managed by the bridge)
 [tools]
@@ -18,13 +18,9 @@ enabled = ["none"]
 
 [lsp]
 enabled = false
-
-[codegraph]
-enabled = false
-auto_install = false
 `
 
-// toolReasonixToml is used in tool/code mode — tools, codegraph and LSP are
+// toolReasonixToml is used in tool/code mode — tools and LSP are
 // all available.
 const toolReasonixToml = `# reasonix-telegram: tool mode — full tools (managed by the bridge)
 `

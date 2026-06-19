@@ -55,7 +55,7 @@ func stripANSI(s string) string {
 var (
 	// "  · 7646 tok · in 7580 (7552 cached / 28 new) · out 66 (23 reasoning) · ¥0.0003"
 	reTokenStats = regexp.MustCompile(`^\s*·\s*\d+\s*tok\b`)
-	// "  · codegraph: fetching code-intelligence runtime in the background (one-time) — symbol-graph tools available next session"
+	// "  · status: some status message from reasonix"
 	// Catch any `· <text>:` status line that reasonix prints
 	reStatusDot = regexp.MustCompile(`^\s*·\s+\S+:`)
 	// "  ▎ thinking" / "  ▎ ..."   (TUI bullet bar)
