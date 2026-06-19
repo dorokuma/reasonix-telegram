@@ -444,9 +444,11 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 			session = false
 		}
 
-		_ = a.postJSON(pa.port, "/approve", map[string]any{
+		if err := a.postJSON(pa.port, "/approve", map[string]any{
 			"id": approvalID, "allow": allow, "session": session,
-		})
+		}); err != nil {
+			a.reply(chatID, "操作失败，reasonix serve 可能已重启，请重新操作")
+		}
 		log.Printf("chat=%d: approval %s -> allow=%v session=%v", chatID, approvalID, allow, session)
 		return
 	}

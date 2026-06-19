@@ -327,6 +327,8 @@ type App struct {
 
 	mediaGroupsMu sync.Mutex
 	mediaGroups   map[int64]map[string]*mediaGroupBatch // chatID → mediaGroupID → batch
+
+	rateLimits sync.Map // map[int64]time.Time — per-chat last message time
 }
 
 type tokenRedactingTransport struct {

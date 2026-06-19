@@ -17,6 +17,14 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 	if m.From == nil {
 		return
 	}
+	// Per-chat rate limit: at most 1 message per 3 seconds.
+	const minInterval = 3 * time.Second
+	if last, ok := a.rateLimits.Load(m.Chat.ID); ok {
+		if time.Since(last.(time.Time)) < minInterval {
+			return // silently drop
+		}
+	}
+	a.rateLimits.Store(m.Chat.ID, time.Now())
 	if !a.allowed(m.From) {
 		a.reply(m.Chat.ID, "⛔ 无权使用此机器人")
 		return
@@ -73,7 +81,7 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 	s := a.getOrCreateSession(m.Chat.ID)
 	s.mu.Lock()
 	pc := s.pendingClarify
-	log.Printf("chat=%d: handleMessage text=%q pendingClarify=%v", m.Chat.ID, logPreview(text, 40), pc != nil)
+	log.Printf("chat=%d: handleMessage text=%q pendingClarify=%v", m.Chat.ID, "[message]", pc != nil)
 	if pc != nil {
 		// Store text answer (under lock to avoid concurrent-map write).
 		answerText := text
@@ -321,8 +329,8 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 			}
 		}
 		log.Printf("chat=%d: reply quote len=%d textPreview=%q captionPreview=%q fromBot=%v fromUser=%d",
-			m.Chat.ID, len(quote), logPreview(m.ReplyToMessage.Text, 60),
-			logPreview(m.ReplyToMessage.Caption, 60),
+			m.Chat.ID, len(quote), "[content]",
+			"[content]",
 			m.ReplyToMessage.From != nil && m.ReplyToMessage.From.IsBot,
 			m.ReplyToMessage.From.ID)
 		if quote != "" {

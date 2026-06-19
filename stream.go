@@ -705,7 +705,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		streamDone = true
 		draftMu.Unlock()
 		if replyDelivered.Load() && errors.Is(procErr, context.Canceled) {
-			log.Printf("chat=%d prompt=%q: canceled after reply delivered (draft cleared)", chatID, logPreview(prompt, 80))
+			log.Printf("chat=%d prompt=%q: canceled after reply delivered (draft cleared)", chatID, "[content]")
 			return
 		}
 		msg := fmt.Sprintf("请求失败：%s", userFacingError(procErr))
@@ -715,7 +715,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			msg = "已中止"
 		}
 		a.reply(chatID, msg)
-		log.Printf("chat=%d prompt=%q err=%v", chatID, logPreview(prompt, 80), procErr)
+		log.Printf("chat=%d prompt=%q err=%v", chatID, "[content]", procErr)
 		return
 	}
 
@@ -737,7 +737,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 	finalBody := strings.TrimSpace(buf.String())
 	bufMu.Unlock()
 	log.Printf("chat=%d prompt=%q stream=draft draftID=%d finalLen=%d runes=%d body=%q",
-		chatID, logPreview(prompt, 80), draftID, len(finalBody), utf8.RuneCountInString(finalBody), logPreview(finalBody, 200))
+		chatID, "[content]", draftID, len(finalBody), utf8.RuneCountInString(finalBody), logPreview(finalBody, 200))
 }
 
 // streamFinalizeBody picks the text to finalize at turn end. The accumulator
