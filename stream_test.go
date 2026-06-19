@@ -156,3 +156,58 @@ var (
 type testErr struct{ msg string }
 
 func (e *testErr) Error() string { return e.msg }
+
+// TestDetectThinkingLeak verifies the thinking-leak probe logic.
+func TestDetectThinkingLeak(t *testing.T) {
+	drop := []string{
+		"Let me check the git log",
+		"Let me look at the code",
+		"let's see what happens",
+		"I need to verify this",
+		"I'll check the file",
+		"I should look at this first",
+		"First, let me understand",
+		"Now I need to check",
+		"Looking at the codebase",
+		"Checking the configuration",
+		"Okay, let me try",
+		"OK, let's see",
+	}
+	keep := []string{
+		"这是中文回复",
+		"编译通过，测试通过",
+		"你好，我来回答",
+		"代码已经在 GitHub 上了",
+		"搞定",
+		// Long non-thinking English without a leak opener → exceeds probe limit
+		strings.Repeat("a", 301),
+	}
+	for _, s := range drop {
+		got := detectThinkingLeak(s)
+		if got != leakDrop {
+			t.Fatalf("detectThinkingLeak(%q) = %v, want leakDrop", s, got)
+		}
+	}
+	for _, s := range keep {
+		got := detectThinkingLeak(s)
+		if got != leakKeep {
+			t.Fatalf("detectThinkingLeak(%q) = %v, want leakKeep", s, got)
+		}
+	}
+	// Undecided: short English without leak opener and no Chinese
+	undecided := []string{
+		"ab",
+		"xyz",
+		"hello",
+		"func main() {",
+		"```go",
+		"package main",
+		"https://example.com",
+	}
+	for _, s := range undecided {
+		got := detectThinkingLeak(s)
+		if got != leakUndecided {
+			t.Fatalf("detectThinkingLeak(%q) = %v, want leakUndecided", s, got)
+		}
+	}
+}

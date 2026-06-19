@@ -95,6 +95,9 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		editFailCount        int  // consecutive edit failures in this turn
 		streamEditFallback   bool // edit flood-silenced: finalize via sendMessage tail
 		streamVisiblePrefix  string // last raw preview successfully shown (edit/draft)
+		leakProbe            strings.Builder // accumulates turn-start text for leak detection
+		leakDecided          bool // language decision made for this segment
+		leakDetected         bool // thinking-leak detected — drop all text this segment
 	)
 	const (
 		maxDraftFailures = 3
@@ -302,6 +305,14 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		}
 	}
 
+	// resetLeakState clears the thinking-leak probe so the next text segment
+	// (after a tool boundary or approval) gets a fresh detection window.
+	resetLeakState := func() {
+		leakProbe.Reset()
+		leakDecided = false
+		leakDetected = false
+	}
+
 	// Register pusher signal on session so clarify answer handlers can kick the stream.
 	s.mu.Lock()
 	s.wakePusher = wakePush
@@ -317,6 +328,33 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		procErr = a.runServeTurn(ctx, chatID, prompt,
 			func(chunk string) {
 				bufMu.Lock()
+				if leakDetected {
+					// Thinking-leak: drop all text for this segment.
+					bufMu.Unlock()
+					return
+				}
+				if !leakDecided {
+					probe := leakProbe.String() + chunk
+					decision := detectThinkingLeak(probe)
+					switch decision {
+					case leakDrop:
+						leakDetected = true
+						leakDecided = true
+						log.Printf("chat=%d: thinking-leak detected, dropping segment prefix=%q", chatID, logPreview(probe, 120))
+						bufMu.Unlock()
+						return
+					case leakKeep:
+						leakDecided = true
+						appendChunk(&buf, probe, a.cfg.MaxOutputBytes, &truncated)
+						bufMu.Unlock()
+						wakePush()
+						return
+					case leakUndecided:
+						leakProbe.WriteString(chunk)
+						bufMu.Unlock()
+						return
+					}
+				}
 				appendChunk(&buf, chunk, a.cfg.MaxOutputBytes, &truncated)
 				bufMu.Unlock()
 				wakePush()
@@ -372,6 +410,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				bufMu.Lock()
 				buf.Reset()
 				truncated = false
+				resetLeakState()
 				bufMu.Unlock()
 				draftID = a.nextDraftID()
 				useDraft = true
@@ -453,6 +492,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				bufMu.Lock()
 				buf.Reset()
 				truncated = false
+				resetLeakState()
 				bufMu.Unlock()
 				draftID = a.nextDraftID()
 				useDraft = true
@@ -563,6 +603,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			body := strings.TrimSpace(buf.String())
 			buf.Reset()
 			truncated = false
+			resetLeakState()
 			bufMu.Unlock()
 			segHadLiveDraft := draftShown || liveDraftEver
 			if body != "" && body != lastSentBody {

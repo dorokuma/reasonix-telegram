@@ -903,6 +903,74 @@ func isSilenceOnly(s string) bool {
 	return false
 }
 
+// leakDecision is the outcome of probing the start of a text stream for
+// thinking-content leakage (model putting chain-of-thought into the text
+// channel instead of the reasoning channel).
+type leakDecision int
+
+const (
+	leakUndecided leakDecision = iota // not enough text yet — keep probing
+	leakKeep                          // normal content — flush probe and stop probing
+	leakDrop                          // thinking leak — drop this segment
+)
+
+// thinkingLeakOpeners are English chain-of-thought sentence starters that
+// indicate the model is reasoning aloud rather than answering. The bot's
+// system rules require Chinese replies, so English text at the start of a
+// turn is a strong leak signal. Prefix-matched, case-insensitive.
+var thinkingLeakOpeners = []string{
+	"let me", "let's", "i need to", "i need", "i'll", "i should",
+	"i have to", "i want to", "i'm going to", "first,", "now i",
+	"looking at", "checking", "let me check", "i'll check",
+	"let's see", "okay, let", "ok, let", "alright, let",
+	"i should check", "i should look", "i should verify",
+	"let me look", "let me see", "let me think",
+	"i'll look", "i'll see", "i'll think",
+	"i need to check", "i need to look", "i need to verify",
+	"let me verify", "let me confirm", "let me understand",
+}
+
+// hasChineseRune reports whether s contains any CJK Unified Ideograph.
+func hasChineseRune(s string) bool {
+	for _, r := range s {
+		if r >= 0x4E00 && r <= 0x9FFF {
+			return true
+		}
+	}
+	return false
+}
+
+// detectThinkingLeak examines the accumulated probe text and decides whether
+// it is a thinking-leak (English chain-of-thought), normal content, or still
+// undetermined. The probe is limited to ~300 bytes; once that is exceeded
+// without a leak signal, the content is kept.
+func detectThinkingLeak(probe string) leakDecision {
+	// Strip ANSI/noise before examining.
+	clean := stripANSI(probe)
+	clean = stripThinkBlocks(clean)
+	trimmed := strings.TrimSpace(clean)
+	if trimmed == "" {
+		return leakUndecided
+	}
+	// Chinese present → normal reply (rules require Chinese). Flush and keep.
+	if hasChineseRune(trimmed) {
+		return leakKeep
+	}
+	lower := strings.ToLower(trimmed)
+	for _, opener := range thinkingLeakOpeners {
+		if strings.HasPrefix(lower, opener) {
+			return leakDrop
+		}
+	}
+	// Probe limit: if we have enough text and no leak signal, keep it.
+	// 300 bytes of pure ASCII without a Chinese rune or leak opener is
+	// likely code or a non-thinking English reply — let it through.
+	if len(trimmed) > 300 {
+		return leakKeep
+	}
+	return leakUndecided
+}
+
 // appendChunk accumulates streamed assistant text (full buffer; finalize may split across messages).
 func appendChunk(buf *strings.Builder, chunk string, maxBytes int, truncated *bool) {
 	clean := stripANSI(chunk)

@@ -133,7 +133,7 @@ func loadModelsFromReasonix(bin string) {
 	for _, p := range doc.Providers {
 		for _, m := range p.Models {
 			id := p.Name + "/" + m
-			display := p.Name + "/" + m
+			display := m
 			if doc.Config.DefaultModel != "" && doc.Config.DefaultModel == id {
 				reasonixDefaultModel = id
 				display += " ⭐"
