@@ -64,7 +64,7 @@ func (a *App) modeHandler(m *tgbotapi.Message, arg string) {
 	a.stopServe(m.Chat.ID)
 	a.setMode(newMode)
 	_ = a.ensureChatWorkdir()
-	if err := a.startServe(m.Chat.ID); err != nil {
+	if err := a.startServe(m.Chat.ID, true); err != nil {
 		a.reply(m.Chat.ID, fmt.Sprintf("切换模式失败: %v", err))
 		return
 	}
@@ -283,7 +283,7 @@ func (a *App) switchModel(chatID int64, modelID, modelName string) {
 	if err := a.persistModel(chatID, modelID); err != nil {
 		log.Printf("chat=%d: persist model failed: %v", chatID, err)
 	}
-	if err := a.startServe(chatID); err != nil {
+	if err := a.startServe(chatID, true); err != nil {
 		a.reply(chatID, fmt.Sprintf("切换模型失败: %v", err))
 		return
 	}
@@ -318,7 +318,7 @@ func (a *App) effortHandler(m *tgbotapi.Message, arg string) {
 		port := s.servePort
 		s.mu.Unlock()
 		if port == 0 {
-			if err := a.startServe(m.Chat.ID); err != nil {
+			if err := a.startServe(m.Chat.ID, true); err != nil {
 				a.reply(m.Chat.ID, fmt.Sprintf("启动 serve 失败: %v", err))
 				return
 			}

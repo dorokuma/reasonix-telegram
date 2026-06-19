@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"regexp"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -136,10 +137,8 @@ func loadModelsFromReasonix(bin string) {
 			display := m
 			if doc.Config.DefaultModel != "" && doc.Config.DefaultModel == id {
 				reasonixDefaultModel = id
-				display += " ⭐"
 			} else if reasonixDefaultModel == "" && p.Model != "" && m == p.Model {
 				reasonixDefaultModel = id
-				display += " ⭐"
 			}
 			availableModels = append(availableModels, struct {
 				ID   string
@@ -323,6 +322,8 @@ type App struct {
 	clarifySeq     uint64 // monotonic counter for clarify IDs
 	mode           atomic.Value // string: ModeChat or ModeTool
 	sentTextCache  sync.Map     // message_id → sent text (for reply/quote extraction)
+	sentTextCachePath string       // path to sent_text_cache.json on disk
+	sentTextCacheMu   sync.Mutex   // guards saveSentTextCache disk write
 
 	mediaGroupsMu sync.Mutex
 	mediaGroups   map[int64]map[string]*mediaGroupBatch // chatID → mediaGroupID → batch
@@ -433,6 +434,10 @@ func main() {
 	}
 	log.Printf("mode=%s workdir=%s", app.cfg.Mode, app.chatWorkdir())
 	log.Printf("telegram stream: sendMessageDraft + sendMessage finalize (TelePi/Hermes pattern)")
+
+	// Load persisted sent-text cache for reply/quote extraction across restarts.
+	app.sentTextCachePath = filepath.Join(st.dir, "sent_text_cache.json")
+	app.loadSentTextCache()
 
 	app.startRestartWatchdog()
 	app.cleanupStaleServesOnStartup()

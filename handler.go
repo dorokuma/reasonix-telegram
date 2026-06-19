@@ -236,7 +236,7 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 				lines = append(lines, fmt.Sprintf("**缓存** %.2f%%", hitRate))
 			}
 			if cumCost > 0 {
-				lines = append(lines, fmt.Sprintf("**花费** %.2f 元", cumCost))
+				lines = append(lines, fmt.Sprintf("**花费** %.4f 元", cumCost))
 			}
 		}
 		// Context usage from serve.
@@ -316,7 +316,8 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 			if quote != "" {
 				log.Printf("chat=%d: reply quote from cache msgID=%d len=%d", m.Chat.ID, m.ReplyToMessage.MessageID, len(quote))
 			} else {
-				log.Printf("chat=%d: reply cache miss msgID=%d", m.Chat.ID, m.ReplyToMessage.MessageID)
+				log.Printf("chat=%d: reply cache miss msgID=%d — trying forward fallback", m.Chat.ID, m.ReplyToMessage.MessageID)
+			quote = a.fetchMessageText(m.Chat.ID, m.ReplyToMessage.MessageID)
 			}
 		}
 		log.Printf("chat=%d: reply quote len=%d textPreview=%q captionPreview=%q fromBot=%v fromUser=%d",

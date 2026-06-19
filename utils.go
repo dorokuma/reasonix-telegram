@@ -246,6 +246,7 @@ func (a *App) recordSentText(msgID int, text string) {
 		})
 	}
 	a.sentTextCache.Store(msgID, text)
+	a.saveSentTextCache()
 }
 
 // lookupSentText retrieves the stored text for a message ID, or "" if not found.
@@ -256,4 +257,103 @@ func (a *App) lookupSentText(msgID int) string {
 		}
 	}
 	return ""
+}
+
+// saveSentTextCache writes the entire in-memory cache to disk as JSON.
+// Uses atomic write (tmp file + rename) to prevent partial-file corruption.
+// Called after every recordSentText. The file is capped at ~500 entries so
+// the write is small (~50 KB) and does not need throttling.
+func (a *App) saveSentTextCache() {
+	if a.sentTextCachePath == "" {
+		return
+	}
+	m := make(map[int]string, 500)
+	a.sentTextCache.Range(func(k, v any) bool {
+		if id, ok := k.(int); ok {
+			if s, ok := v.(string); ok {
+				m[id] = s
+			}
+		}
+		return true
+	})
+	b, err := json.Marshal(m)
+	if err != nil {
+		log.Printf("sentTextCache: marshal: %v", err)
+		return
+	}
+
+	a.sentTextCacheMu.Lock()
+	defer a.sentTextCacheMu.Unlock()
+
+	// Atomic write: tmp file → rename to prevent partial file on crash.
+	tmpPath := a.sentTextCachePath + ".tmp"
+	if err := os.WriteFile(tmpPath, b, 0o600); err != nil {
+		log.Printf("sentTextCache: write tmp %s: %v", tmpPath, err)
+		return
+	}
+	if err := os.Rename(tmpPath, a.sentTextCachePath); err != nil {
+		log.Printf("sentTextCache: rename %s → %s: %v", tmpPath, a.sentTextCachePath, err)
+	}
+}
+
+// loadSentTextCache reads the disk cache into the in-memory sync.Map.
+// Called once at startup. Errors are logged but not fatal — a missing or
+// corrupt cache file simply means we start with an empty cache.
+func (a *App) loadSentTextCache() {
+	if a.sentTextCachePath == "" {
+		return
+	}
+	disk := loadSentTextCacheFromDisk(a.sentTextCachePath)
+	for id, text := range disk {
+		a.sentTextCache.Store(id, text)
+	}
+	log.Printf("sentTextCache: loaded %d entries from %s", len(disk), a.sentTextCachePath)
+}
+
+// loadSentTextCacheFromDisk reads and parses the JSON cache file.
+// Returns nil if the file does not exist or is corrupt.
+func loadSentTextCacheFromDisk(path string) map[int]string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if !os.IsNotExist(err) {
+			log.Printf("sentTextCache: read %s: %v", path, err)
+		}
+		return nil
+	}
+	var m map[int]string
+	if err := json.Unmarshal(b, &m); err != nil {
+		log.Printf("sentTextCache: unmarshal %s: %v", path, err)
+		return nil
+	}
+	return m
+}
+
+// fetchMessageText retrieves the text of a message by temporarily forwarding
+// it and immediately deleting the copy. This is a last-resort fallback when
+// ReplyToMessage.Text is empty (sendRichMessage) and the local cache misses
+// (e.g. messages sent before the persistent cache was deployed).
+// The forward is silent (no notification) and the copy is deleted within the
+// same handler turn, so users should not notice it.
+// The retrieved text is also recorded into the sentTextCache for future lookups.
+func (a *App) fetchMessageText(chatID int64, msgID int) string {
+	fwd := tgbotapi.NewForward(chatID, chatID, msgID)
+	fwd.DisableNotification = true
+	msg, err := a.bot.Send(fwd)
+	if err != nil {
+		log.Printf("chat=%d: fetchMessageText forward %d: %v", chatID, msgID, err)
+		return ""
+	}
+	text := msg.Text
+	if text == "" {
+		text = msg.Caption
+	}
+	// Delete the forwarded copy immediately.
+	a.deleteMessage(chatID, msg.MessageID)
+	if text != "" {
+		log.Printf("chat=%d: fetchMessageText msgID=%d len=%d", chatID, msgID, len(text))
+		a.recordSentText(msgID, text)
+	} else {
+		text = "⚠️ 无法获取引用消息内容（bot 重启后旧消息的引用文本不可恢复）"
+	}
+	return text
 }

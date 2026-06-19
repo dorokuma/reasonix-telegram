@@ -213,17 +213,12 @@ func (a *App) serveRunning(s *session) bool {
 	}
 	s.mu.Lock()
 	cmd := s.serveCmd
-	port := s.servePort
+	_ = s.servePort
 	s.mu.Unlock()
 	if cmd != nil && cmd.Process != nil && cmd.ProcessState == nil {
 		return true
 	}
-	if port == 0 {
-		return false
-	}
-	// Adopt an already-listening serve (e.g. after an out-of-band restart) so the
-	// bridge does not try to bind the same port again.
-	return a.waitServeReady(port, 2*time.Second) == nil
+	return false
 }
 
 func (a *App) stopServe(chatID int64) {
@@ -274,7 +269,7 @@ func (a *App) stopSessionServe(s *session, chatID int64) {
 	}
 }
 
-func (a *App) startServe(chatID int64) error {
+func (a *App) startServe(chatID int64, skipPortCheck bool) error {
 	if err := a.ensureChatWorkdir(); err != nil {
 		return err
 	}
@@ -289,7 +284,8 @@ func (a *App) startServe(chatID int64) error {
 	s.workdir = workDir
 	sessionPath := s.sessionPath
 	port := s.servePort
-	model := s.model // per-session model override
+	sessionModel := s.model // per-session model override, persisted separately
+	model := sessionModel
 	s.mu.Unlock()
 
 	if sessionPath == "" {
@@ -327,22 +323,24 @@ func (a *App) startServe(chatID int64) error {
 	// Reasonix Resume now re-applies the boot system prompt even when the file is empty.
 	args = append(args, "--resume", sessionPath)
 
-	if err := a.waitServeReady(port, 2*time.Second); err == nil {
-		// A serve process is already listening. Check whether it was started
-		// with the same config we'd use now — if not, stop it and start fresh.
-		if a.isServeStale(port, args, workDir) {
-			log.Printf("chat=%d: existing serve stale (config mismatch), restarting", chatID)
-			a.stopServe(chatID)
-			// Wait for the old process to release the port.
-			for i := 0; i < 30; i++ {
-				if err := a.waitServeReady(port, 100*time.Millisecond); err != nil {
-					break
+	if !skipPortCheck {
+		if err := a.waitServeReady(port, 2*time.Second); err == nil {
+			// A serve process is already listening. Check whether it was started
+			// with the same config we'd use now — if not, stop it and start fresh.
+			if a.isServeStale(port, args, workDir) {
+				log.Printf("chat=%d: existing serve stale (config mismatch), restarting", chatID)
+				a.stopServe(chatID)
+				// Wait for the old process to release the port.
+				for i := 0; i < 30; i++ {
+					if err := a.waitServeReady(port, 100*time.Millisecond); err != nil {
+						break
+					}
+					time.Sleep(100 * time.Millisecond)
 				}
-				time.Sleep(100 * time.Millisecond)
+			} else {
+				log.Printf("chat=%d: adopting existing reasonix serve on %s", chatID, serveAddr(port))
+				return nil
 			}
-		} else {
-			log.Printf("chat=%d: adopting existing reasonix serve on %s", chatID, serveAddr(port))
-			return nil
 		}
 	}
 
@@ -382,7 +380,7 @@ func (a *App) startServe(chatID int64) error {
 	// mode lockdown is handled by reasonix.toml
 	log.Printf("chat=%d: serve cwd=%s config-dir=%s mode=%s", chatID, workDir, wd, a.getMode())
 	if err := a.state.upsert(chatRecord{
-		ChatID: chatID, Workdir: workDir, SessionPath: sessionPath, Port: port,
+		ChatID: chatID, Workdir: workDir, SessionPath: sessionPath, Port: port, Model: sessionModel,
 	}); err != nil {
 		log.Printf("chat=%d: persist state failed: %v", chatID, err)
 	}
@@ -403,7 +401,7 @@ func (a *App) ensureServe(chatID int64) error {
 		}
 		return nil
 	}
-	return a.startServe(chatID)
+	return a.startServe(chatID, true)
 }
 
 // startServeHealthCheck periodically checks all serve processes are alive.
@@ -430,7 +428,7 @@ func (a *App) startServeHealthCheck() {
 			a.sessMu.Unlock()
 			for _, chatID := range chatIDs {
 				log.Printf("health: chat=%d serve process dead, restarting", chatID)
-				if err := a.startServe(chatID); err != nil {
+				if err := a.startServe(chatID, false); err != nil {
 					log.Printf("health: chat=%d restart failed: %v", chatID, err)
 				}
 			}
@@ -480,7 +478,7 @@ func (a *App) restorePersistedSessions() {
 		s.cumCurrency = rec.CumCurrency
 		s.mu.Unlock()
 		go func(chatID int64) {
-			if err := a.startServe(chatID); err != nil {
+			if err := a.startServe(chatID, false); err != nil {
 				log.Printf("chat=%d: restore serve failed (will retry on next message): %v", chatID, err)
 			}
 		}(rec.ChatID)

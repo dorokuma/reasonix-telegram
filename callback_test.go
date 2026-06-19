@@ -43,12 +43,12 @@ func TestModelDisplayName(t *testing.T) {
 		ID   string
 		Name string
 	}{
-		{ID: "deepseek/deepseek-v4", Name: "deepseek-v4 ⭐"},
+		{ID: "deepseek/deepseek-v4", Name: "deepseek-v4"},
 		{ID: "custom/my-model", Name: "my-model"},
 	}
 
 	app := &App{}
-	if name := app.modelDisplayName("deepseek/deepseek-v4"); name != "deepseek-v4 ⭐" {
+	if name := app.modelDisplayName("deepseek/deepseek-v4"); name != "deepseek-v4" {
 		t.Fatalf("got %q", name)
 	}
 	if name := app.modelDisplayName("unknown/model"); name != "unknown/model" {
