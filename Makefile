@@ -1,10 +1,11 @@
 .PHONY: build install deploy push reasonix clean test vet
 
+VERSION := $(shell git describe --tags --always 2>/dev/null || echo dev)
 BINARY := reasonix-telegram
-LDFLAGS := -ldflags="-s -w"
+LDFLAGS := -s -w -X main.version=$(VERSION)
 
 build:
-	go build $(LDFLAGS) -o $(BINARY) .
+	CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o $(BINARY) .
 
 install: build
 	install -m 0755 $(BINARY) /usr/local/bin/$(BINARY)

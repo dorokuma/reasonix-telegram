@@ -4,6 +4,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -170,13 +171,30 @@ func (t *TelegramFallbackTransport) RoundTrip(req *http.Request) (*http.Response
 // original Host header (for TLS SNI and virtual hosting).
 func (t *TelegramFallbackTransport) tryIP(req *http.Request, ip string) (*http.Response, error) {
 	clone := req.Clone(req.Context())
-	// Replace URL host with IP (keep original port if present, default 443)
-	if !strings.Contains(ip, ":") {
-		clone.URL.Host = ip + ":443"
-	} else {
-		clone.URL.Host = ip
+	dialer := &net.Dialer{Timeout: 5 * time.Second}
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err == nil && (host == "api.telegram.org" || strings.HasSuffix(host, ".api.telegram.org")) {
+				addr = ip + ":" + port
+			}
+			return dialer.DialContext(ctx, network, addr)
+		},
 	}
-	// Preserve original Host for TLS SNI and Telegram's virtual hosting
-	clone.Host = "api.telegram.org"
-	return t.inner.RoundTrip(clone)
+
+	resp, err := transport.RoundTrip(clone)
+	if err != nil {
+		var token string
+		if rt, ok := t.inner.(*tokenRedactingTransport); ok {
+			token = rt.token
+		}
+		if token != "" {
+			sanitized := strings.ReplaceAll(err.Error(), token, "***")
+			if sanitized != err.Error() {
+				return resp, fmt.Errorf("%s", sanitized)
+			}
+		}
+		return resp, err
+	}
+	return resp, nil
 }

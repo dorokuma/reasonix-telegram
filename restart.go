@@ -18,11 +18,15 @@ type restartNotifyFile struct {
 	NotifyChats []int64 `json:"notify_chats"`
 }
 
+var restartNotifyMu sync.Mutex
+
 func restartNotifyPath(stateDir string) string {
 	return filepath.Join(stateDir, "restart_notify.json")
 }
 
 func saveRestartNotify(stateDir string, chatID int64) error {
+	restartNotifyMu.Lock()
+	defer restartNotifyMu.Unlock()
 	path := restartNotifyPath(stateDir)
 	var nf restartNotifyFile
 	if b, err := os.ReadFile(path); err == nil {
@@ -74,6 +78,8 @@ func writeRestartNotify(path string, nf restartNotifyFile) error {
 }
 
 func loadRestartNotify(stateDir string) ([]int64, error) {
+	restartNotifyMu.Lock()
+	defer restartNotifyMu.Unlock()
 	path := restartNotifyPath(stateDir)
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -90,6 +96,8 @@ func loadRestartNotify(stateDir string) ([]int64, error) {
 }
 
 func clearRestartNotify(stateDir string) {
+	restartNotifyMu.Lock()
+	defer restartNotifyMu.Unlock()
 	_ = os.Remove(restartNotifyPath(stateDir))
 }
 

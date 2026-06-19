@@ -93,6 +93,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		lastDraftBody  string
 		msgCreatedAt   time.Time // when first draft/stream msg was sent
 		editFailCount        int  // consecutive edit failures in this turn
+		draftFailCount       int  // consecutive draft failures in this turn
 		streamEditFallback   bool // edit flood-silenced: finalize via sendMessage tail
 		streamVisiblePrefix  string // last raw preview successfully shown (edit/draft)
 		leakProbe            strings.Builder // accumulates turn-start text for leak detection
@@ -241,6 +242,17 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		}
 	}
 
+	retireLiveDraftLocked := func(reason string) {
+		if !useDraft {
+			return
+		}
+		a.clearDraftPreview(chatID, draftID)
+		draftShown = false
+		liveDraftEver = false
+		lastDraftBody = ""
+		log.Printf("chat=%d: retired live draft (%s) draftID=%d", chatID, reason, draftID)
+	}
+
 	pushDraft := func() {
 		draftMu.Lock()
 		defer draftMu.Unlock()
@@ -255,12 +267,53 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			log.Printf("chat=%d: pushDraft skip (empty buffer)", chatID)
 			return
 		}
-		// No preview — the typing indicator is sufficient feedback.
-		// Only edit an existing stream message; never create a new one here.
+		preview := telegramPreviewTail(body, telegramMaxMessageRunes)
+		// Native drafts and edit-in-place must not mix: an open sendRichMessageDraft
+		// blocks the user's input even when the preview is invisible. Once we have
+		// a stream message to edit, stay on the edit path for this segment.
+		if useDraft && streamMsgID == 0 {
+			if preview == lastDraftBody {
+				return
+			}
+			if a.sendDraft(chatID, draftID, preview) {
+				draftFailCount = 0
+				lastDraftBody = preview
+				draftShown = true
+				liveDraftEver = true
+				s.mu.Lock()
+				s.liveDraftID = draftID
+				s.mu.Unlock()
+				if msgCreatedAt.IsZero() {
+					msgCreatedAt = time.Now()
+				}
+				return
+			}
+			draftFailCount++
+			if draftFailCount >= maxDraftFailures {
+				log.Printf("chat=%d: disabling draft stream after %d failures", chatID, draftFailCount)
+				retireLiveDraftLocked("draft_send_failed")
+				useDraft = false
+				draftID = a.nextDraftID()
+			}
+		}
 		if streamMsgID == 0 {
+			msg := newMessage(chatID, preview)
+			msg.ParseMode = "" // plain text preview; final send uses Rich Messages
+			sent, err := a.sendWithRetry(msg, chatID)
+			if err != nil {
+				log.Printf("chat=%d: stream send failed: %v", chatID, err)
+				editFailCount++
+				return
+			}
+			editFailCount = 0
+			streamMsgID = sent.MessageID
+			lastDraftBody = preview
+			streamVisiblePrefix = preview
+			if msgCreatedAt.IsZero() {
+				msgCreatedAt = time.Now()
+			}
 			return
 		}
-		preview := telegramPreviewTail(body, telegramMaxMessageRunes)
 		if streamEditFallback {
 			return
 		}
@@ -799,6 +852,31 @@ func (a *App) dismissSessionDraft(chatID int64) {
 
 // sendDraft pushes streaming preview via sendRichMessageDraft (Bot API 10.1+).
 // The same draft_id auto-animates updates. Final sendRichMessage replaces the draft.
+func (a *App) sendDraft(chatID int64, draftID int64, text string) bool {
+	text = telegramPreviewTail(text, telegramMaxMessageRunes)
+	if text == "" {
+		return false
+	}
+	_, err := a.bot.MakeRequest("sendRichMessageDraft", tgbotapi.Params{
+		"chat_id":  strconv.FormatInt(chatID, 10),
+		"draft_id": strconv.FormatInt(draftID, 10),
+		"rich_message": mustMarshal(map[string]any{
+			"markdown": text,
+		}),
+	})
+	if err != nil {
+		log.Printf("sendRichMessageDraft failed (fallback to edit): %v", err)
+		return false
+	}
+	return true
+}
 
-// dismissDraft is no longer needed — sendRichMessage replaces drafts automatically.
-// Kept as no-op for callers that haven't been migrated yet.
+func (a *App) dismissDraft(chatID int64, draftID int64) {
+	_, _ = a.bot.MakeRequest("sendRichMessageDraft", tgbotapi.Params{
+		"chat_id":  strconv.FormatInt(chatID, 10),
+		"draft_id": strconv.FormatInt(draftID, 10),
+		"rich_message": mustMarshal(map[string]any{
+			"markdown": "",
+		}),
+	})
+}

@@ -173,8 +173,11 @@ func (a *App) isSafeMediaPath(path string) bool {
 		return false
 	}
 	workdir := a.chatWorkdir()
-	if workdir != "" && strings.HasPrefix(resolved, workdir) {
-		return true
+	if workdir != "" {
+		rel, err := filepath.Rel(workdir, resolved)
+		if err == nil && !strings.HasPrefix(rel, "..") && rel != ".." {
+			return true
+		}
 	}
 	if strings.HasPrefix(resolved, "/tmp/") {
 		return true

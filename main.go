@@ -28,6 +28,8 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
+var version = "dev" // set by ldflags at build time
+
 // Telegram shows "typing…" for ~5s per sendChatAction; refresh before it expires.
 const typingRefreshInterval = 4 * time.Second
 
@@ -411,7 +413,7 @@ func main() {
 	bot.Client = &http.Client{
 		Transport: NewTelegramFallbackTransport(innerTransport, os.Getenv("TELEGRAM_FALLBACK_IPS")),
 	}
-	log.Printf("authorized as @%s (id=%d)", bot.Self.UserName, bot.Self.ID)
+	log.Printf("reasonix-telegram %s — authorized as @%s (id=%d)", version, bot.Self.UserName, bot.Self.ID)
 
 	if err := registerCommands(bot); err != nil {
 		log.Printf("warning: setMyCommands failed: %v", err)
