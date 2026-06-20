@@ -26,10 +26,7 @@ push:
 	@echo "=== pushed ==="
 
 reasonix:
-	@if [ ! -d /tmp/reasonix-src ]; then \
-		git clone --branch main-v2 https://github.com/esengine/DeepSeek-Reasonix /tmp/reasonix-src; \
-	fi
-	(cd /tmp/reasonix-src && go build -o /usr/local/bin/reasonix ./cmd/reasonix)
+	(cd ../reasonix && CGO_ENABLED=0 go build -o /usr/local/bin/reasonix ./cmd/reasonix)
 	@reasonix --version
 
 test:

@@ -165,6 +165,10 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 			"/new — 新对话",
 			"/model — 切换模型",
 			"/effort — 推理深度",
+			"**定时任务**",
+			"/cron [分] [时] [日] [月] [周] [Prompt] — 创建定时任务",
+			"/cron_list — 查看定时任务列表",
+			"/cron_del [ID] — 删除定时任务",
 			"**状态查看**",
 			"/status — 当前状态",
 			"/health — 服务状态",
@@ -176,6 +180,28 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 			"/restart — 重启桥接",
 			fmt.Sprintf("缓冲 %d 字节 · 超时 %d 分钟", a.cfg.MaxOutputBytes, a.cfg.MaxDuration),
 		}, "\n\n"))
+		return
+
+	case strings.HasPrefix(text, "/cron"):
+		if text == "/cron" || text == "/cron@"+a.bot.Self.UserName {
+			a.reply(m.Chat.ID, "用法: /cron [分] [时] [日] [月] [周] [Prompt]")
+			return
+		}
+		args := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(text, "/cron"), "@"+a.bot.Self.UserName))
+		a.handleCron(m, args)
+		return
+
+	case strings.HasPrefix(text, "/cron_list"):
+		a.handleCronList(m)
+		return
+
+	case strings.HasPrefix(text, "/cron_del"):
+		if text == "/cron_del" || text == "/cron_del@"+a.bot.Self.UserName {
+			a.reply(m.Chat.ID, "用法: /cron_del [任务ID]")
+			return
+		}
+		args := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(text, "/cron_del"), "@"+a.bot.Self.UserName))
+		a.handleCronDel(m, args)
 		return
 
 	case text == "/stop" || text == "/cancel":

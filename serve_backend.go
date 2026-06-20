@@ -149,7 +149,7 @@ type turnResult struct {
 	err error
 }
 
-func (a *App) reasonixEnv() []string {
+func (a *App) reasonixEnv(chatID int64) []string {
 	// Build a minimal environment for child processes — never inherit all
 	// parent env vars (which may contain API keys, tokens, secrets).
 	var env []string
@@ -204,6 +204,11 @@ func (a *App) reasonixEnv() []string {
 	if a.getMode() == ModeChat {
 		env = append(env, "NO_COLOR=1", "FORCE_COLOR=0", "CI=1", "TERM=dumb")
 	}
+
+	env = append(env,
+		"REASONIX_CHAT_ID="+strconv.FormatInt(chatID, 10),
+		"REASONIX_CRON_TASKS_PATH="+filepath.Join(a.state.dir, "cron_tasks.json"),
+	)
 	return env
 }
 
@@ -346,7 +351,7 @@ func (a *App) startServe(chatID int64, skipPortCheck bool) error {
 
 	cmd := exec.Command(a.cfg.ReasonixBin, args...)
 	cmd.Dir = workDir
-	cmd.Env = a.reasonixEnv()
+	cmd.Env = a.reasonixEnv(chatID)
 	// Go wires nil Stderr to /dev/null; forward serve diagnostics (RTK/CTX hit/miss) to journal.
 	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: 0}
