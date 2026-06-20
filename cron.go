@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -273,7 +274,10 @@ func (a *App) triggerCronTask(task *CronTask) {
 
 	a.reply(task.ChatID, fmt.Sprintf("⏰ 定时任务触发：正在执行 \"%s\"...", task.Prompt))
 
-	cmd := exec.Command(a.cfg.ReasonixBin, "run", "--resume", tmpPath, task.Prompt)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, a.cfg.ReasonixBin, "run", "--resume", tmpPath, task.Prompt)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		log.Printf("cron: command exec failed: %v, output: %s", err, string(out))
