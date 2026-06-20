@@ -190,15 +190,14 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			}
 			log.Printf("chat=%d draftID=%d: finalize %d part(s) total=%d runes", chatID, draftID, n, utf8.RuneCountInString(body))
 		} else {
+			hadLiveDraft := draftShown || liveDraftEver
 			if useFreshFinal && streamMsgID > 0 {
 				// Stale preview — upgrade it to rich text in-place instead of
 				// deleting + resending (avoids duplicate messages).
 				log.Printf("chat=%d: fresh final (stale preview >%ds), upgrading in-place", chatID, int(freshFinalAfter.Seconds()))
 				editID := streamMsgID
 				n = a.sendTextParts(chatID, body, &editID)
-			}
-			hadLiveDraft := draftShown || liveDraftEver
-			if streamMsgID > 0 && !useFreshFinal {
+			} else if streamMsgID > 0 {
 				if streamEditFallback {
 					tail := streamContinuationText(body, streamVisiblePrefix)
 					if tail == "" {
