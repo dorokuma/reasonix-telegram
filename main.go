@@ -448,66 +448,33 @@ func main() {
 	app.restorePersistedSessions()
 	app.notifyBridgeRestarted()
 
-	// Shutdown handling: signal → drain handlers → cancel tasks → stop serves.
-	// restarting is set first so the update loop below stops accepting new work;
-	// then msgWg is drained; remaining tasks cancelled; serves stopped.
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
-	shutdownCh := make(chan struct{})
-	go func() {
-		s := <-sig
-		log.Printf("shutdown signal: received %v, draining message handlers…", s)
-		app.restartMu.Lock()
-		app.restarting = true
-		app.restartMu.Unlock()
-
-		drainDone := make(chan struct{})
-		go func() {
-			app.msgWg.Wait()
-			close(drainDone)
-		}()
-		select {
-		case <-drainDone:
-			log.Printf("shutdown: all message handlers drained")
-		case <-time.After(3 * time.Second):
-			log.Printf("shutdown: drain timeout, proceeding with cancel")
-		}
-		app.cancelAllTasks()
-		app.waitTasksDone(10 * time.Second)
-		log.Printf("shutdown: all tasks done, stopping serves…")
-		app.stopAllServes()
-		close(shutdownCh)
-	}()
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
 
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
 	updates := bot.GetUpdatesChan(u)
 
-	for upd := range updates {
-		app.restartMu.Lock()
-		restarting := app.restarting
-		app.restartMu.Unlock()
-		if restarting {
-			break
-		}
-		if upd.Message != nil {
-			app.msgWg.Add(1)
-			go func(msg *tgbotapi.Message) {
-				defer app.msgWg.Done()
-				app.handleMessage(msg)
-			}(upd.Message)
-		}
-		if upd.CallbackQuery != nil {
-			app.msgWg.Add(1)
-			go func(query *tgbotapi.CallbackQuery) {
-				defer app.msgWg.Done()
-				app.handleCallbackQuery(query)
-			}(upd.CallbackQuery)
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("shutdown signal: flushing reasonix sessions…")
+			app.cancelAllTasks()
+			app.waitTasksDone(5 * time.Second)
+			app.stopAllServes()
+			return
+		case upd, ok := <-updates:
+			if !ok {
+				return
+			}
+			if upd.Message != nil {
+				go app.handleMessage(upd.Message)
+			}
+			if upd.CallbackQuery != nil {
+				go app.handleCallbackQuery(upd.CallbackQuery)
+			}
 		}
 	}
-	// Wait for shutdown to finish (serve processes stopped, etc).
-	<-shutdownCh
-	log.Print("shutdown complete")
 }
 
 // registerCommands tells Telegram which slash commands to surface in the
