@@ -11,7 +11,9 @@ WorkingDirectory=/root
 EnvironmentFile=/etc/reasonix-telegram.env
 ExecStart=/usr/local/bin/reasonix-telegram
 Restart=on-failure
-RestartSec=2s
+RestartSec=5s
+StartLimitBurst=5
+StartLimitIntervalSec=30s
 TimeoutStopSec=30s
 KillMode=process
 

@@ -10,9 +10,7 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"log"
-	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -311,8 +309,10 @@ type runningTask struct {
 }
 
 type App struct {
-	cfg        Config
-	bot        *tgbotapi.BotAPI
+	cfg         Config
+	bridge      PlatformBridge
+	bot         *tgbotapi.BotAPI
+	cronManager *CronManager
 	state      *stateStore
 	sessMu     sync.Mutex
 	sess       map[int64]*session
@@ -331,22 +331,6 @@ type App struct {
 	mediaGroups   map[int64]map[string]*mediaGroupBatch // chatID → mediaGroupID → batch
 
 	rateLimits sync.Map // map[int64]time.Time — per-chat last message time
-}
-
-type tokenRedactingTransport struct {
-	inner http.RoundTripper
-	token string
-}
-
-func (t *tokenRedactingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	resp, err := t.inner.RoundTrip(req)
-	if err != nil && t.token != "" {
-		sanitized := strings.ReplaceAll(err.Error(), t.token, "***")
-		if sanitized != err.Error() {
-			return resp, errors.New(sanitized)
-		}
-	}
-	return resp, err
 }
 
 // redactSecrets returns s with known secrets replaced by "***".
@@ -399,23 +383,13 @@ func main() {
 	}
 	loadModelsFromReasonix(cfg.ReasonixBin)
 
-	bot, err := tgbotapi.NewBotAPI(cfg.BotToken)
+	bridge, err := NewTelegramBridge(&cfg)
 	if err != nil {
 		log.Fatalf("telegram auth failed: %v", redactSecrets(err.Error(), cfg.secrets))
 	}
-	bot.Debug = false
-	// Wrap HTTP client to redact bot token from error logs
-	// and enable fallback transport for GFW-broken networks.
-	innerTransport := &tokenRedactingTransport{
-		inner: http.DefaultTransport,
-		token: cfg.BotToken,
-	}
-	bot.Client = &http.Client{
-		Transport: NewTelegramFallbackTransport(innerTransport, os.Getenv("TELEGRAM_FALLBACK_IPS")),
-	}
-	log.Printf("reasonix-telegram %s — authorized as @%s (id=%d)", version, bot.Self.UserName, bot.Self.ID)
+	bot := bridge.GetBot()
 
-	if err := registerCommands(bot); err != nil {
+	if err := bridge.RegisterCommands(); err != nil {
 		log.Printf("warning: setMyCommands failed: %v", err)
 	} else {
 		log.Printf("registered bot commands with Telegram")
@@ -427,6 +401,7 @@ func main() {
 	}
 	app := &App{
 		cfg:         cfg,
+		bridge:      bridge,
 		bot:         bot,
 		state:       st,
 		sess:        map[int64]*session{},
@@ -447,13 +422,14 @@ func main() {
 	app.cleanupStaleServesOnStartup()
 	app.restorePersistedSessions()
 	app.notifyBridgeRestarted()
+	app.initCron()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
-	updates := bot.GetUpdatesChan(u)
+	updates := bridge.GetUpdatesChan(u)
 
 	for {
 		select {
@@ -462,6 +438,12 @@ func main() {
 			app.cancelAllTasks()
 			app.waitTasksDone(5 * time.Second)
 			app.stopAllServes()
+			if app.cronManager != nil {
+				app.cronManager.cron.Stop()
+				if app.cronManager.watcher != nil {
+					app.cronManager.watcher.Close()
+				}
+			}
 			return
 		case upd, ok := <-updates:
 			if !ok {
@@ -475,25 +457,4 @@ func main() {
 			}
 		}
 	}
-}
-
-// registerCommands tells Telegram which slash commands to surface in the
-// client's `/` menu and the menu button. Without this, the client only
-// shows commands the local user has previously used.
-func registerCommands(bot *tgbotapi.BotAPI) error {
-	cmds := []tgbotapi.BotCommand{
-		{Command: "start", Description: "欢迎与指令说明"},
-		{Command: "help", Description: "指令说明"},
-		{Command: "status", Description: "是否在生成回复"},
-		{Command: "stop", Description: "中止当前回复"},
-		{Command: "new", Description: "开启新对话"},
-		{Command: "restart", Description: "重启桥接"},
-		{Command: "health", Description: "所有 serve 进程状态"},
-		{Command: "sessions", Description: "活跃会话列表"},
-		{Command: "chat", Description: "切换到聊天模式"},
-		{Command: "code", Description: "切换到编程模式"},
-		{Command: "model", Description: "切换模型：/model [名称]"},
-	}
-	_, err := bot.Request(tgbotapi.NewSetMyCommands(cmds...))
-	return err
 }
