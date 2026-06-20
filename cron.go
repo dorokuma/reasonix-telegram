@@ -25,6 +25,7 @@ type CronTask struct {
 	ChatID  int64        `json:"chat_id"`
 	Spec    string       `json:"spec"`
 	Prompt  string       `json:"prompt"`
+	RunOnce bool         `json:"run_once,omitempty"`
 	EntryID cron.EntryID `json:"-"`
 }
 
@@ -79,10 +80,7 @@ func (a *App) initCron() {
 	}
 }
 
-func (cm *CronManager) save() {
-	cm.mu.Lock()
-	defer cm.mu.Unlock()
-
+func (cm *CronManager) saveLocked() error {
 	var list []*CronTask
 	for _, t := range cm.tasks {
 		list = append(list, t)
@@ -90,14 +88,22 @@ func (cm *CronManager) save() {
 
 	b, err := json.MarshalIndent(list, "", "  ")
 	if err != nil {
-		log.Printf("cron: marshal tasks failed: %v", err)
-		return
+		return fmt.Errorf("marshal tasks failed: %w", err)
 	}
 
 	cm.lastFileContent = b
 
 	if err := os.WriteFile(cm.filePath, b, 0644); err != nil {
-		log.Printf("cron: write file failed: %v", err)
+		return fmt.Errorf("write file failed: %w", err)
+	}
+	return nil
+}
+
+func (cm *CronManager) save() {
+	cm.mu.Lock()
+	defer cm.mu.Unlock()
+	if err := cm.saveLocked(); err != nil {
+		log.Printf("cron: save failed: %v", err)
 	}
 }
 
@@ -221,6 +227,24 @@ func (cm *CronManager) clearTasksLocked() {
 func (a *App) triggerCronTask(task *CronTask) {
 	srcPath := a.state.sessionPathForChat(task.ChatID)
 
+	succeeded := false
+	if task.RunOnce {
+		defer func() {
+			cm := a.cronManager
+			cm.mu.Lock()
+			if t, ok := cm.tasks[task.ID]; ok {
+				cm.cron.Remove(t.EntryID)
+				delete(cm.tasks, task.ID)
+				if err := cm.saveLocked(); err != nil {
+					log.Printf("cron: run-once task %d auto-delete: save failed: %v", task.ID, err)
+				} else {
+					log.Printf("cron: run-once task %d auto-deleted (succeeded=%v)", task.ID, succeeded)
+				}
+			}
+			cm.mu.Unlock()
+		}()
+	}
+
 	tmpFile, err := os.CreateTemp("", fmt.Sprintf("cron_session_%d_*.jsonl", task.ChatID))
 	if err != nil {
 		log.Printf("cron: failed to create temp file: %v", err)
@@ -266,6 +290,7 @@ func (a *App) triggerCronTask(task *CronTask) {
 	}
 
 	a.sendTextParts(task.ChatID, result, nil)
+	succeeded = true
 }
 
 func copyFile(src, dst string) error {
@@ -337,9 +362,10 @@ func (a *App) handleCron(m *tgbotapi.Message, args string) {
 
 	task.EntryID = entryID
 	cm.tasks[taskID] = task
+	if err := cm.saveLocked(); err != nil {
+		log.Printf("cron: save after add task %d failed: %v", taskID, err)
+	}
 	cm.mu.Unlock()
-
-	cm.save()
 
 	a.reply(m.Chat.ID, fmt.Sprintf("✅ 定时任务添加成功！\n任务 ID: %d\n表达式: `%s`\nPrompt: %s", task.ID, task.Spec, task.Prompt))
 }
@@ -386,9 +412,10 @@ func (a *App) handleCronDel(m *tgbotapi.Message, args string) {
 
 	cm.cron.Remove(task.EntryID)
 	delete(cm.tasks, id)
+	if err := cm.saveLocked(); err != nil {
+		log.Printf("cron: save after delete task %d failed: %v", id, err)
+	}
 	cm.mu.Unlock()
-
-	cm.save()
 
 	a.reply(m.Chat.ID, fmt.Sprintf("✅ 定时任务 %d 已成功删除", id))
 }
