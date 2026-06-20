@@ -1,9 +1,11 @@
 package main
 
 import (
-	"bufio"
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -215,27 +217,33 @@ func (st *stateStore) cleanupOrphanSessionArtifacts() {
 
 // sessionStats reads a Reasonix session JSONL for logging resume health.
 func sessionStats(path string) (messages int, userTurns int, err error) {
-	f, err := os.Open(path)
+	data, err := os.ReadFile(path)
 	if err != nil {
 		return 0, 0, err
 	}
-	defer f.Close()
-	sc := bufio.NewScanner(f)
-	for sc.Scan() {
-		line := strings.TrimSpace(sc.Text())
-		if line == "" {
-			continue
+	if IsEncrypted(data) {
+		plain, err := Decrypt(data)
+		if err != nil {
+			return 0, 0, err
 		}
+		data = plain
+	}
+
+	dec := json.NewDecoder(bytes.NewReader(data))
+	for {
 		var m struct {
 			Role string `json:"role"`
 		}
-		if json.Unmarshal([]byte(line), &m) != nil {
-			continue
+		if err := dec.Decode(&m); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return 0, 0, err
 		}
 		messages++
 		if m.Role == "user" {
 			userTurns++
 		}
 	}
-	return messages, userTurns, sc.Err()
+	return messages, userTurns, nil
 }
