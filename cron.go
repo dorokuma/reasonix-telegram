@@ -256,8 +256,6 @@ func (a *App) triggerCronTask(task *CronTask) {
 
 	defer os.Remove(tmpPath)
 
-	a.reply(task.ChatID, fmt.Sprintf("⏰ 定时任务触发：正在执行 \"%s\"...", task.Prompt))
-
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
