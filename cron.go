@@ -244,6 +244,7 @@ func (a *App) triggerCronTask(task *CronTask) {
 	}
 
 	// 创建空 session 文件（不克隆用户会话，避免上下文污染）
+	// 写空文件（0 字节），reasonix LoadSession 遇到 EOF 返回空 session
 	tmpFile, err := os.CreateTemp("", fmt.Sprintf("cron_empty_session_%d_*.jsonl", task.ChatID))
 	if err != nil {
 		log.Printf("cron: failed to create temp file: %v", err)
@@ -251,13 +252,7 @@ func (a *App) triggerCronTask(task *CronTask) {
 		return
 	}
 	tmpPath := tmpFile.Name()
-	if _, err := tmpFile.WriteString("[]\n"); err != nil {
-		log.Printf("cron: failed to write empty session: %v", err)
-		tmpFile.Close()
-		os.Remove(tmpPath)
-		return
-	}
-	tmpFile.Close()
+	tmpFile.Close() // 空文件，不写任何内容
 
 	defer os.Remove(tmpPath)
 
