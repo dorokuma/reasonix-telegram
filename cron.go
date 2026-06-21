@@ -254,7 +254,8 @@ func (a *App) triggerCronTask(task *CronTask) {
 	tmpPath := tmpFile.Name()
 	tmpFile.Close() // 空文件，不写任何内容
 
-	defer os.Remove(tmpPath)
+	// DEBUG: keep temp files
+	// defer os.Remove(tmpPath)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
