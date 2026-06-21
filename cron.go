@@ -10,7 +10,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -287,7 +286,18 @@ func (a *App) triggerCronTask(task *CronTask) {
 
 	result := string(out)
 	result = stripANSI(result)
-	result = cleanThinking(result)
+	result = stripThinkBlocks(result)
+
+	// Filter noise lines (token stats, status dots, thinking bars, etc.)
+	lines := strings.Split(result, "\n")
+	var cleanLines []string
+	for _, line := range lines {
+		if !isReasonixNoise(strings.TrimSpace(line)) {
+			cleanLines = append(cleanLines, line)
+		}
+	}
+	result = strings.Join(cleanLines, "\n")
+	result = stripErrorLines(result)
 
 	if strings.TrimSpace(result) == "" {
 		result = "(任务执行完毕，无输出内容)"
@@ -312,13 +322,6 @@ func copyFile(src, dst string) error {
 	return err
 }
 
-func cleanThinking(s string) string {
-	re := regexp.MustCompile(`(?s)<thinking>.*?</thinking>`)
-	s = re.ReplaceAllString(s, "")
-	reUnclosed := regexp.MustCompile(`(?s)<thinking>.*$`)
-	s = reUnclosed.ReplaceAllString(s, "")
-	return strings.TrimSpace(s)
-}
 
 func parseCronCmd(args string) (spec string, prompt string, err error) {
 	fields := strings.Fields(args)
