@@ -286,7 +286,7 @@ func (a *App) triggerCronTask(task *CronTask) {
 	datePrefix := fmt.Sprintf("[系统时间：%s]\n", now.Format("2006年1月2日")+" "+weekdayMap[now.Weekday()])
 	fullPrompt := datePrefix + task.Prompt
 
-	cmd := exec.CommandContext(ctx, a.cfg.ReasonixBin, "run", "--resume", tmpPath, "--model", "deepseek-chat", fullPrompt)
+	cmd := exec.CommandContext(ctx, a.cfg.ReasonixBin, "run", "--resume", tmpPath, "--model", "deepseek-v4-flash", fullPrompt)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		log.Printf("cron: command exec failed: %v, output: %s", err, string(out))
