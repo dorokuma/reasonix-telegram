@@ -225,18 +225,18 @@ func (cm *CronManager) clearTasksLocked() {
 
 func (a *App) triggerCronTask(task *CronTask) {
 	log.Printf("cron: task %d - entering triggerCronTask, chat=%d, prompt=%q", task.ID, task.ChatID, task.Prompt)
-	succeeded := false
 	if task.RunOnce {
 		defer func() {
 			cm := a.cronManager
 			cm.mu.Lock()
+			// Only delete if the task still exists (not manually removed)
 			if t, ok := cm.tasks[task.ID]; ok {
 				cm.cron.Remove(t.EntryID)
 				delete(cm.tasks, task.ID)
 				if err := cm.saveLocked(); err != nil {
 					log.Printf("cron: run-once task %d auto-delete: save failed: %v", task.ID, err)
 				} else {
-					log.Printf("cron: run-once task %d auto-deleted (succeeded=%v)", task.ID, succeeded)
+					log.Printf("cron: run-once task %d auto-deleted", task.ID)
 				}
 			}
 			cm.mu.Unlock()
@@ -245,7 +245,7 @@ func (a *App) triggerCronTask(task *CronTask) {
 
 	// 创建空 session 文件（不克隆用户会话，避免上下文污染）
 	// 写空文件（0 字节），reasonix LoadSession 遇到 EOF 返回空 session
-	tmpFile, err := os.CreateTemp("", fmt.Sprintf("cron_empty_session_%d_*.jsonl", task.ChatID))
+	tmpFile, err := os.CreateTemp("", "cron_empty_session_*.jsonl")
 	if err != nil {
 		log.Printf("cron: failed to create temp file: %v", err)
 		a.reply(task.ChatID, "⏰ 定时任务执行失败：创建临时文件失败")
@@ -269,7 +269,7 @@ func (a *App) triggerCronTask(task *CronTask) {
 	datePrefix := fmt.Sprintf("[系统时间：%s]\n", now.Format("2006年1月2日")+" "+weekdayMap[now.Weekday()])
 	fullPrompt := datePrefix + task.Prompt
 
-	cmd := exec.CommandContext(ctx, a.cfg.ReasonixBin, "run", "--resume", tmpPath, "--model", "deepseek-v4-flash", fullPrompt)
+	cmd := exec.CommandContext(ctx, a.cfg.ReasonixBin, "run", "--resume", tmpPath, "--model", "deepseek-v4-flash", "--", fullPrompt)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		log.Printf("cron: command exec failed: %v, output: %s", err, string(out))
@@ -330,7 +330,7 @@ func (a *App) triggerCronTask(task *CronTask) {
 		result = rawStdout
 	}
 
-	log.Printf("cron: task %d raw output (%d bytes):\n%s", task.ID, len(out), string(out))
+	log.Printf("cron: task %d raw output %d bytes", task.ID, len(out))
 	log.Printf("cron: task %d final answer from jsonl=%v (%d bytes):\n%s", task.ID, finalAnswer != "", len(result), result)
 
 	if strings.TrimSpace(result) == "" {
@@ -338,13 +338,13 @@ func (a *App) triggerCronTask(task *CronTask) {
 		result = "(任务执行完毕，无输出内容)"
 	}
 
-	log.Printf("cron: task %d - result=%q (len=%d), calling sendTextParts chat=%d", task.ID, result, len(result), task.ChatID)
+	log.Printf("cron: task %d result %d bytes, calling sendTextParts", task.ID, len(result))
 	sent := a.sendTextParts(task.ChatID, result, nil)
 	log.Printf("cron: task %d - sendTextParts returned sent=%d", task.ID, sent)
 	if sent == 0 {
-		log.Printf("cron: task %d - WARNING: sendTextParts sent 0 messages, result(%d bytes)=%q", task.ID, len(result), result)
+		log.Printf("cron: task %d - WARNING: sendTextParts sent 0 messages, result %d bytes", task.ID, len(result))
 	}
-	succeeded = true
+
 }
 
 
