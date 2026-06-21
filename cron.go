@@ -276,7 +276,17 @@ func (a *App) triggerCronTask(task *CronTask) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, a.cfg.ReasonixBin, "run", "--resume", tmpPath, task.Prompt)
+	// 注入当前系统时间，避免 LLM 使用训练截止日期
+	now := time.Now()
+	weekdayMap := map[time.Weekday]string{
+		time.Sunday: "周日", time.Monday: "周一", time.Tuesday: "周二",
+		time.Wednesday: "周三", time.Thursday: "周四", time.Friday: "周五",
+		time.Saturday: "周六",
+	}
+	datePrefix := fmt.Sprintf("[系统时间：%s]\n", now.Format("2006年1月2日")+" "+weekdayMap[now.Weekday()])
+	fullPrompt := datePrefix + task.Prompt
+
+	cmd := exec.CommandContext(ctx, a.cfg.ReasonixBin, "run", "--resume", tmpPath, fullPrompt)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		log.Printf("cron: command exec failed: %v, output: %s", err, string(out))

@@ -60,21 +60,56 @@ var (
 	reStatusDot = regexp.MustCompile(`^\s*·\s+\S+:`)
 	// "  ▎ thinking" / "  ▎ ..."   (TUI bullet bar)
 	reThinkingBar = regexp.MustCompile(`^\s*[▎▌▍▏┃│]\s*(thinking|reasoning|done|working|executing|reading|writing|searching)\b`)
-	// Any line that is just whitespace after stripping
+	// "hook <name>: ..." — tool hook status lines
+	reHookLine = regexp.MustCompile(`^\s*hook\s`)
+	// "[ctx-x]" context reference lines
+	reCtxLine = regexp.MustCompile(`^\s*\[ctx`)
+	// "unknown ref"/"unknown tool" lines
+	reUnknownRef = regexp.MustCompile(`unknown (ref|tool)`)
+	// Timestamp log lines: 2026/06/21 08:25:12 INFO|WARN|ERROR|DEBUG ...
+	reLogLine = regexp.MustCompile(`^\d{4}/\d{2}/\d{2} \d{2}:\d{2}:\d{2} (INFO|WARN|ERROR|DEBUG) `)
 )
 
 // isReasonixNoise returns true if the line should be dropped before display.
 func isReasonixNoise(line string) bool {
 	trimmed := strings.TrimSpace(line)
 	if trimmed == "" {
-		return false
+		return false // 保留空行作为段落分隔
 	}
 	if strings.HasPrefix(trimmed, "❌") || strings.HasPrefix(trimmed, "✅") || strings.HasPrefix(trimmed, "ℹ️") || strings.HasPrefix(trimmed, "hook ") || strings.HasPrefix(trimmed, "[ctx]") || strings.HasPrefix(trimmed, "exit status") || strings.HasPrefix(trimmed, "command exited") || strings.HasPrefix(trimmed, "remembered") || strings.HasPrefix(trimmed, "unknown ref") || strings.HasPrefix(trimmed, "unknown tool") || strings.Contains(trimmed, "unknown tool") {
 		return true
 	}
-	return reTokenStats.MatchString(line) ||
-		reStatusDot.MatchString(line) ||
-		reThinkingBar.MatchString(line)
+	if reThinkingBar.MatchString(trimmed) {
+		return true
+	}
+	if reTokenStats.MatchString(trimmed) {
+		return true
+	}
+	if reStatusDot.MatchString(trimmed) {
+		return true
+	}
+	if reHookLine.MatchString(trimmed) {
+		return true
+	}
+	if reCtxLine.MatchString(trimmed) {
+		return true
+	}
+	if reUnknownRef.MatchString(trimmed) {
+		return true
+	}
+	// 新增：-> 开头的 tool 调用重定向行
+	if strings.HasPrefix(trimmed, "->") {
+		return true
+	}
+	// 新增：⊘ 开头的 tool 错误行
+	if strings.HasPrefix(trimmed, "⊘") {
+		return true
+	}
+	// 新增：时间戳日志行 (2026/06/21 08:25:12 INFO/WARN/ERROR)
+	if reLogLine.MatchString(trimmed) {
+		return true
+	}
+	return false
 }
 
 // Config: env-driven. Copy `.env.example` and fill in.
