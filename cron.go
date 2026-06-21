@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -226,8 +225,6 @@ func (cm *CronManager) clearTasksLocked() {
 
 func (a *App) triggerCronTask(task *CronTask) {
 	log.Printf("cron: task %d - entering triggerCronTask, chat=%d, prompt=%q", task.ID, task.ChatID, task.Prompt)
-	srcPath := a.state.sessionPathForChat(task.ChatID)
-
 	succeeded := false
 	if task.RunOnce {
 		defer func() {
@@ -246,31 +243,23 @@ func (a *App) triggerCronTask(task *CronTask) {
 		}()
 	}
 
-	tmpFile, err := os.CreateTemp("", fmt.Sprintf("cron_session_%d_*.jsonl", task.ChatID))
+	// 创建空 session 文件（不克隆用户会话，避免上下文污染）
+	tmpFile, err := os.CreateTemp("", fmt.Sprintf("cron_empty_session_%d_*.jsonl", task.ChatID))
 	if err != nil {
 		log.Printf("cron: failed to create temp file: %v", err)
 		a.reply(task.ChatID, "⏰ 定时任务执行失败：创建临时文件失败")
 		return
 	}
 	tmpPath := tmpFile.Name()
+	if _, err := tmpFile.WriteString("[]\n"); err != nil {
+		log.Printf("cron: failed to write empty session: %v", err)
+		tmpFile.Close()
+		os.Remove(tmpPath)
+		return
+	}
 	tmpFile.Close()
 
 	defer os.Remove(tmpPath)
-
-	if _, err := os.Stat(srcPath); err == nil {
-		if err := copyFile(srcPath, tmpPath); err != nil {
-			log.Printf("cron: failed to copy session file: %v", err)
-			a.reply(task.ChatID, "⏰ 定时任务执行失败：克隆会话文件失败")
-			return
-		}
-	} else {
-		f, err := os.Create(tmpPath)
-		if err != nil {
-			log.Printf("cron: failed to create empty session: %v", err)
-			return
-		}
-		f.Close()
-	}
 
 	a.reply(task.ChatID, fmt.Sprintf("⏰ 定时任务触发：正在执行 \"%s\"...", task.Prompt))
 
@@ -365,20 +354,7 @@ func (a *App) triggerCronTask(task *CronTask) {
 	succeeded = true
 }
 
-func copyFile(src, dst string) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer out.Close()
-	_, err = io.Copy(out, in)
-	return err
-}
+
 
 
 func parseCronCmd(args string) (spec string, prompt string, err error) {
