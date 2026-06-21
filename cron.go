@@ -294,6 +294,8 @@ func (a *App) triggerCronTask(task *CronTask) {
 		return
 	}
 
+	log.Printf("cron: task %d raw output (%d bytes):\n%s", task.ID, len(out), string(out))
+
 	result := string(out)
 	result = stripANSI(result)
 	result = stripThinkBlocks(result)
@@ -308,6 +310,8 @@ func (a *App) triggerCronTask(task *CronTask) {
 	}
 	result = strings.Join(cleanLines, "\n")
 	result = stripErrorLines(result)
+
+	log.Printf("cron: task %d filtered output (%d bytes):\n%s", task.ID, len(result), result)
 
 	if strings.TrimSpace(result) == "" {
 		result = "(任务执行完毕，无输出内容)"
