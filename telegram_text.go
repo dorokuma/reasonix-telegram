@@ -361,9 +361,13 @@ func newMessage(chatID int64, text string) tgbotapi.MessageConfig {
 // (with the MDV2 escape backslashes and formatting markers stripped via _stripMdv2,
 // Hermes pattern). If editFirstMsgID != nil and *editFirstMsgID > 0, the first
 // part updates that message.
-func (a *App) sendTextParts(chatID int64, text string, editFirstMsgID *int, noFileFallback ...bool) int {
+func (a *App) sendTextParts(chatID int64, text string, editFirstMsgID *int, noFileFallback ...bool) (ret int) {
+	defer func() {
+		log.Printf("chat=%d: sendTextParts returns %d", chatID, ret)
+	}()
 	text = strings.TrimSpace(text)
 	if text == "" {
+		log.Printf("chat=%d: sendTextParts called with empty text, returning 0", chatID)
 		return 0
 	}
 	// Check if file fallback is disabled (recursion guard)
@@ -410,6 +414,7 @@ func (a *App) sendFormattedParts(chatID int64, displayText string, editFirstMsgI
 	}
 	parts := splitTelegramText(displayText, telegramMaxMessageRunes)
 	if len(parts) == 0 {
+		log.Printf("chat=%d: sendFormattedParts: splitTelegramText returned 0 parts, text len=%d", chatID, len(displayText))
 		return 0
 	}
 	if editFirstMsgID != nil && *editFirstMsgID != 0 {

@@ -225,6 +225,7 @@ func (cm *CronManager) clearTasksLocked() {
 }
 
 func (a *App) triggerCronTask(task *CronTask) {
+	log.Printf("cron: task %d - entering triggerCronTask, chat=%d, prompt=%q", task.ID, task.ChatID, task.Prompt)
 	srcPath := a.state.sessionPathForChat(task.ChatID)
 
 	succeeded := false
@@ -339,6 +340,8 @@ func (a *App) triggerCronTask(task *CronTask) {
 	rawStdout = strings.Join(cleanLines, "\n")
 	rawStdout = stripErrorLines(rawStdout)
 
+	log.Printf("cron: task %d - after filtering, rawStdout len=%d", task.ID, len(rawStdout))
+
 	// 优先用 JSONL 答案
 	result := finalAnswer
 	if result == "" {
@@ -349,10 +352,16 @@ func (a *App) triggerCronTask(task *CronTask) {
 	log.Printf("cron: task %d final answer from jsonl=%v (%d bytes):\n%s", task.ID, finalAnswer != "", len(result), result)
 
 	if strings.TrimSpace(result) == "" {
+		log.Printf("cron: task %d - result is empty after processing, using fallback text", task.ID)
 		result = "(任务执行完毕，无输出内容)"
 	}
 
-	a.sendTextParts(task.ChatID, result, nil)
+	log.Printf("cron: task %d - result=%q (len=%d), calling sendTextParts chat=%d", task.ID, result, len(result), task.ChatID)
+	sent := a.sendTextParts(task.ChatID, result, nil)
+	log.Printf("cron: task %d - sendTextParts returned sent=%d", task.ID, sent)
+	if sent == 0 {
+		log.Printf("cron: task %d - WARNING: sendTextParts sent 0 messages, result(%d bytes)=%q", task.ID, len(result), result)
+	}
 	succeeded = true
 }
 
