@@ -294,24 +294,59 @@ func (a *App) triggerCronTask(task *CronTask) {
 		return
 	}
 
-	log.Printf("cron: task %d raw output (%d bytes):\n%s", task.ID, len(out), string(out))
+	// 从 session JSONL 读取最终答案
+	finalAnswer := ""
+	if data, err := os.ReadFile(tmpPath); err == nil {
+		lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+		// 从后往前找最后一条 assistant 消息
+		for i := len(lines) - 1; i >= 0; i-- {
+			line := strings.TrimSpace(lines[i])
+			if line == "" {
+				continue
+			}
+			var msg struct {
+				Role    string          `json:"role"`
+				Content json.RawMessage `json:"content"`
+			}
+			if json.Unmarshal([]byte(line), &msg) == nil && msg.Role == "assistant" {
+				// content 可能是字符串也可能是数组（tool calls）
+				var contentStr string
+				if err := json.Unmarshal(msg.Content, &contentStr); err == nil {
+					finalAnswer = contentStr
+					break
+				}
+				// 如果是数组（tool calls），跳过
+				var arr []interface{}
+				if json.Unmarshal(msg.Content, &arr) == nil {
+					continue
+				}
+			}
+		}
+	}
 
-	result := string(out)
-	result = stripANSI(result)
-	result = stripThinkBlocks(result)
+	rawStdout := string(out)
+	rawStdout = stripANSI(rawStdout)
+	rawStdout = stripThinkBlocks(rawStdout)
 
 	// Filter noise lines (token stats, status dots, thinking bars, etc.)
-	lines := strings.Split(result, "\n")
+	lines := strings.Split(rawStdout, "\n")
 	var cleanLines []string
 	for _, line := range lines {
 		if !isReasonixNoise(strings.TrimSpace(line)) {
 			cleanLines = append(cleanLines, line)
 		}
 	}
-	result = strings.Join(cleanLines, "\n")
-	result = stripErrorLines(result)
+	rawStdout = strings.Join(cleanLines, "\n")
+	rawStdout = stripErrorLines(rawStdout)
 
-	log.Printf("cron: task %d filtered output (%d bytes):\n%s", task.ID, len(result), result)
+	// 优先用 JSONL 答案
+	result := finalAnswer
+	if result == "" {
+		result = rawStdout
+	}
+
+	log.Printf("cron: task %d raw output (%d bytes):\n%s", task.ID, len(out), string(out))
+	log.Printf("cron: task %d final answer from jsonl=%v (%d bytes):\n%s", task.ID, finalAnswer != "", len(result), result)
 
 	if strings.TrimSpace(result) == "" {
 		result = "(任务执行完毕，无输出内容)"
