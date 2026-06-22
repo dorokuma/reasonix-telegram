@@ -5,10 +5,10 @@ BINARY := reasonix-telegram
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
 build:
-	CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o $(BINARY) .
+	CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o /usr/local/bin/$(BINARY) .
 
 install: build
-	install -m 0755 $(BINARY) /usr/local/bin/$(BINARY)
+	chmod 0755 /usr/local/bin/$(BINARY)
 	systemctl daemon-reload
 	systemctl enable --now reasonix-telegram
 	@echo "tail logs: journalctl -u reasonix-telegram -f"
