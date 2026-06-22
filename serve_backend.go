@@ -107,8 +107,12 @@ type wireUsage struct {
 	Currency         string  `json:"currency,omitempty"`
 	CostUSD          float64 `json:"costUsd,omitempty"`
 	// Session-cumulative cache stats (sent by serve, per-turn fields dropped).
-	SessionCacheHitTokens  int `json:"sessionCacheHitTokens,omitempty"`
-	SessionCacheMissTokens int `json:"sessionCacheMissTokens,omitempty"`
+	SessionCacheHitTokens  int     `json:"sessionCacheHitTokens,omitempty"`
+	SessionCacheMissTokens int     `json:"sessionCacheMissTokens,omitempty"`
+	SessionCost            float64 `json:"sessionCost,omitempty"`
+	SessionCurrency        string  `json:"sessionCurrency,omitempty"`
+	SessionPromptTokens    int     `json:"sessionPromptTokens,omitempty"`
+	SessionTotalTokens     int     `json:"sessionTotalTokens,omitempty"`
 }
 
 // wireEvent mirrors reasonix serve SSE JSON (internal/serve/wire.go).

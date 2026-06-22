@@ -591,14 +591,29 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				a.sendSafe(msg)
 			},
 			func(u wireUsage) {
-				// onUsage: accumulate session totals + store latest for /status.
+				// onUsage: use session-cumulative values (include sub-agent/planner stats).
 				s.mu.Lock()
 				s.lastUsage = u
-				s.cumPrompt += u.PromptTokens
-				s.cumCompletion += u.CompletionTokens
-				s.cumTotal += u.TotalTokens
-				s.cumCost += u.Cost
-				if u.Currency != "" {
+				// Use session-cumulative fields when available (they include sub-agent
+				// and planner token consumption); fall back to single-turn accumulation
+				// for older serve versions that don't send session-cumulative tokens.
+				if u.SessionPromptTokens > 0 || u.SessionTotalTokens > 0 {
+					s.cumPrompt = u.SessionPromptTokens
+					s.cumTotal = u.SessionTotalTokens
+					s.cumCompletion = s.cumTotal - s.cumPrompt
+				} else {
+					s.cumPrompt += u.PromptTokens
+					s.cumCompletion += u.CompletionTokens
+					s.cumTotal += u.TotalTokens
+				}
+				if u.SessionCost > 0 {
+					s.cumCost = u.SessionCost
+				} else {
+					s.cumCost += u.Cost
+				}
+				if u.SessionCurrency != "" {
+					s.cumCurrency = u.SessionCurrency
+				} else if u.Currency != "" {
 					s.cumCurrency = u.Currency
 				}
 				// Persist cumulative values so they survive restart.
