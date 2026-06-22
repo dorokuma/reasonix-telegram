@@ -25,7 +25,7 @@ func (a *App) workDir() string {
 // ensureUserRulesLinked creates symlinks for AGENTS.md and REASONIX.md into /root
 // so that Reasonix can read rules and write memory within its project scope.
 func (a *App) ensureUserRulesLinked() error {
-	a.linkUserRulesIntoWD("/root")
+	a.linkUserRulesIntoWD(a.workDir())
 	return nil
 }
 

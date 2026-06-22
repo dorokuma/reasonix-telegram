@@ -260,15 +260,6 @@ func (a *App) stopSessionServe(s *session, chatID int64) {
 		log.Printf("chat=%d: stopping serve (pid %d)", chatID, cmd.Process.Pid)
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 
-		// Wait for port to be released before proceeding to Wait.
-		deadline := time.Now().Add(10 * time.Second)
-		for time.Now().Before(deadline) {
-			if !isPortInUse(port) {
-				break
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
-
 		waitDone := make(chan struct{})
 		go func() {
 			_, _ = cmd.Process.Wait()
@@ -280,6 +271,15 @@ func (a *App) stopSessionServe(s *session, chatID int64) {
 		case <-time.After(5 * time.Second):
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 			<-waitDone
+		}
+
+		// Wait for port to be released after the process has exited.
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if !isPortInUse(port) {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
 		}
 	} else if port > 0 {
 		// Untracked serve (adopted from a previous bridge instance).
@@ -409,7 +409,6 @@ func (a *App) startServe(chatID int64, skipPortCheck bool) error {
 		a.stopServe(chatID)
 		return err
 	}
-	// mode lockdown is handled by reasonix.toml
 	log.Printf("chat=%d: serve cwd=%s mode=%s", chatID, workDir, a.getMode())
 	if err := a.state.upsert(chatRecord{
 		ChatID: chatID, Workdir: workDir, SessionPath: sessionPath, Port: port, Model: sessionModel,
