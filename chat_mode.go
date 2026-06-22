@@ -9,62 +9,23 @@ import (
 
 const chatWorkdirSubdir = "chat-wd"
 
-// chatReasonixToml is written into the dedicated chat workdir on every bridge
-// start. Only technical lockdown (tools/plugins/LSP) — no system_prompt,
-// persona, or agent behavior overrides; the user's own rules apply via Reasonix.
-const chatReasonixToml = `# reasonix-telegram: chat mode — tool lockdown (managed by the bridge)
-[tools]
-enabled = ["none"]
-
-[lsp]
-enabled = false
-`
-
-// toolReasonixToml is used in tool/code mode — tools and LSP are
-// all available.
-const toolReasonixToml = `# reasonix-telegram: tool mode — full tools (managed by the bridge)
-`
-
 func (a *App) chatWorkdir() string {
 	return filepath.Join(a.cfg.StateDir, chatWorkdirSubdir)
 }
 
 // workDir returns the agent's tool workspace directory.
-// When WORK_DIR is set, it decouples the workspace from the config directory
-// (chat-wd); otherwise falls back to chat-wd for backward compatibility.
+// When WORK_DIR is set, it returns that; otherwise defaults to "/root".
 func (a *App) workDir() string {
 	if a.cfg.WorkDir != "" {
 		return a.cfg.WorkDir
 	}
-	return a.chatWorkdir()
+	return "/root"
 }
 
-// ensureChatWorkdir prepares the per-chat reasonix workdir and writes a
-// per-mode reasonix.toml that overrides the global config (reasonix.toml
-// in the cwd wins over ~/.config/reasonix/config.toml). Without this, the
-// chat-mode tool lockdown defined in chatReasonixToml is dead code.
-func (a *App) ensureChatWorkdir() error {
-	wd := a.chatWorkdir()
-	if err := os.MkdirAll(wd, 0o755); err != nil {
-		return err
-	}
-	content := chatReasonixToml
-	if a.getMode() == ModeTool {
-		content = toolReasonixToml
-	}
-	tomlPath := filepath.Join(wd, "reasonix.toml")
-	if err := os.WriteFile(tomlPath, []byte(content), 0o644); err != nil {
-		return err
-	}
-	// 写回验证：确保写入内容可读回匹配
-	if readBack, err := os.ReadFile(tomlPath); err != nil {
-		log.Printf("chat-wd: write-verify read failed: %v", err)
-		return err
-	} else if string(readBack) != content {
-		log.Printf("chat-wd: write-verify mismatch (got %d bytes, want %d)", len(readBack), len(content))
-		return os.ErrInvalid
-	}
-	a.linkUserRulesIntoChatWD(wd)
+// ensureUserRulesLinked creates symlinks for AGENTS.md and REASONIX.md into /root
+// so that Reasonix can read rules and write memory within its project scope.
+func (a *App) ensureUserRulesLinked() error {
+	a.linkUserRulesIntoWD("/root")
 	return nil
 }
 
@@ -76,7 +37,7 @@ func defaultRulesFile() string {
 		if st, err := os.Stat(src); err == nil && st.Mode().IsRegular() {
 			return src
 		}
-		log.Printf("chat-wd: CHAT_RULES_FILE %q not found or not a regular file, skipping", src)
+		log.Printf("link-rules: CHAT_RULES_FILE %q not found or not a regular file, skipping", src)
 		return ""
 	}
 	home, err := os.UserHomeDir()
@@ -90,22 +51,22 @@ func defaultRulesFile() string {
 	return ""
 }
 
-// linkUserRulesIntoChatWD symlinks rules and memory files into chat-wd
+// linkUserRulesIntoWD symlinks rules and memory files into the given directory
 // so Reasonix can read rules and write memory within its project scope.
-func (a *App) linkUserRulesIntoChatWD(wd string) {
+func (a *App) linkUserRulesIntoWD(wd string) {
 	// Clean stale links for files that should be symlinks, not local copies.
 	// REASONIX.md is NOT cleaned — it's the memory file that reasonix may write
 	// to; removing it would discard remembers.
 	for _, stale := range []string{"AGENTS.md", "CLAUDE.md"} {
 		if err := os.Remove(filepath.Join(wd, stale)); err != nil && !os.IsNotExist(err) {
-			log.Printf("chat-wd: remove stale %s: %v", stale, err)
+			log.Printf("link-rules: remove stale %s: %v", stale, err)
 		}
 	}
 	// Symlink AGENTS.md (rules, read-only source).
 	if src := defaultRulesFile(); src != "" {
 		link := filepath.Join(wd, "AGENTS.md")
 		if err := os.Symlink(src, link); err != nil {
-			log.Printf("chat-wd: symlink %s -> %s: %v", link, src, err)
+			log.Printf("link-rules: symlink %s -> %s: %v", link, src, err)
 		}
 	}
 	// Symlink REASONIX.md (memory, writable — reasonix writes remembers here).
@@ -116,10 +77,10 @@ func (a *App) linkUserRulesIntoChatWD(wd string) {
 	// Remove stale regular file so symlink can replace it.
 	if st, err := os.Lstat(memLink); err == nil && st.Mode().IsRegular() {
 		if err := os.Remove(memLink); err != nil {
-			log.Printf("chat-wd: remove stale REASONIX.md: %v", err)
+			log.Printf("link-rules: remove stale REASONIX.md: %v", err)
 		}
 	} else if err != nil && !os.IsNotExist(err) {
-		log.Printf("chat-wd: stat REASONIX.md: %v", err)
+		log.Printf("link-rules: stat REASONIX.md: %v", err)
 	}
 	if err := os.MkdirAll(memDir, 0o755); err == nil {
 		// Ensure the target exists so the symlink isn't dangling.
@@ -127,7 +88,7 @@ func (a *App) linkUserRulesIntoChatWD(wd string) {
 			_ = os.WriteFile(memFile, nil, 0o600)
 		}
 		if err := os.Symlink(memFile, memLink); err != nil {
-			log.Printf("chat-wd: symlink %s -> %s: %v", memLink, memFile, err)
+			log.Printf("link-rules: symlink %s -> %s: %v", memLink, memFile, err)
 		}
 	}
 }

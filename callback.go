@@ -63,7 +63,7 @@ func (a *App) modeHandler(m *tgbotapi.Message, arg string) {
 	// Stop existing serve, switch mode, rewrite toml, restart.
 	a.stopServe(m.Chat.ID)
 	a.setMode(newMode)
-	_ = a.ensureChatWorkdir()
+	_ = a.ensureUserRulesLinked()
 	if err := a.startServe(m.Chat.ID, true); err != nil {
 		a.reply(m.Chat.ID, fmt.Sprintf("切换模式失败: %v", err))
 		return

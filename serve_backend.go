@@ -65,9 +65,9 @@ func (a *App) isServeStale(port int, expectedArgs []string, expectedCWD string) 
 		if readProcCWD(pid) != expectedCWD {
 			return true
 		}
-		// Build expected cmdline suffix: "serve --addr ... --model ... --config-dir ... --resume ...".
+		// Build expected cmdline suffix: "serve --addr ... --model ... --resume ...".
 		// We check every expected arg is present in the actual cmdline. This catches
-		// missing --config-dir, different --model, different binary path, etc.
+		// a different --model, different binary path, etc.
 		expectedSuffix := strings.Join(expectedArgs, " ")
 		if !strings.Contains(cmdline, expectedSuffix) {
 			return true
@@ -275,7 +275,7 @@ func (a *App) stopSessionServe(s *session, chatID int64) {
 }
 
 func (a *App) startServe(chatID int64, skipPortCheck bool) error {
-	if err := a.ensureChatWorkdir(); err != nil {
+	if err := a.ensureUserRulesLinked(); err != nil {
 		return err
 	}
 	s := a.getOrCreateSession(chatID)
@@ -284,8 +284,7 @@ func (a *App) startServe(chatID int64, skipPortCheck bool) error {
 		s.mu.Unlock()
 		return nil
 	}
-	wd := a.chatWorkdir()            // config directory (reasonix.toml lives here)
-	workDir := a.workDir()           // tool workspace (default = chat-wd for backward compat)
+	workDir := a.workDir()           // tool workspace; default /root
 	s.workdir = workDir
 	sessionPath := s.sessionPath
 	port := s.servePort
@@ -318,11 +317,6 @@ func (a *App) startServe(chatID int64, skipPortCheck bool) error {
 	}
 	if model != "" {
 		args = append(args, "--model", model)
-	}
-	// When workDir differs from config directory, point Reasonix at the config
-	// location explicitly so it picks up mode lockdown / rules from chat-wd.
-	if workDir != wd {
-		args = append(args, "--config-dir", wd)
 	}
 	// Always --resume so auto-save stays on sessionPath (not ~/.config/reasonix/sessions).
 	// Reasonix Resume now re-applies the boot system prompt even when the file is empty.
@@ -383,7 +377,7 @@ func (a *App) startServe(chatID int64, skipPortCheck bool) error {
 		return err
 	}
 	// mode lockdown is handled by reasonix.toml
-	log.Printf("chat=%d: serve cwd=%s config-dir=%s mode=%s", chatID, workDir, wd, a.getMode())
+	log.Printf("chat=%d: serve cwd=%s mode=%s", chatID, workDir, a.getMode())
 	if err := a.state.upsert(chatRecord{
 		ChatID: chatID, Workdir: workDir, SessionPath: sessionPath, Port: port, Model: sessionModel,
 	}); err != nil {

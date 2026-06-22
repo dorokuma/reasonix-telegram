@@ -56,7 +56,7 @@ func TestGetOrCreateSession(t *testing.T) {
 		sess:  map[int64]*session{},
 	}
 	app.setMode(ModeChat)
-	_ = app.ensureChatWorkdir()
+	_ = app.ensureUserRulesLinked()
 
 	s1 := app.getOrCreateSession(123)
 	if s1 == nil {

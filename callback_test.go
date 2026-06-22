@@ -103,9 +103,9 @@ func TestSessionsHandlerNoPanic(t *testing.T) {
 		sess: map[int64]*session{},
 	}
 	app.setMode(ModeTool)
-	// Ensure chatWorkdir is set so ensureChatWorkdir doesn't fail
+	// Ensure rules are linked so ensureUserRulesLinked doesn't fail
 	app.cfg.StateDir = t.TempDir()
-	_ = app.ensureChatWorkdir()
+	_ = app.ensureUserRulesLinked()
 
 	// Just verify sessionsHandler body doesn't panic when sess is empty.
 	// The full function needs a real bot, so we test the map access only.

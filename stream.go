@@ -818,6 +818,7 @@ func (a *App) clearDraftPreview(chatID int64, draftID int64) {
 	if draftID == 0 {
 		return
 	}
+	a.dismissDraft(chatID, draftID)
 	a.clearSessionDraft(chatID, draftID)
 }
 
@@ -845,8 +846,12 @@ func (a *App) clearSessionDraft(chatID int64, draftID int64) {
 func (a *App) dismissSessionDraft(chatID int64) {
 	s := a.getOrCreateSession(chatID)
 	s.mu.Lock()
+	draftID := s.liveDraftID
 	s.liveDraftID = 0
 	s.mu.Unlock()
+	if draftID != 0 {
+		a.dismissDraft(chatID, draftID)
+	}
 }
 
 // sendDraft pushes streaming preview via sendRichMessageDraft (Bot API 10.1+).

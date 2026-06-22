@@ -208,7 +208,7 @@ type Config struct {
 	Mode     string // MODE: "chat" (default, tools locked) or "tool" (full agent access)
 	DeepSeekKey string // read from /etc/reasonix-api.env, never in os.Environ
 	NotificationMode string // NOTIFICATION_MODE: "important" (default) or "all"
-	WorkDir string // WORK_DIR: reasonix serve working directory (tool workspace); default = chat-wd
+	WorkDir string // WORK_DIR: reasonix serve working directory (tool workspace); default = /root
 	secrets []string // collected at startup for log redaction
 }
 
@@ -443,8 +443,8 @@ func main() {
 		mediaGroups: map[int64]map[string]*mediaGroupBatch{},
 	}
 	app.setMode(cfg.Mode)
-	if err := app.ensureChatWorkdir(); err != nil {
-		log.Fatalf("chat workdir: %v", err)
+	if err := app.ensureUserRulesLinked(); err != nil {
+		log.Fatalf("link user rules: %v", err)
 	}
 	log.Printf("mode=%s workdir=%s", app.cfg.Mode, app.chatWorkdir())
 	log.Printf("telegram stream: sendMessageDraft + sendMessage finalize (TelePi/Hermes pattern)")
