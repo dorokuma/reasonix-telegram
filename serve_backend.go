@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -36,6 +37,16 @@ func serveAddr(port int) string {
 
 func serveBaseURL(port int) string {
 	return fmt.Sprintf("http://%s", serveAddr(port))
+}
+
+// isPortInUse checks whether a TCP port is already in use by trying to listen on it.
+func isPortInUse(port int) bool {
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return true
+	}
+	ln.Close()
+	return false
 }
 
 // readProcCWD reads a process's current working directory from /proc/PID/cwd.
@@ -244,6 +255,16 @@ func (a *App) stopSessionServe(s *session, chatID int64) {
 		// so the serve process can flush its session JSONL and exit cleanly.
 		log.Printf("chat=%d: stopping serve (pid %d)", chatID, cmd.Process.Pid)
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
+
+		// Wait for port to be released before proceeding to Wait.
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) {
+			if !isPortInUse(port) {
+				break
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+
 		waitDone := make(chan struct{})
 		go func() {
 			_, _ = cmd.Process.Wait()
@@ -268,6 +289,14 @@ func (a *App) stopSessionServe(s *session, chatID int64) {
 			cmdline := readProcCmdline(pid)
 			if isReasonixServeCmd(cmdline, a.cfg.ReasonixBin) {
 				terminateProcessGroup(pid, 8*time.Second)
+				// Wait for port to be released before returning.
+				deadline := time.Now().Add(10 * time.Second)
+				for time.Now().Before(deadline) {
+					if !isPortInUse(port) {
+						break
+					}
+					time.Sleep(100 * time.Millisecond)
+				}
 				break
 			}
 		}
