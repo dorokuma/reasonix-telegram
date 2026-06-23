@@ -41,6 +41,11 @@ func (a *App) downloadTelegramFile(fileID string, ext string, category string, c
 		return "", fmt.Errorf("getFile: %w", err)
 	}
 
+	const maxDownloadSize = 50 * 1024 * 1024 // 50MB limit
+	if tf.FileSize > maxDownloadSize {
+		return "", fmt.Errorf("file size %d exceeds limit of %d bytes", tf.FileSize, maxDownloadSize)
+	}
+
 	dir := a.cacheDir(category, chatID)
 	localPath := filepath.Join(dir, fileID+ext)
 
@@ -71,9 +76,15 @@ func (a *App) downloadTelegramFile(fileID string, ext string, category string, c
 	}
 	defer f.Close()
 
-	if _, err := io.Copy(f, resp.Body); err != nil {
+	limitReader := io.LimitReader(resp.Body, maxDownloadSize+1)
+	written, err := io.Copy(f, limitReader)
+	if err != nil {
 		os.Remove(localPath)
 		return "", fmt.Errorf("write: %w", err)
+	}
+	if written > maxDownloadSize {
+		os.Remove(localPath)
+		return "", fmt.Errorf("file size exceeds limit of %d bytes", maxDownloadSize)
 	}
 
 	// LRU cleanup: remove oldest files if over limit

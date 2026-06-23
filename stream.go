@@ -127,7 +127,8 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		if streamDone {
 			return
 		}
-		if draftShown || liveDraftEver {
+		hadPreview := draftShown || liveDraftEver
+		if hadPreview {
 			a.clearDraftPreview(chatID, draftID)
 			draftShown = false
 			liveDraftEver = false
@@ -158,11 +159,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			return
 		}
 		if body == "" {
-			hadPreview := false
 			if hadPreview {
-				a.clearDraftPreview(chatID, draftID)
-				draftShown = false
-				liveDraftEver = false
 				lastDraftBody = ""
 			}
 			streamDone = true
@@ -387,7 +384,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				}
 				if !leakDecided {
 					probe := leakProbe.String() + chunk
-					decision := detectThinkingLeak(probe)
+					decision := detectThinkingLeak(probe, false)
 					switch decision {
 					case leakDrop:
 						leakDetected = true
@@ -414,6 +411,18 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			signalFlush,
 			func() {
 				// onToolDispatch: finalize current text segment and start fresh
+				bufMu.Lock()
+				if !leakDecided {
+					probe := leakProbe.String()
+					if probe != "" {
+						decision := detectThinkingLeak(probe, true)
+						if decision == leakKeep {
+							appendChunk(&buf, probe, a.cfg.MaxOutputBytes, &truncated)
+						}
+						leakDecided = true
+					}
+				}
+				bufMu.Unlock()
 				select {
 				case newSegment <- struct{}{}:
 				default:
@@ -632,6 +641,18 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				s.mu.Unlock()
 			},
 		)
+		bufMu.Lock()
+		if !leakDecided {
+			probe := leakProbe.String()
+			if probe != "" {
+				decision := detectThinkingLeak(probe, true)
+				if decision == leakKeep {
+					appendChunk(&buf, probe, a.cfg.MaxOutputBytes, &truncated)
+				}
+				leakDecided = true
+			}
+		}
+		bufMu.Unlock()
 	}()
 
 	pusherDone := make(chan struct{})

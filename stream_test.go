@@ -182,15 +182,15 @@ func TestDetectThinkingLeak(t *testing.T) {
 		strings.Repeat("a", 301),
 	}
 	for _, s := range drop {
-		got := detectThinkingLeak(s)
+		got := detectThinkingLeak(s, false)
 		if got != leakDrop {
-			t.Fatalf("detectThinkingLeak(%q) = %v, want leakDrop", s, got)
+			t.Fatalf("detectThinkingLeak(%q, false) = %v, want leakDrop", s, got)
 		}
 	}
 	for _, s := range keep {
-		got := detectThinkingLeak(s)
+		got := detectThinkingLeak(s, false)
 		if got != leakKeep {
-			t.Fatalf("detectThinkingLeak(%q) = %v, want leakKeep", s, got)
+			t.Fatalf("detectThinkingLeak(%q, false) = %v, want leakKeep", s, got)
 		}
 	}
 	// Undecided: short English without leak opener and no Chinese
@@ -204,9 +204,15 @@ func TestDetectThinkingLeak(t *testing.T) {
 		"https://example.com",
 	}
 	for _, s := range undecided {
-		got := detectThinkingLeak(s)
+		got := detectThinkingLeak(s, false)
 		if got != leakUndecided {
-			t.Fatalf("detectThinkingLeak(%q) = %v, want leakUndecided", s, got)
+			t.Fatalf("detectThinkingLeak(%q, false) = %v, want leakUndecided", s, got)
+		}
+
+		// On EOF, undecided short replies should be kept.
+		gotEOF := detectThinkingLeak(s, true)
+		if gotEOF != leakKeep {
+			t.Fatalf("detectThinkingLeak(%q, true) = %v, want leakKeep", s, gotEOF)
 		}
 	}
 }

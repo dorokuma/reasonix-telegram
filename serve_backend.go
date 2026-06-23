@@ -650,6 +650,16 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 	}
 	defer resp.Body.Close()
 
+	ctxDoneChan := make(chan struct{})
+	defer close(ctxDoneChan)
+	go func() {
+		select {
+		case <-ctx.Done():
+			resp.Body.Close()
+		case <-ctxDoneChan:
+		}
+	}()
+
 	var turnErr error
 	var gotTextDelta bool
 	var cancelOnce sync.Once
@@ -973,7 +983,7 @@ func hasChineseRune(s string) bool {
 // it is a thinking-leak (English chain-of-thought), normal content, or still
 // undetermined. The probe is limited to ~300 bytes; once that is exceeded
 // without a leak signal, the content is kept.
-func detectThinkingLeak(probe string) leakDecision {
+func detectThinkingLeak(probe string, isEOF bool) leakDecision {
 	// Strip ANSI/noise before examining.
 	clean := stripANSI(probe)
 	clean = stripThinkBlocks(clean)
@@ -995,6 +1005,9 @@ func detectThinkingLeak(probe string) leakDecision {
 	// 300 bytes of pure ASCII without a Chinese rune or leak opener is
 	// likely code or a non-thinking English reply — let it through.
 	if len(trimmed) > 300 {
+		return leakKeep
+	}
+	if isEOF {
 		return leakKeep
 	}
 	return leakUndecided

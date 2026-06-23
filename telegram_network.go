@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -167,6 +168,17 @@ func (t *TelegramFallbackTransport) RoundTrip(req *http.Request) (*http.Response
 	return nil, fmt.Errorf("all Telegram endpoints exhausted (tried %d fallback IPs)", len(t.fallbackIPs))
 }
 
+type bodyWithCloseHook struct {
+	io.ReadCloser
+	hook func()
+}
+
+func (b *bodyWithCloseHook) Close() error {
+	err := b.ReadCloser.Close()
+	b.hook()
+	return err
+}
+
 // tryIP sends the request to a specific IP address while preserving the
 // original Host header (for TLS SNI and virtual hosting).
 func (t *TelegramFallbackTransport) tryIP(req *http.Request, ip string) (*http.Response, error) {
@@ -184,6 +196,7 @@ func (t *TelegramFallbackTransport) tryIP(req *http.Request, ip string) (*http.R
 
 	resp, err := transport.RoundTrip(clone)
 	if err != nil {
+		transport.CloseIdleConnections()
 		var token string
 		if rt, ok := t.inner.(*tokenRedactingTransport); ok {
 			token = rt.token
@@ -195,6 +208,10 @@ func (t *TelegramFallbackTransport) tryIP(req *http.Request, ip string) (*http.R
 			}
 		}
 		return resp, err
+	}
+	resp.Body = &bodyWithCloseHook{
+		ReadCloser: resp.Body,
+		hook:       transport.CloseIdleConnections,
 	}
 	return resp, nil
 }
