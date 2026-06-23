@@ -361,6 +361,7 @@ type App struct {
 	sentTextCache  sync.Map     // message_id → sent text (for reply/quote extraction)
 	sentTextCachePath string       // path to sent_text_cache.json on disk
 	sentTextCacheMu   sync.Mutex   // guards saveSentTextCache disk write
+	stickerMu         sync.Mutex   // guards stickerCache load/save/handle
 
 	mediaGroupsMu sync.Mutex
 	mediaGroups   map[int64]map[string]*mediaGroupBatch // chatID → mediaGroupID → batch

@@ -69,6 +69,9 @@ func (a *App) handleSticker(m *tgbotapi.Message) string {
 		return ""
 	}
 
+	a.stickerMu.Lock()
+	defer a.stickerMu.Unlock()
+
 	fileUniqueID := m.Sticker.FileUniqueID
 	emoji := m.Sticker.Emoji
 	setName := m.Sticker.SetName
