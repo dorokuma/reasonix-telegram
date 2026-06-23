@@ -7,11 +7,14 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
+
+var seenMsgs sync.Map // inbound message_id dedup
 
 func (a *App) handleMessage(m *tgbotapi.Message) {
 	if m.From == nil {
@@ -25,6 +28,14 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 		}
 	}
 	a.rateLimits.Store(m.Chat.ID, time.Now())
+	// Inbound message_id dedup: drop duplicate Telegram updates.
+	if m.MessageID != 0 {
+		if _, ok := seenMsgs.Load(m.MessageID); ok {
+			log.Printf("chat=%d: duplicate message %d ignored", m.Chat.ID, m.MessageID)
+			return
+		}
+		seenMsgs.Store(m.MessageID, true)
+	}
 	if !a.allowed(m.From) {
 		a.reply(m.Chat.ID, "⛔ 无权使用此机器人")
 		return
@@ -53,22 +64,47 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 
 	// Handle non-batched media (photo, document, video, GIF, voice, audio)
 	// and stickers. Build a prompt fragment describing the content.
-	parts := ""
-	if mp := a.handleIncomingMedia(m); mp != "" {
-		parts = mp
-	}
-	if sp := a.handleSticker(m); sp != "" {
-		if parts != "" {
-			parts += "\n" + sp
-		} else {
-			parts = sp
+	var parts strings.Builder
+	var mediaDataURLs []string
+	if mr := a.handleIncomingMedia(m); mr.Text != "" {
+		parts.WriteString(mr.Text)
+		log.Printf("chat=%d: mediaResult.Text len=%d, DataURLs len=%d", m.Chat.ID, len(mr.Text), len(mr.DataURLs))
+		if len(mr.DataURLs) > 0 {
+			mediaDataURLs = mr.DataURLs
 		}
 	}
-	if parts != "" {
-		if text != "" {
-			text = parts + "\n" + text
+	if sp := a.handleSticker(m); sp != "" {
+		if parts.Len() > 0 {
+			parts.WriteString("\n")
+		}
+		parts.WriteString(sp)
+	}
+
+	// Embed multimodal data URLs directly in the text using a marker that
+	// the reasonix agent will parse and convert to image Parts. This avoids
+	// changing the HTTP API between bridge and reasonix serve.
+	if len(mediaDataURLs) > 0 {
+		log.Printf("chat=%d: embedding %d data URLs", m.Chat.ID, len(mediaDataURLs))
+		if parts.Len() > 0 {
+			// Insert media markers after the description but before user text
+			mediaBlock := "\n"
+			for _, du := range mediaDataURLs {
+				mediaBlock += "[REASONIX_IMAGE:" + du + "]\n"
+			}
+			parts.WriteString(mediaBlock)
 		} else {
-			text = parts
+			for _, du := range mediaDataURLs {
+				parts.WriteString("[REASONIX_IMAGE:" + du + "]\n")
+			}
+		}
+	}
+
+	if parts.Len() > 0 {
+		prelude := strings.TrimSpace(parts.String())
+		if text != "" {
+			text = prelude + "\n" + text
+		} else {
+			text = prelude
 		}
 	}
 
