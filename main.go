@@ -367,6 +367,9 @@ type App struct {
 	mediaGroups   map[int64]map[string]*mediaGroupBatch // chatID → mediaGroupID → batch
 
 	rateLimits sync.Map // map[int64]time.Time — per-chat last message time
+
+	noticeMu   sync.Mutex
+	lastNotice map[string]time.Time // "chatID|noticeText" → last seen time
 }
 
 // redactSecrets returns s with known secrets replaced by "***".

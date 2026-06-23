@@ -607,8 +607,12 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				// and planner token consumption); fall back to single-turn accumulation
 				// for older serve versions that don't send session-cumulative tokens.
 				if u.SessionPromptTokens > 0 || u.SessionTotalTokens > 0 {
-					s.cumPrompt = u.SessionPromptTokens
-					s.cumTotal = u.SessionTotalTokens
+					if u.SessionPromptTokens > s.cumPrompt {
+						s.cumPrompt = u.SessionPromptTokens
+					}
+					if u.SessionTotalTokens > s.cumTotal {
+						s.cumTotal = u.SessionTotalTokens
+					}
 					s.cumCompletion = s.cumTotal - s.cumPrompt
 				} else {
 					s.cumPrompt += u.PromptTokens

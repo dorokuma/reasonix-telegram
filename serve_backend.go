@@ -323,6 +323,11 @@ func (a *App) startServe(chatID int64, skipPortCheck bool) error {
 	port := s.servePort
 	sessionModel := s.model // per-session model override, persisted separately
 	model := sessionModel
+	cumPrompt := s.cumPrompt
+	cumCompletion := s.cumCompletion
+	cumTotal := s.cumTotal
+	cumCost := s.cumCost
+	cumCurrency := s.cumCurrency
 	s.mu.Unlock()
 
 	if sessionPath == "" {
@@ -411,7 +416,16 @@ func (a *App) startServe(chatID int64, skipPortCheck bool) error {
 	}
 	log.Printf("chat=%d: serve cwd=%s mode=%s", chatID, workDir, a.getMode())
 	if err := a.state.upsert(chatRecord{
-		ChatID: chatID, Workdir: workDir, SessionPath: sessionPath, Port: port, Model: sessionModel,
+		ChatID:      chatID,
+		Workdir:     workDir,
+		SessionPath: sessionPath,
+		Port:        port,
+		Model:       sessionModel,
+		CumPrompt:   cumPrompt,
+		CumComplete: cumCompletion,
+		CumTotal:    cumTotal,
+		CumCost:     cumCost,
+		CumCurrency: cumCurrency,
 	}); err != nil {
 		log.Printf("chat=%d: persist state failed: %v", chatID, err)
 	}
@@ -870,6 +884,20 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 			return turnResult{err: turnErr}
 		case "notice":
 			if t := strings.TrimSpace(ev.Text); t != "" && !isReasonixNoise(t) {
+				key := fmt.Sprintf("%d|%s", chatID, t)
+				a.noticeMu.Lock()
+				if a.lastNotice == nil {
+					a.lastNotice = make(map[string]time.Time)
+				}
+				last, ok := a.lastNotice[key]
+				skip := ok && time.Since(last) < 5*time.Second
+				if !skip {
+					a.lastNotice[key] = time.Now()
+				}
+				a.noticeMu.Unlock()
+				if skip {
+					continue
+				}
 				onChunk("\n" + t + "\n")
 			}
 		}
