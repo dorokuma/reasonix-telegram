@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,9 +41,12 @@ type CronManager struct {
 }
 
 func (a *App) initCron() {
-	c := cron.New(cron.WithParser(cron.NewParser(
-		cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow,
-	)))
+	c := cron.New(
+		cron.WithParser(cron.NewParser(
+			cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow,
+		)),
+		cron.WithChain(cron.Recover(cron.DefaultLogger)),
+	)
 
 	watcher, err := fsnotify.NewWatcher()
 	if err != nil {
@@ -224,6 +228,12 @@ func (cm *CronManager) clearTasksLocked() {
 }
 
 func (a *App) triggerCronTask(task *CronTask) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC recovered: %v\nstack: %s", r, debug.Stack())
+		}
+	}()
+
 	log.Printf("cron: task %d - entering triggerCronTask, chat=%d, prompt=%q", task.ID, task.ChatID, task.Prompt)
 	if task.RunOnce {
 		defer func() {

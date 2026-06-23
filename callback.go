@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -397,6 +398,14 @@ func (a *App) persistModel(chatID int64, modelID string) error {
 }
 
 func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
+	a.msgWg.Add(1)
+	defer a.msgWg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC recovered: %v\nstack: %s", r, debug.Stack())
+		}
+	}()
+
 	if cq.Message == nil || cq.From == nil {
 		return
 	}

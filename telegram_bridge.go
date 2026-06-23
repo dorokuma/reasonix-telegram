@@ -36,6 +36,7 @@ func NewTelegramBridge(cfg *Config) (PlatformBridge, error) {
 	}
 	bot.Client = &http.Client{
 		Transport: NewTelegramFallbackTransport(innerTransport, os.Getenv("TELEGRAM_FALLBACK_IPS")),
+		Timeout:   30 * time.Second,
 	}
 
 	log.Printf("reasonix-telegram %s — authorized as @%s (id=%d)", version, bot.Self.UserName, bot.Self.ID)

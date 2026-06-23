@@ -80,7 +80,11 @@ func (a *App) handleSticker(m *tgbotapi.Message) string {
 	cache := a.loadStickerCache()
 	if entry, ok := cache[fileUniqueID]; ok {
 		if entry.Description != "" {
-			return fmt.Sprintf("[用户发送了贴纸 %s 来自 \"%s\"~ 已缓存在: %s]", emoji, entry.SetName, entry.Description)
+			if _, err := os.Stat(entry.Description); err == nil {
+				return fmt.Sprintf("[用户发送了贴纸 %s 来自 \"%s\"~ 已缓存在: %s]", emoji, entry.SetName, entry.Description)
+			}
+			delete(cache, fileUniqueID)
+			a.saveStickerCache(cache)
 		}
 	}
 

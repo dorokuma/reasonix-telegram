@@ -471,6 +471,7 @@ func main() {
 		select {
 		case <-ctx.Done():
 			log.Printf("shutdown signal: flushing reasonix sessions…")
+			app.msgWg.Wait()
 			app.cancelAllTasks()
 			app.waitTasksDone(5 * time.Second)
 			app.stopAllServes()

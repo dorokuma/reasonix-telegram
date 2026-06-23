@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,6 +18,14 @@ import (
 var seenMsgs sync.Map // inbound message_id dedup
 
 func (a *App) handleMessage(m *tgbotapi.Message) {
+	a.msgWg.Add(1)
+	defer a.msgWg.Done()
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("PANIC recovered: %v\nstack: %s", r, debug.Stack())
+		}
+	}()
+
 	if m.From == nil {
 		return
 	}
@@ -119,76 +128,83 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 	pc := s.pendingClarify
 	log.Printf("chat=%d: handleMessage text=%q pendingClarify=%v", m.Chat.ID, "[message]", pc != nil)
 	if pc != nil {
-		// Store text answer (under lock to avoid concurrent-map write).
-		answerText := text
-		if pc.awaitingCustom {
-			pc.awaitingCustom = false
-			answerText = "(自定义) " + text
-		}
-		log.Printf("chat=%d: clarify text answer for q=%s: %q", m.Chat.ID, pc.questionID, answerText)
-		pc.answers[pc.questionID] = []string{answerText}
-
-		nextIdx := pc.qIndex + 1
-		if nextIdx < len(pc.allQuestions) {
-			// Advance to next question (all fields mutated under lock).
-			nextQ := pc.allQuestions[nextIdx]
-			pc.qIndex = nextIdx
-			pc.questionID = nextQ.ID
-			pc.choices = nextQ.Options
-			cidNum := atomic.AddUint64(&a.clarifySeq, 1)
-			pc.clarifyID = strconv.FormatUint(cidNum, 36)
-			// Snapshot data needed outside lock.
-			qText := _escapeMdv2(strings.TrimSpace(nextQ.Text))
-			if qText == "" {
-				qText = _escapeMdv2(strings.TrimSpace(nextQ.ID))
-			}
-			if qText == "" {
-				qText = "请选择："
-			}
-			header := fmt.Sprintf("问题 %d/%d\n", nextIdx+1, len(pc.allQuestions))
-			options := nextQ.Options
-			clarifyID := pc.clarifyID
-			prevMsgID := pc.messageID
+		cleanText := strings.TrimSpace(text)
+		if cleanText == "/cancel" || cleanText == "/stop" || strings.HasPrefix(cleanText, "/cancel ") || strings.HasPrefix(cleanText, "/stop ") {
+			s.pendingClarify = nil
 			s.mu.Unlock()
+		} else {
+			// Store text answer (under lock to avoid concurrent-map write).
+			answerText := text
+			if pc.awaitingCustom {
+				pc.awaitingCustom = false
+				answerText = "(自定义) " + text
+			}
+			log.Printf("chat=%d: clarify text answer for q=%s: %q", m.Chat.ID, pc.questionID, answerText)
+			pc.answers[pc.questionID] = []string{answerText}
 
-			a.removeKeyboard(m.Chat.ID, prevMsgID)
-			replyText := "❓ " + header + qText
-			msg := newMessage(m.Chat.ID, replyText)
-			msg.ParseMode = "MarkdownV2"
-			if len(options) > 0 {
-				var rows [][]tgbotapi.InlineKeyboardButton
-				for i, choice := range options {
-					data := fmt.Sprintf("%s%s:%d", prefixClarify, clarifyID, i)
-					btnText := truncateForButton(fmt.Sprintf("%d. %s", i+1, choice))
-					rows = append(rows, []tgbotapi.InlineKeyboardButton{
-						{Text: btnText, CallbackData: &data},
-					})
+			nextIdx := pc.qIndex + 1
+			if nextIdx < len(pc.allQuestions) {
+				// Advance to next question (all fields mutated under lock).
+				nextQ := pc.allQuestions[nextIdx]
+				pc.qIndex = nextIdx
+				pc.questionID = nextQ.ID
+				pc.choices = nextQ.Options
+				cidNum := atomic.AddUint64(&a.clarifySeq, 1)
+				pc.clarifyID = strconv.FormatUint(cidNum, 36)
+				// Snapshot data needed outside lock.
+				qText := _escapeMdv2(strings.TrimSpace(nextQ.Text))
+				if qText == "" {
+					qText = _escapeMdv2(strings.TrimSpace(nextQ.ID))
 				}
-				otherData := fmt.Sprintf("%s%s:%s", prefixClarify, clarifyID, actionOther)
-				rows = append(rows, []tgbotapi.InlineKeyboardButton{
-					{Text: "✏️ 其他（输入答案）", CallbackData: &otherData},
-				})
-				msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
-			}
-			if sent, err := a.sendWithRetry(msg, m.Chat.ID); err != nil {
-				log.Printf("send failed: %v", err)
-			} else {
-				s.mu.Lock()
-				s.pendingClarify.messageID = sent.MessageID
+				if qText == "" {
+					qText = "请选择："
+				}
+				header := fmt.Sprintf("问题 %d/%d\n", nextIdx+1, len(pc.allQuestions))
+				options := nextQ.Options
+				clarifyID := pc.clarifyID
+				prevMsgID := pc.messageID
 				s.mu.Unlock()
+
+				a.removeKeyboard(m.Chat.ID, prevMsgID)
+				replyText := "❓ " + header + qText
+				msg := newMessage(m.Chat.ID, replyText)
+				msg.ParseMode = "MarkdownV2"
+				if len(options) > 0 {
+					var rows [][]tgbotapi.InlineKeyboardButton
+					for i, choice := range options {
+						data := fmt.Sprintf("%s%s:%d", prefixClarify, clarifyID, i)
+						btnText := truncateForButton(fmt.Sprintf("%d. %s", i+1, choice))
+						rows = append(rows, []tgbotapi.InlineKeyboardButton{
+							{Text: btnText, CallbackData: &data},
+						})
+					}
+					otherData := fmt.Sprintf("%s%s:%s", prefixClarify, clarifyID, actionOther)
+					rows = append(rows, []tgbotapi.InlineKeyboardButton{
+						{Text: "✏️ 其他（输入答案）", CallbackData: &otherData},
+					})
+					msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
+				}
+				if sent, err := a.sendWithRetry(msg, m.Chat.ID); err != nil {
+					log.Printf("send failed: %v", err)
+				} else {
+					s.mu.Lock()
+					s.pendingClarify.messageID = sent.MessageID
+					s.mu.Unlock()
+				}
+				return
 			}
+
+			// All answered — submit.
+			prevMsgID := pc.messageID
+			s.pendingClarify = nil
+			s.mu.Unlock()
+			a.removeKeyboard(m.Chat.ID, prevMsgID)
+			a.submitClarifyAnswers(pc, m.Chat.ID)
 			return
 		}
-
-		// All answered — submit.
-		prevMsgID := pc.messageID
-		s.pendingClarify = nil
+	} else {
 		s.mu.Unlock()
-		a.removeKeyboard(m.Chat.ID, prevMsgID)
-		a.submitClarifyAnswers(pc, m.Chat.ID)
-		return
 	}
-	s.mu.Unlock()
 
 	// Slash commands.
 	switch {
