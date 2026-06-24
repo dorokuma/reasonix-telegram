@@ -8,13 +8,16 @@ import (
 
 // TestAllowed verifies the ALLOWED_USERS access control.
 func TestAllowed(t *testing.T) {
+	// When ALLOWED_USERS is empty, DEV_MODE=1 allows everyone (the default in test/dev).
+	t.Setenv("DEV_MODE", "1")
+
 	app := &App{cfg: Config{}}
-	// Empty list = allow all
+	// Empty list = allow all (only when DEV_MODE=1, else deny)
 	if !app.allowed(&tgbotapi.User{ID: 42}) {
-		t.Fatal("empty ALLOWED_USERS should allow anyone")
+		t.Fatal("empty ALLOWED_USERS + DEV_MODE=1 should allow anyone")
 	}
 	if !app.allowed(&tgbotapi.User{ID: 0}) {
-		t.Fatal("empty ALLOWED_USERS should allow even ID 0")
+		t.Fatal("empty ALLOWED_USERS + DEV_MODE=1 should allow even ID 0")
 	}
 
 	// Non-empty list = strict check

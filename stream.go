@@ -99,6 +99,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		leakProbe            strings.Builder // accumulates turn-start text for leak detection
 		leakDecided          bool // language decision made for this segment
 		leakDetected         bool // thinking-leak detected — drop all text this segment
+		leakTail             string // incomplete UTF-8 tail saved across chunks
 	)
 	const (
 		maxDraftFailures = 3
@@ -227,7 +228,28 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				lastDraftBody = ""
 			}
 			if n == 0 {
-				log.Printf("chat=%d: finalize send failed (0 parts), stream stays open for retry", chatID)
+				log.Printf("chat=%d: finalize send failed (0 parts), trying plain text fallback", chatID)
+				plain := stripMdv2(body)
+				if plain != "" {
+					fallback := newMessage(chatID, capTelegramMessage(plain))
+					fallback.ParseMode = ""
+					sent, err := a.sendWithRetry(fallback, chatID)
+					if err == nil {
+						n = 1
+						replyDelivered.Store(true)
+						lastSentBody = body
+						a.recordSentText(sent.MessageID, plain)
+						log.Printf("chat=%d: finalize plain text fallback succeeded msgID=%d", chatID, sent.MessageID)
+					} else {
+						log.Printf("chat=%d: finalize plain text fallback also failed: %v", chatID, err)
+					}
+				}
+				if n == 0 {
+					log.Printf("chat=%d: finalize send failed after fallback, closing stream", chatID)
+					a.reply(chatID, "（回复生成完成但发送失败，请重试。）")
+					streamDone = true
+					releaseTask()
+				}
 			}
 		}
 		if n > 0 {
@@ -383,6 +405,11 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 					return
 				}
 				if !leakDecided {
+					// Prepend any incomplete UTF-8 tail saved from the previous chunk.
+					if leakTail != "" {
+						chunk = leakTail + chunk
+						leakTail = ""
+					}
 					probe := leakProbe.String() + chunk
 					decision := detectThinkingLeak(probe, false)
 					switch decision {
@@ -399,6 +426,21 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 						wakePush()
 						return
 					case leakUndecided:
+						// Before writing to leakProbe, ensure we don't stash an
+						// incomplete UTF-8 sequence at the end of the chunk.
+						if !utf8.ValidString(chunk) {
+							// Find the longest valid UTF-8 prefix by trimming
+							// incomplete bytes from the tail (max 4 bytes for UTF-8).
+							valid := chunk
+							for i := len(chunk); i > 0 && i > len(chunk)-4; i-- {
+								if utf8.ValidString(chunk[:i]) {
+									valid = chunk[:i]
+									break
+								}
+							}
+							leakTail = chunk[len(valid):]
+							chunk = valid
+						}
 						leakProbe.WriteString(chunk)
 						bufMu.Unlock()
 						return
@@ -502,9 +544,9 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				s.mu.Unlock()
 
 				// Send question with header + question text + options with descriptions
-				qText := _escapeMdv2(strings.TrimSpace(q.Text))
+				qText := escapeMdv2(strings.TrimSpace(q.Text))
 				if qText == "" {
-					qText = _escapeMdv2(strings.TrimSpace(q.ID))
+					qText = escapeMdv2(strings.TrimSpace(q.ID))
 				}
 				if qText == "" {
 					qText = "请选择："
@@ -515,7 +557,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				}
 				text := "❓ " + header + qText
 				msg := newMessage(chatID, text)
-				msg.ParseMode = "MarkdownV2"
+				msg.ParseMode = tgbotapi.ModeMarkdownV2
 				if len(q.Options) > 0 {
 					var rows [][]tgbotapi.InlineKeyboardButton
 					for i, choice := range q.Options {
@@ -582,12 +624,12 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				}
 				s.mu.Unlock()
 
-				text := fmt.Sprintf("%s 需要批准：%s", emoji, _escapeMdv2(label))
+				text := fmt.Sprintf("%s 需要批准：%s", emoji, escapeMdv2(label))
 				onceData := fmt.Sprintf("%s:%s", apID, actionOnce)
 				sessionData := fmt.Sprintf("%s:%s", apID, actionSession)
 				denyData := fmt.Sprintf("%s:%s", apID, actionDeny)
 				msg := newMessage(chatID, text)
-				msg.ParseMode = "MarkdownV2"
+				msg.ParseMode = tgbotapi.ModeMarkdownV2
 				msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
 					[]tgbotapi.InlineKeyboardButton{
 						{Text: "✅ 批准一次", CallbackData: &onceData},
@@ -629,8 +671,8 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				} else if u.Currency != "" {
 					s.cumCurrency = u.Currency
 				}
-				// Persist cumulative values so they survive restart.
-				_ = a.state.upsert(chatRecord{
+				// Copy needed fields to local variables before releasing the lock.
+				rec := chatRecord{
 					ChatID:      chatID,
 					Workdir:     s.workdir,
 					SessionPath: s.sessionPath,
@@ -641,8 +683,10 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 					CumTotal:    s.cumTotal,
 					CumCost:     s.cumCost,
 					CumCurrency: s.cumCurrency,
-				})
+				}
 				s.mu.Unlock()
+				// Persist cumulative values outside the lock so they survive restart.
+				_ = a.state.upsert(rec)
 			},
 		)
 		bufMu.Lock()

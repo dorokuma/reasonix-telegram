@@ -38,12 +38,15 @@ const typingRefreshInterval = 4 * time.Second
 //
 // We keep the textual content; if the user actually wants TUI fidelity,
 // they should run reasonix locally, not through a chat bot.
-var ansiCSI = regexp.MustCompile(`\x1b\[[0-9;?]*[a-zA-Z]`)
+var ansiCSI = regexp.MustCompile(`\x1b\[[0-9;:?]*[a-zA-Z]`)
 var ansiOSC = regexp.MustCompile(`\x1b\][^\x07]*\x07`)
 var ansiBare = regexp.MustCompile(`\x1b[@-_]`) // ESC followed by a single byte (e.g. ESC c, ESC =)
+// ST-terminated OSC sequences: ESC ] ... ST (ST = ESC \)
+var ansiOSCST = regexp.MustCompile(`\x1b\][^\x1b]*\x1b\\`)
 
 func stripANSI(s string) string {
 	s = ansiOSC.ReplaceAllString(s, "")
+	s = ansiOSCST.ReplaceAllString(s, "")
 	s = ansiCSI.ReplaceAllString(s, "")
 	s = ansiBare.ReplaceAllString(s, "")
 	return s
@@ -337,6 +340,8 @@ type session struct {
 	cumCost       float64
 	cumCurrency   string
 	liveDraftID   int64 // open sendMessageDraft on Telegram (session-level for pre-empt cleanup)
+	serveRestartCount int       // consecutive health-check restart failures
+	serveLastRestart  time.Time // last restart attempt time
 }
 
 type runningTask struct {

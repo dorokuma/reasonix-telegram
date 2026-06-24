@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -76,12 +77,17 @@ func (a *App) isServeStale(port int, expectedArgs []string, expectedCWD string) 
 		if readProcCWD(pid) != expectedCWD {
 			return true
 		}
-		// Build expected cmdline suffix: "serve --addr ... --model ... --resume ...".
-		// We check every expected arg is present in the actual cmdline. This catches
-		// a different --model, different binary path, etc.
-		expectedSuffix := strings.Join(expectedArgs, " ")
-		if !strings.Contains(cmdline, expectedSuffix) {
+		// Compare args token-by-token to avoid false matches from partial
+		// substrings (e.g. --model llama3 matching --model llama3-70b).
+		// Skip the binary path (cmdParts[0]) and compare against expectedArgs.
+		cmdParts := strings.Fields(cmdline)
+		if len(cmdParts) < 1+len(expectedArgs) {
 			return true
+		}
+		for i, expected := range expectedArgs {
+			if cmdParts[1+i] != expected {
+				return true
+			}
 		}
 		return false // all checks passed, process matches
 	}
@@ -270,7 +276,11 @@ func (a *App) stopSessionServe(s *session, chatID int64) {
 			log.Printf("chat=%d: serve exited cleanly", chatID)
 		case <-time.After(5 * time.Second):
 			_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
-			<-waitDone
+			select {
+			case <-waitDone:
+			case <-time.After(2 * time.Second):
+				log.Printf("port=%d: timeout waiting for process to exit after kill", port)
+			}
 		}
 
 		// Wait for port to be released after the process has exited.
@@ -383,13 +393,39 @@ func (a *App) startServe(chatID int64, skipPortCheck bool) error {
 
 	cmd := exec.Command(a.cfg.ReasonixBin, args...)
 	cmd.Dir = workDir
-	cmd.Env = a.reasonixEnv(chatID)
+	env := a.reasonixEnv(chatID)
+	// Create temp file for DEEPSEEK_API_KEY to avoid exposure in /proc/PID/environ.
+	var keyFile string
+	if k := a.cfg.DeepSeekKey; k != "" {
+		tmpf, err := os.CreateTemp("", "deepseek-key-*")
+		if err == nil {
+			if _, err := tmpf.WriteString(k); err == nil {
+				tmpf.Close()
+				if err := os.Chmod(tmpf.Name(), 0600); err == nil {
+					keyFile = tmpf.Name()
+					env = append(env, "DEEPSEEK_API_KEY_FILE="+keyFile)
+				}
+			} else {
+				tmpf.Close()
+			}
+		}
+		// Keep DEEPSEEK_API_KEY as compatibility fallback.
+		env = append(env, "DEEPSEEK_API_KEY="+k)
+	}
+	cmd.Env = env
 	// Go wires nil Stderr to /dev/null; forward serve diagnostics (RTK/CTX hit/miss) to journal.
 	cmd.Stderr = os.Stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: 0}
 
 	if err := cmd.Start(); err != nil {
+		if keyFile != "" {
+			os.Remove(keyFile)
+		}
 		return fmt.Errorf("start reasonix serve: %w", err)
+	}
+	// Clean up temp key file after the child has started (it reads it at startup).
+	if keyFile != "" {
+		defer os.Remove(keyFile)
 	}
 
 	s.mu.Lock()
@@ -450,14 +486,18 @@ func (a *App) ensureServe(chatID int64) error {
 }
 
 // startServeHealthCheck periodically checks all serve processes are alive.
-// Runs every 60s; restarts any that have died.
+// Runs every 60s; restarts any that have died, with exponential backoff.
 func (a *App) startServeHealthCheck() {
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
 			a.sessMu.Lock()
-			chatIDs := make([]int64, 0, len(a.sess))
+			type deadChat struct {
+				id  int64
+				s   *session
+			}
+			var dead []deadChat
 			for chatID, s := range a.sess {
 				s.mu.Lock()
 				cmd := s.serveCmd
@@ -467,14 +507,45 @@ func (a *App) startServeHealthCheck() {
 				alive := cmd != nil && cmd.Process != nil && cmd.ProcessState == nil
 				listening := port > 0 && a.waitServeReady(port, 2*time.Second) == nil
 				if !alive && !listening {
-					chatIDs = append(chatIDs, chatID)
+					dead = append(dead, deadChat{chatID, s})
 				}
 			}
 			a.sessMu.Unlock()
-			for _, chatID := range chatIDs {
-				log.Printf("health: chat=%d serve process dead, restarting", chatID)
+			for _, dc := range dead {
+				chatID := dc.id
+				s := dc.s
+				s.mu.Lock()
+				count := s.serveRestartCount
+				s.mu.Unlock()
+				if count >= 10 {
+					log.Printf("health: chat=%d serve process dead, %d consecutive failures, giving up", chatID, count)
+					continue
+				}
+				backoff := time.Duration(1 << uint(count)) * time.Second // 1s, 2s, 4s, 8s, ...
+				if backoff > 300*time.Second {
+					backoff = 300 * time.Second
+				}
+				// Ensure minimum gap between restarts.
+				s.mu.Lock()
+				elapsed := time.Since(s.serveLastRestart)
+				s.mu.Unlock()
+				if elapsed < backoff {
+					log.Printf("health: chat=%d backoff %v remaining (%d consecutive failures)", chatID, backoff-elapsed, count)
+					continue
+				}
+				log.Printf("health: chat=%d serve process dead, restarting (attempt %d)", chatID, count+1)
+				s.mu.Lock()
+				s.serveLastRestart = time.Now()
+				s.mu.Unlock()
 				if err := a.startServe(chatID, false); err != nil {
-					log.Printf("health: chat=%d restart failed: %v", chatID, err)
+					s.mu.Lock()
+					s.serveRestartCount++
+					log.Printf("health: chat=%d restart failed: %v (consecutive failures: %d)", chatID, err, s.serveRestartCount)
+					s.mu.Unlock()
+				} else {
+					s.mu.Lock()
+					s.serveRestartCount = 0
+					s.mu.Unlock()
 				}
 			}
 		}
@@ -586,9 +657,14 @@ func (a *App) waitServeReady(port int, timeout time.Duration) error {
 	for time.Now().Before(deadline) {
 		resp, err := client.Get(url)
 		if err == nil {
-			resp.Body.Close()
 			if resp.StatusCode == http.StatusOK {
-				return nil
+				body, _ := io.ReadAll(resp.Body)
+				resp.Body.Close()
+				if strings.Contains(string(body), "label") {
+					return nil
+				}
+			} else {
+				resp.Body.Close()
 			}
 		}
 		time.Sleep(250 * time.Millisecond)
@@ -653,16 +729,27 @@ func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onC
 	}
 }
 
-func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string) int, onAskRequest func(askID string, questions []askQuestionData), onApprovalRequest func(approvalID string, toolName string), onUsage func(wireUsage)) turnResult {
+// errNonSSEResponse is returned when the serve endpoint returns a response with
+// an unexpected Content-Type (not text/event-stream). This is a fatal error that
+// should not be retried, since retrying would produce the same non-SSE response.
+var errNonSSEResponse = errors.New("serve returned non-SSE response")
+
+func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string) int, onAskRequest func(askID string, questions []askQuestionData), onApprovalRequest func(approvalID string, toolName string), onUsage func(wireUsage)) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serveBaseURL(port)+"/events", nil)
 	if err != nil {
-		return turnResult{err: err}
+		return err
 	}
 	resp, err := sseClient.Do(req)
 	if err != nil {
-		return turnResult{err: fmt.Errorf("reasonix events: %w", err)}
+		return fmt.Errorf("reasonix events: %w", err)
 	}
 	defer resp.Body.Close()
+
+	// Verify this is an SSE stream; non-SSE responses (e.g. HTML error pages
+	// from a misconfigured serve) are fatal and should not be retried.
+	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		return fmt.Errorf("%w: %q (URL: %s)", errNonSSEResponse, ct, serveBaseURL(port)+"/events")
+	}
 
 	ctxDoneChan := make(chan struct{})
 	defer close(ctxDoneChan)
@@ -714,7 +801,7 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 		select {
 		case <-ctx.Done():
 			log.Printf("port=%d: SSE context cancelled, stopping event processing", port)
-			return turnResult{err: ctx.Err()}
+			return ctx.Err()
 		default:
 		}
 		atomic.StoreInt64(&lastActivityUnix, time.Now().Unix())
@@ -837,7 +924,7 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 		case "ask_request":
 			if ev.Ask != nil {
 				for _, q := range ev.Ask.Questions {
-					log.Printf("port=%d: ask_request q.id=%s q.prompt=%q", port, q.ID, q.Prompt)
+					log.Printf("port=%d: ask_request q.id=%s q.prompt=%q", port, q.ID, logPreview(q.Prompt, 100))
 				}
 			}
 			bufferingAsk = false
@@ -881,7 +968,7 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 				log.Printf("chat=%d: onComplete via turn_done", chatID)
 				onComplete()
 			}
-			return turnResult{err: turnErr}
+			return turnErr
 		case "notice":
 			if t := strings.TrimSpace(ev.Text); t != "" && !isReasonixNoise(t) {
 				key := fmt.Sprintf("%d|%s", chatID, t)
@@ -905,13 +992,50 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 	if err := sc.Err(); err != nil {
 		log.Printf("chat=%d: consumeServeEvents scanner error: %v", chatID, err)
 		if ctx.Err() == nil {
-			return turnResult{err: err}
+			return err
 		}
 	}
 	if ctx.Err() != nil {
-		return turnResult{err: ctx.Err()}
+		return ctx.Err()
 	}
-	return turnResult{}
+	return nil
+}
+
+// consumeServeEvents connects to the serve SSE stream and processes events.
+// It retries transient connection failures up to 3 times with exponential
+// backoff (500ms, 1s, 2s). Fatal errors (non-SSE response, context
+// cancellation, dead serve process) are returned immediately without retry.
+func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string) int, onAskRequest func(askID string, questions []askQuestionData), onApprovalRequest func(approvalID string, toolName string), onUsage func(wireUsage)) turnResult {
+	const maxRetries = 3
+	backoffs := []time.Duration{500 * time.Millisecond, 1 * time.Second, 2 * time.Second}
+
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			// Check if the turn was canceled (e.g. pre-empted by a newer message).
+			if ctx.Err() != nil {
+				return turnResult{err: fmt.Errorf("serve turn canceled during retry: %w", ctx.Err())}
+			}
+			// Check that the serve process is still alive before reconnecting.
+			if err := a.waitServeReady(port, 2*time.Second); err != nil {
+				return turnResult{err: fmt.Errorf("serve process dead, cannot retry: %w", err)}
+			}
+			log.Printf("chat=%d: SSE reconnect attempt %d/%d after %v", chatID, attempt, maxRetries, backoffs[attempt-1])
+			time.Sleep(backoffs[attempt-1])
+		}
+
+		err := a.connectAndConsumeSSE(ctx, chatID, port, onChunk, onComplete, onToolDispatch, onCommentary, onAskRequest, onApprovalRequest, onUsage)
+		if err == nil {
+			return turnResult{}
+		}
+
+		// Fatal errors: non-SSE response or context cancellation — do not retry.
+		if errors.Is(err, errNonSSEResponse) || errors.Is(err, context.Canceled) {
+			return turnResult{err: err}
+		}
+
+		log.Printf("chat=%d: SSE connection lost (attempt %d/%d): %v", chatID, attempt+1, maxRetries+1, err)
+	}
+	return turnResult{err: fmt.Errorf("SSE connection failed after %d retries", maxRetries+1)}
 }
 
 // openThinkTags and closeThinkTags for stripping reasoning blocks.
@@ -1045,7 +1169,12 @@ func detectThinkingLeak(probe string, isEOF bool) leakDecision {
 func appendChunk(buf *strings.Builder, chunk string, maxBytes int, truncated *bool) {
 	clean := stripANSI(chunk)
 	clean = stripThinkBlocks(clean)
-	if clean == "" || isReasonixNoise(clean) {
+	if clean == "" {
+		return
+	}
+	// Only filter complete lines (ending with \n) as reasonix noise; incomplete
+	// chunks that arrive mid-stream are always kept to avoid truncation false positives.
+	if strings.HasSuffix(clean, "\n") && isReasonixNoise(clean) {
 		return
 	}
 	cap := maxFinalizeBytes

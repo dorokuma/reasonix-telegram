@@ -168,8 +168,8 @@ func (a *App) sendModelPicker(chatID int64, page int) {
 	}
 
 	text := fmt.Sprintf("🤖 选择模型（当前：%s）", a.modelDisplayName(current))
-	msg := newMessage(chatID, _escapeMdv2(text))
-	msg.ParseMode = "MarkdownV2"
+	msg := newMessage(chatID, escapeMdv2(text))
+	msg.ParseMode = tgbotapi.ModeMarkdownV2
 	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
 	a.sendSafe(msg)
 }
@@ -228,8 +228,8 @@ func (a *App) editModelPicker(chatID int64, messageID int, page int) {
 	}
 
 	text := fmt.Sprintf("🤖 选择模型（当前：%s）", a.modelDisplayName(current))
-	edit := tgbotapi.NewEditMessageText(chatID, messageID, _escapeMdv2(text))
-	edit.ParseMode = "MarkdownV2"
+	edit := tgbotapi.NewEditMessageText(chatID, messageID, escapeMdv2(text))
+	edit.ParseMode = tgbotapi.ModeMarkdownV2
 	edit.ReplyMarkup = &tgbotapi.InlineKeyboardMarkup{InlineKeyboard: rows}
 	if _, err := a.bot.Request(edit); err != nil {
 		log.Printf("edit model picker failed: %v", err)
@@ -371,7 +371,7 @@ func (a *App) sendEffortPicker(chatID int64, _ int) {
 		})
 	}
 	msg := newMessage(chatID, "🤔 选择推理深度")
-	msg.ParseMode = "MarkdownV2"
+	msg.ParseMode = tgbotapi.ModeMarkdownV2
 	msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
 	a.sendSafe(msg)
 	_ = port // keep port reference for future use
@@ -379,22 +379,15 @@ func (a *App) sendEffortPicker(chatID int64, _ int) {
 
 // persistModel writes the model ID to state.json so it survives restarts.
 func (a *App) persistModel(chatID int64, modelID string) error {
-	records, err := a.state.load()
-	if err != nil {
-		return err
-	}
-	found := false
-	for i, rec := range records {
-		if rec.ChatID == chatID {
-			records[i].Model = modelID
-			found = true
-			break
+	return a.state.updateAll(func(records []chatRecord) []chatRecord {
+		for i, rec := range records {
+			if rec.ChatID == chatID {
+				records[i].Model = modelID
+				return records
+			}
 		}
-	}
-	if !found {
-		records = append(records, chatRecord{ChatID: chatID, Model: modelID})
-	}
-	return a.state.saveAll(records)
+		return append(records, chatRecord{ChatID: chatID, Model: modelID})
+	})
 }
 
 func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
@@ -415,7 +408,7 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 	}
 	chatID := cq.Message.Chat.ID
 	data := strings.TrimSpace(cq.Data)
-	log.Printf("chat=%d: callback data=%q", chatID, data)
+	log.Printf("chat=%d: callback data=%q", chatID, logPreview(data, 200))
 
 	// --- Approval callbacks: ap:{approvalID}:{action} ---
 	if strings.HasPrefix(data, prefixApproval) {
@@ -563,7 +556,7 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 		a.answerCallback(cq.ID, "")
 		a.removeKeyboard(chatID, msgID)
 		msg := newMessage(chatID, "📝 请输入你的回答：")
-		msg.ParseMode = "MarkdownV2"
+		msg.ParseMode = tgbotapi.ModeMarkdownV2
 		msg.ReplyToMessageID = cq.Message.MessageID
 		a.sendSafe(msg)
 		return
@@ -590,9 +583,9 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 		cidNum := atomic.AddUint64(&a.clarifySeq, 1)
 		pc.clarifyID = strconv.FormatUint(cidNum, 36)
 		// Snapshot data for message building.
-		qText := _escapeMdv2(strings.TrimSpace(nextQ.Text))
+		qText := escapeMdv2(strings.TrimSpace(nextQ.Text))
 		if qText == "" {
-			qText = _escapeMdv2(strings.TrimSpace(nextQ.ID))
+			qText = escapeMdv2(strings.TrimSpace(nextQ.ID))
 		}
 		if qText == "" {
 			qText = "请选择："
@@ -607,7 +600,7 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 		header := fmt.Sprintf("问题 %d/%d\n", nextIdx+1, len(pc.allQuestions))
 		text := "❓ " + header + qText
 		msg := newMessage(chatID, text)
-		msg.ParseMode = "MarkdownV2"
+		msg.ParseMode = tgbotapi.ModeMarkdownV2
 		if len(options) > 0 {
 			var rows [][]tgbotapi.InlineKeyboardButton
 			for i, choice := range options {
@@ -650,7 +643,7 @@ func (a *App) formatChoices(choices []string) string {
 		if i > 0 {
 			b.WriteString("\n")
 		}
-		fmt.Fprintf(&b, "%d. %s", i+1, _escapeMdv2(c))
+		fmt.Fprintf(&b, "%d. %s", i+1, escapeMdv2(c))
 	}
 	return b.String()
 }

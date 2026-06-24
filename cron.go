@@ -234,7 +234,7 @@ func (a *App) triggerCronTask(task *CronTask) {
 		}
 	}()
 
-	log.Printf("cron: task %d - entering triggerCronTask, chat=%d, prompt=%q", task.ID, task.ChatID, task.Prompt)
+	log.Printf("cron: task %d - entering triggerCronTask, chat=%d, prompt=%q", task.ID, task.ChatID, logPreview(task.Prompt, 100))
 	if task.RunOnce {
 		defer func() {
 			cm := a.cronManager
@@ -282,7 +282,7 @@ func (a *App) triggerCronTask(task *CronTask) {
 	cmd := exec.CommandContext(ctx, a.cfg.ReasonixBin, "run", "--resume", tmpPath, "--model", "deepseek-v4-flash", "--", fullPrompt)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		log.Printf("cron: command exec failed: %v, output: %s", err, string(out))
+		log.Printf("cron: command exec failed: %v, output: %s", err, logPreview(string(out), 200))
 		a.reply(task.ChatID, fmt.Sprintf("⏰ 定时任务执行失败：%v\n输出：%s", err, string(out)))
 		return
 	}
@@ -341,7 +341,7 @@ func (a *App) triggerCronTask(task *CronTask) {
 	}
 
 	log.Printf("cron: task %d raw output %d bytes", task.ID, len(out))
-	log.Printf("cron: task %d final answer from jsonl=%v (%d bytes):\n%s", task.ID, finalAnswer != "", len(result), result)
+	log.Printf("cron: task %d final answer from jsonl=%v (%d bytes):\n%s", task.ID, finalAnswer != "", len(result), logPreview(result, 200))
 
 	if strings.TrimSpace(result) == "" {
 		log.Printf("cron: task %d - result is empty after processing, using fallback text", task.ID)

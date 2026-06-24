@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -81,7 +82,9 @@ func (st *stateStore) load() ([]chatRecord, error) {
 	}
 	var sf stateFile
 	if err := json.Unmarshal(b, &sf); err != nil {
-		return nil, err
+		log.Printf("state: failed to unmarshal state file %s: %v (keeping backup)", st.path, err)
+		os.Rename(st.path, st.path+".bak")
+		return []chatRecord{}, nil
 	}
 	return sf.Chats, nil
 }
@@ -91,7 +94,11 @@ func (st *stateStore) upsert(rec chatRecord) error {
 	defer st.mu.Unlock()
 	var sf stateFile
 	if b, err := os.ReadFile(st.path); err == nil {
-		_ = json.Unmarshal(b, &sf)
+		if err := json.Unmarshal(b, &sf); err != nil {
+			log.Printf("state: failed to unmarshal state file %s: %v (keeping backup)", st.path, err)
+			os.Rename(st.path, st.path+".bak")
+			sf = stateFile{}
+		}
 	}
 	found := false
 	for i, c := range sf.Chats {
@@ -112,7 +119,11 @@ func (st *stateStore) remove(chatID int64) error {
 	defer st.mu.Unlock()
 	var sf stateFile
 	if b, err := os.ReadFile(st.path); err == nil {
-		_ = json.Unmarshal(b, &sf)
+		if err := json.Unmarshal(b, &sf); err != nil {
+			log.Printf("state: failed to unmarshal state file %s: %v (keeping backup)", st.path, err)
+			os.Rename(st.path, st.path+".bak")
+			sf = stateFile{}
+		}
 	}
 	out := sf.Chats[:0]
 	for _, c := range sf.Chats {
@@ -129,6 +140,23 @@ func (st *stateStore) saveAll(records []chatRecord) error {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	return st.writeLocked(&stateFile{Chats: records})
+}
+
+// updateAll runs fn inside the state lock, reading current records, applying fn,
+// and saving the result atomically.
+func (st *stateStore) updateAll(fn func([]chatRecord) []chatRecord) error {
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	var sf stateFile
+	if b, err := os.ReadFile(st.path); err == nil {
+		if err := json.Unmarshal(b, &sf); err != nil {
+			log.Printf("state: failed to unmarshal state file %s: %v (keeping backup)", st.path, err)
+			os.Rename(st.path, st.path+".bak")
+			sf = stateFile{}
+		}
+	}
+	sf.Chats = fn(sf.Chats)
+	return st.writeLocked(&sf)
 }
 
 func (st *stateStore) writeLocked(sf *stateFile) error {

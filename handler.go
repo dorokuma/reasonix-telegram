@@ -38,12 +38,17 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 	}
 	a.rateLimits.Store(m.Chat.ID, time.Now())
 	// Inbound message_id dedup: drop duplicate Telegram updates.
+	// Entries older than 10 minutes are treated as new (timestamp-based expiry).
 	if m.MessageID != 0 {
-		if _, ok := seenMsgs.Load(m.MessageID); ok {
-			log.Printf("chat=%d: duplicate message %d ignored", m.Chat.ID, m.MessageID)
-			return
+		if v, ok := seenMsgs.Load(m.MessageID); ok {
+			if ts, ok := v.(int64); ok && time.Now().Unix()-ts < 600 {
+				log.Printf("chat=%d: duplicate message %d ignored", m.Chat.ID, m.MessageID)
+				return
+			}
+			// Stale entry (>10 min) — delete and re-store
+			seenMsgs.Delete(m.MessageID)
 		}
-		seenMsgs.Store(m.MessageID, true)
+		seenMsgs.Store(m.MessageID, time.Now().Unix())
 	}
 	if !a.allowed(m.From) {
 		a.reply(m.Chat.ID, "⛔ 无权使用此机器人")
@@ -139,7 +144,7 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 				pc.awaitingCustom = false
 				answerText = "(自定义) " + text
 			}
-			log.Printf("chat=%d: clarify text answer for q=%s: %q", m.Chat.ID, pc.questionID, answerText)
+			log.Printf("chat=%d: clarify text answer for q=%s: %q", m.Chat.ID, pc.questionID, logPreview(answerText, 100))
 			pc.answers[pc.questionID] = []string{answerText}
 
 			nextIdx := pc.qIndex + 1
@@ -152,9 +157,9 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 				cidNum := atomic.AddUint64(&a.clarifySeq, 1)
 				pc.clarifyID = strconv.FormatUint(cidNum, 36)
 				// Snapshot data needed outside lock.
-				qText := _escapeMdv2(strings.TrimSpace(nextQ.Text))
+				qText := escapeMdv2(strings.TrimSpace(nextQ.Text))
 				if qText == "" {
-					qText = _escapeMdv2(strings.TrimSpace(nextQ.ID))
+					qText = escapeMdv2(strings.TrimSpace(nextQ.ID))
 				}
 				if qText == "" {
 					qText = "请选择："
@@ -168,7 +173,7 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 				a.removeKeyboard(m.Chat.ID, prevMsgID)
 				replyText := "❓ " + header + qText
 				msg := newMessage(m.Chat.ID, replyText)
-				msg.ParseMode = "MarkdownV2"
+				msg.ParseMode = tgbotapi.ModeMarkdownV2
 				if len(options) > 0 {
 					var rows [][]tgbotapi.InlineKeyboardButton
 					for i, choice := range options {
@@ -423,7 +428,11 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 
 func (a *App) allowed(u *tgbotapi.User) bool {
 	if len(a.cfg.AllowedUsers) == 0 {
-		return true
+		if os.Getenv("DEV_MODE") != "" {
+			return true
+		}
+		log.Printf("WARNING: ALLOWED_USERS not set, denying access. Set DEV_MODE=1 to allow all users in development.")
+		return false
 	}
 	for _, id := range a.cfg.AllowedUsers {
 		if u.ID == id {

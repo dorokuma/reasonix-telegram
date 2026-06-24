@@ -29,6 +29,10 @@ func (a *App) cleanupStaleServesOnStartup() {
 			if pid == bridgePID {
 				continue
 			}
+			cmd := readProcCmdline(pid)
+			if !isReasonixServeCmd(cmd, a.cfg.ReasonixBin) {
+				continue
+			}
 			stale[pid] = struct{}{}
 		}
 	}

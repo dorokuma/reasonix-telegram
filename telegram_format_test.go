@@ -207,7 +207,7 @@ func TestFormatMessage_MultipleCodeBlocks(t *testing.T) {
 
 func TestWrapMarkdownTables(t *testing.T) {
 	in := "| Name | Value |\n|------|-------|\n| A | 1 |\n| B | 2 |"
-	got := _wrapMarkdownTables(in)
+	got := wrapMarkdownTables(in)
 	if !strings.Contains(got, "•") {
 		t.Errorf("table not converted to bullets: %q", got)
 	}
@@ -218,7 +218,7 @@ func TestWrapMarkdownTables(t *testing.T) {
 
 func TestWrapMarkdownTables_InCodeBlock(t *testing.T) {
 	in := "```\n| Name | Value |\n|------|-------|\n```"
-	got := _wrapMarkdownTables(in)
+	got := wrapMarkdownTables(in)
 	// Table inside code block should NOT be converted
 	if strings.Contains(got, "•") {
 		t.Errorf("table inside code block should not be converted: %q", got)

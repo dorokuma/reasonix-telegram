@@ -13,42 +13,45 @@ import (
 // syntax. Protected regions (code blocks, inline code) are extracted first
 // via placeholders so their contents are never modified.
 
-// _MDV2_ESCAPE_RE_RE is the regex that matches every character MarkdownV2
-// requires to be backslash-escaped outside code spans.
-var _MDV2_ESCAPE_RE_RE = regexp.MustCompile(`([_*\[\]()~` + "`" + `>#+\-=|{}.!\\])`)
+// fencedRe matches fenced code blocks: ```optional-lang\n...\n```
+var fencedRe = regexp.MustCompile("(?s)`{3,}[^\\n]*\\n.*?`{3,}")
 
-// _FENCED_RE matches fenced code blocks: ```optional-lang\n...\n```
-var _FENCED_RE = regexp.MustCompile("(?s)`{3,}[^\\n]*\\n.*?`{3,}")
+// inlineCodeRe matches inline code spans: `...`
+var inlineCodeRe = regexp.MustCompile("`[^`]+`")
 
-// _INLINE_CODE_RE matches inline code spans: `...`
-var _INLINE_CODE_RE = regexp.MustCompile("`[^`]+`")
+// linkRe matches markdown links: [text](url)
+var linkRe = regexp.MustCompile(`\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)`)
 
-// _LINK_RE matches markdown links: [text](url)
-var _LINK_RE = regexp.MustCompile(`\[([^\]]+)\]\(([^()]*(?:\([^()]*\)[^()]*)*)\)`)
+// headerRe matches markdown headers: ## Title
+var headerRe = regexp.MustCompile(`(?m)^#{1,6}\s+(.+)$`)
 
-// _HEADER_RE matches markdown headers: ## Title
-var _HEADER_RE = regexp.MustCompile(`(?m)^#{1,6}\s+(.+)$`)
+// boldRe matches markdown bold: **text**
+var boldRe = regexp.MustCompile(`\*\*(.+?)\*\*`)
 
-// _BOLD_RE matches markdown bold: **text**
-var _BOLD_RE = regexp.MustCompile(`\*\*(.+?)\*\*`)
+// italicRe matches markdown italic: *text* (single asterisk, not across newlines)
+var italicRe = regexp.MustCompile(`\*([^*]+)\*`)
 
-// _ITALIC_RE matches markdown italic: *text* (single asterisk, not across newlines)
-var _ITALIC_RE = regexp.MustCompile(`\*([^*\n]+)\*`)
+// strikeRe matches markdown strikethrough: ~~text~~
+var strikeRe = regexp.MustCompile(`~~(.+?)~~`)
 
-// _STRIKE_RE matches markdown strikethrough: ~~text~~
-var _STRIKE_RE = regexp.MustCompile(`~~(.+?)~~`)
+// spoilerRe matches markdown spoiler: ||text||
+var spoilerRe = regexp.MustCompile(`\|\|(.+?)\|\|`)
 
-// _SPOILER_RE matches markdown spoiler: ||text||
-var _SPOILER_RE = regexp.MustCompile(`\|\|(.+?)\|\|`)
+// blockquoteRe matches markdown blockquotes: > text, >> text, etc.
+var blockquoteRe = regexp.MustCompile(`(?m)^((?:\*\*)?>{1,3}) (.+)$`)
 
-// _BLOCKQUOTE_RE matches markdown blockquotes: > text, >> text, etc.
-var _BLOCKQUOTE_RE = regexp.MustCompile(`(?m)^((?:\*\*)?>{1,3}) (.+)$`)
+// tableSeparatorRe matches GFM table separator rows: |---|---|
+var tableSeparatorRe = regexp.MustCompile(`^\s*\|?(\s*:?-{2,}:?\s*\|)+\s*:?-{2,}:?\s*\|?\s*$`)
 
-// _TABLE_SEPARATOR_RE matches GFM table separator rows: |---|---|
-var _TABLE_SEPARATOR_RE = regexp.MustCompile(`^\s*\|?(\s*:?-{2,}:?\s*\|)+\s*:?-{2,}:?\s*\|?\s*$`)
+// bareCharsRe matches unescaped (){} for safety-net escaping.
+var bareCharsRe = regexp.MustCompile(`[(){}]`)
 
-// _BARE_CHARS_RE matches unescaped (){} for safety-net escaping.
-var _BARE_CHARS_RE = regexp.MustCompile(`[(){}]`)
+// stripMdv2 pre-compiled regexes
+var _STRIP_ESCAPE_RE = regexp.MustCompile(`\\([_*\[\]()~` + "`" + `>#+\-=|{}.!\\])`)
+var _STRIP_BOLD_RE = regexp.MustCompile(`\*\*([^*]+)\*\*`)
+var _STRIP_ITALIC_RE = regexp.MustCompile(`\*([^*]+)\*`)
+var _STRIP_UNDER_RE = regexp.MustCompile(`_([^_\n]+)_`)
+var _STRIP_STRIKE_RE = regexp.MustCompile(`~([^~]+)~`)
 
 // placeholder token prefix/suffix
 const _phPrefix = "\x00PH"
@@ -56,7 +59,7 @@ const _phSuffix = "\x00"
 
 // ── Table helpers ────────────────────────────────────────────────────────
 
-func _isTableRow(line string) bool {
+func isTableRow(line string) bool {
 	stripped := strings.TrimSpace(line)
 	return stripped != "" && strings.Contains(stripped, "|")
 }
@@ -72,7 +75,7 @@ func _splitMarkdownTableRow(line string) []string {
 	return parts
 }
 
-func _renderTableBlockForTelegram(block []string) string {
+func renderTableBlockForTelegram(block []string) string {
 	if len(block) < 3 {
 		return strings.Join(block, "\n")
 	}
@@ -145,9 +148,9 @@ func _renderTableBlockForTelegram(block []string) string {
 	return strings.Join(rendered, "\n\n")
 }
 
-// _wrapMarkdownTables rewrites GFM pipe tables into Telegram-friendly bullet
+// wrapMarkdownTables rewrites GFM pipe tables into Telegram-friendly bullet
 // groups. Tables inside fenced code blocks are left alone.
-func _wrapMarkdownTables(text string) string {
+func wrapMarkdownTables(text string) string {
 	if !strings.Contains(text, "|") || !strings.Contains(text, "-") {
 		return text
 	}
@@ -174,14 +177,14 @@ func _wrapMarkdownTables(text string) string {
 		}
 
 		// Look for a header row (contains '|') immediately followed by a separator row
-		if strings.Contains(line, "|") && i+1 < len(lines) && _TABLE_SEPARATOR_RE.MatchString(lines[i+1]) {
+		if strings.Contains(line, "|") && i+1 < len(lines) && tableSeparatorRe.MatchString(lines[i+1]) {
 			tableBlock := []string{line, lines[i+1]}
 			j := i + 2
-			for j < len(lines) && _isTableRow(lines[j]) {
+			for j < len(lines) && isTableRow(lines[j]) {
 				tableBlock = append(tableBlock, lines[j])
 				j++
 			}
-			out = append(out, _renderTableBlockForTelegram(tableBlock))
+			out = append(out, renderTableBlockForTelegram(tableBlock))
 			i = j
 			continue
 		}
@@ -217,11 +220,11 @@ func formatMessage(content string) string {
 	text := content
 
 	// 0) Rewrite GFM-style pipe tables into Telegram-friendly row groups
-	text = _wrapMarkdownTables(text)
+	text = wrapMarkdownTables(text)
 
 	// 1) Protect fenced code blocks (``` ... ```)
 	// Per MarkdownV2 spec, \ and ` inside pre/code must be escaped.
-	text = _FENCED_RE.ReplaceAllStringFunc(text, func(m string) string {
+	text = fencedRe.ReplaceAllStringFunc(text, func(m string) string {
 		raw := m
 		// Split off opening ``` (with optional language) and closing ```
 		openEnd := strings.Index(raw[3:], "\n")
@@ -242,76 +245,76 @@ func formatMessage(content string) string {
 
 	// 2) Protect inline code (`...`)
 	// Escape \ inside inline code per MDV2 spec.
-	text = _INLINE_CODE_RE.ReplaceAllStringFunc(text, func(m string) string {
+	text = inlineCodeRe.ReplaceAllStringFunc(text, func(m string) string {
 		return ph(strings.ReplaceAll(m, `\`, `\\`))
 	})
 
 	// 3) Convert markdown links [text](url)
 	// Escape the display text; inside the URL only ')' and '\' need escaping per MDV2.
-	text = _LINK_RE.ReplaceAllStringFunc(text, func(m string) string {
-		parts := _LINK_RE.FindStringSubmatch(m)
+	text = linkRe.ReplaceAllStringFunc(text, func(m string) string {
+		parts := linkRe.FindStringSubmatch(m)
 		if len(parts) < 3 {
 			return m
 		}
-		display := _escapeMdv2(parts[1])
+		display := escapeMdv2(parts[1])
 		url := strings.ReplaceAll(parts[2], `\`, `\\`)
 		url = strings.ReplaceAll(url, `)`, `\)`)
 		return ph(fmt.Sprintf("[%s](%s)", display, url))
 	})
 
 	// 4) Convert markdown headers (## Title) → bold *Title*
-	text = _HEADER_RE.ReplaceAllStringFunc(text, func(m string) string {
-		parts := _HEADER_RE.FindStringSubmatch(m)
+	text = headerRe.ReplaceAllStringFunc(text, func(m string) string {
+		parts := headerRe.FindStringSubmatch(m)
 		if len(parts) < 2 {
 			return m
 		}
 		inner := strings.TrimSpace(parts[1])
 		// Strip redundant bold markers inside a header
-		inner = _BOLD_RE.ReplaceAllString(inner, `$1`)
-		return ph(fmt.Sprintf("*%s*", _escapeMdv2(inner)))
+		inner = boldRe.ReplaceAllString(inner, `$1`)
+		return ph(fmt.Sprintf("*%s*", escapeMdv2(inner)))
 	})
 
 	// 5) Convert bold: **text** → *text* (MarkdownV2 bold)
-	text = _BOLD_RE.ReplaceAllStringFunc(text, func(m string) string {
-		parts := _BOLD_RE.FindStringSubmatch(m)
+	text = boldRe.ReplaceAllStringFunc(text, func(m string) string {
+		parts := boldRe.FindStringSubmatch(m)
 		if len(parts) < 2 {
 			return m
 		}
-		return ph(fmt.Sprintf("*%s*", _escapeMdv2(parts[1])))
+		return ph(fmt.Sprintf("*%s*", escapeMdv2(parts[1])))
 	})
 
 	// 6) Convert italic: *text* → _text_ (MarkdownV2 italic)
 	// [^*\n]+ prevents matching across newlines (protects bullet lists)
-	text = _ITALIC_RE.ReplaceAllStringFunc(text, func(m string) string {
-		parts := _ITALIC_RE.FindStringSubmatch(m)
+	text = italicRe.ReplaceAllStringFunc(text, func(m string) string {
+		parts := italicRe.FindStringSubmatch(m)
 		if len(parts) < 2 {
 			return m
 		}
-		return ph(fmt.Sprintf("_%s_", _escapeMdv2(parts[1])))
+		return ph(fmt.Sprintf("_%s_", escapeMdv2(parts[1])))
 	})
 
 	// 7) Convert strikethrough: ~~text~~ → ~text~ (MarkdownV2)
-	text = _STRIKE_RE.ReplaceAllStringFunc(text, func(m string) string {
-		parts := _STRIKE_RE.FindStringSubmatch(m)
+	text = strikeRe.ReplaceAllStringFunc(text, func(m string) string {
+		parts := strikeRe.FindStringSubmatch(m)
 		if len(parts) < 2 {
 			return m
 		}
-		return ph(fmt.Sprintf("~%s~", _escapeMdv2(parts[1])))
+		return ph(fmt.Sprintf("~%s~", escapeMdv2(parts[1])))
 	})
 
 	// 8) Convert spoiler: ||text|| → ||text|| (protect from | escaping)
-	text = _SPOILER_RE.ReplaceAllStringFunc(text, func(m string) string {
-		parts := _SPOILER_RE.FindStringSubmatch(m)
+	text = spoilerRe.ReplaceAllStringFunc(text, func(m string) string {
+		parts := spoilerRe.FindStringSubmatch(m)
 		if len(parts) < 2 {
 			return m
 		}
-		return ph(fmt.Sprintf("||%s||", _escapeMdv2(parts[1])))
+		return ph(fmt.Sprintf("||%s||", escapeMdv2(parts[1])))
 	})
 
 	// 9) Convert blockquotes: > at line start → protect > from escaping
 	// Handles regular blockquotes (>) and expandable blockquotes (**>)
-	text = _BLOCKQUOTE_RE.ReplaceAllStringFunc(text, func(m string) string {
-		parts := _BLOCKQUOTE_RE.FindStringSubmatch(m)
+	text = blockquoteRe.ReplaceAllStringFunc(text, func(m string) string {
+		parts := blockquoteRe.FindStringSubmatch(m)
 		if len(parts) < 3 {
 			return m
 		}
@@ -319,13 +322,13 @@ func formatMessage(content string) string {
 		content := parts[2]
 		// Expandable blockquote: ** prefix with trailing ||
 		if strings.HasPrefix(prefix, "**") && strings.HasSuffix(content, "||") {
-			return ph(fmt.Sprintf("%s %s||", prefix, _escapeMdv2(content[:len(content)-2])))
+			return ph(fmt.Sprintf("%s %s||", prefix, escapeMdv2(content[:len(content)-2])))
 		}
-		return ph(fmt.Sprintf("%s %s", prefix, _escapeMdv2(content)))
+		return ph(fmt.Sprintf("%s %s", prefix, escapeMdv2(content)))
 	})
 
 	// 10) Escape remaining special characters in plain text
-	text = _escapeMdv2(text)
+	text = escapeMdv2(text)
 
 	// 11) Restore placeholders in reverse insertion order so that
 	// nested references resolve correctly.
@@ -348,7 +351,7 @@ func formatMessage(content string) string {
 			safeParts = append(safeParts, seg)
 		} else {
 			// Outside code — escape bare (){}
-			safeParts = append(safeParts, _escapeBareChars(seg))
+			safeParts = append(safeParts, escapeBareChars(seg))
 		}
 	}
 	text = strings.Join(safeParts, "")
@@ -374,8 +377,8 @@ func _splitByCode(text string) []string {
 	return result
 }
 
-// _escapeBareChars escapes bare (){} outside code blocks.
-func _escapeBareChars(seg string) string {
+// escapeBareChars escapes bare (){} outside code blocks.
+func escapeBareChars(seg string) string {
 	var out strings.Builder
 	runes := []rune(seg)
 	for i := 0; i < len(runes); i++ {
@@ -440,16 +443,15 @@ func stripMdv2(text string) string {
 		return text
 	}
 	// Remove escape backslashes before special characters: \* → *, \( → (, etc.
-	cleaned := regexp.MustCompile(`\\([_*\[\]()~` + "`" + `>#+\-=|{}.!\\])`).ReplaceAllString(text, `$1`)
+	cleaned := _STRIP_ESCAPE_RE.ReplaceAllString(text, `$1`)
 	// Remove standard markdown bold (**text** → text) BEFORE MarkdownV2 bold
-	cleaned = regexp.MustCompile(`\*\*([^*]+)\*\*`).ReplaceAllString(cleaned, `$1`)
+	cleaned = _STRIP_BOLD_RE.ReplaceAllString(cleaned, `$1`)
 	// Remove MarkdownV2 bold markers that formatMessage converted from **bold**
-	cleaned = regexp.MustCompile(`\*([^*]+)\*`).ReplaceAllString(cleaned, `$1`)
+	cleaned = _STRIP_ITALIC_RE.ReplaceAllString(cleaned, `$1`)
 	// Remove MarkdownV2 italic markers: _text_ → text
 	// Go regex no lookahead — simple match _..._
-	cleaned = regexp.MustCompile(`_([^_
-]+)_`).ReplaceAllString(cleaned, `$1`)
+	cleaned = _STRIP_UNDER_RE.ReplaceAllString(cleaned, `$1`)
 	// Remove strikethrough: ~text~ → text (not ~~)
-	cleaned = regexp.MustCompile(`~([^~]+)~`).ReplaceAllString(cleaned, `$1`)
+	cleaned = _STRIP_STRIKE_RE.ReplaceAllString(cleaned, `$1`)
 	return cleaned
 }

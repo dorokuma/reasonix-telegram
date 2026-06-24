@@ -19,6 +19,10 @@ const multiPartSendGap = 80 * time.Millisecond
 // Telegram Bot API: max length of a single text message (UTF-8 code points / runes).
 const telegramMaxMessageRunes = 4096
 
+// telegramMaxFormattedRunes is the safe truncation limit for formatted text,
+// reserving ~10% headroom for MarkdownV2 escaping expansion.
+const telegramMaxFormattedRunes = 3700
+
 // Hard cap on streamed reply size before finalize (OOM guard).
 const maxFinalizeBytes = 512 << 10
 const maxMediaSize = 50 << 20 // 50 MB max for media uploads
@@ -331,22 +335,24 @@ func streamContinuationText(final, visiblePrefix string) string {
 	return final
 }
 
-// capTelegramMessage trims text to fit one Telegram message (≤4096 runes).
+// capTelegramMessage trims text to fit one Telegram message, reserving ~10%
+// headroom for MarkdownV2 escaping expansion (leaves 3700 of the 4096 limit).
 func capTelegramMessage(text string) string {
+	const safeMaxRunes = 3700
 	text = strings.TrimSpace(text)
 	if text == "" {
 		return ""
 	}
 	runes := []rune(text)
-	if len(runes) <= telegramMaxMessageRunes {
+	if len(runes) <= safeMaxRunes {
 		return text
 	}
 	const suffix = "\n…（已截断）"
 	suffixRunes := len([]rune(suffix))
-	if telegramMaxMessageRunes <= suffixRunes {
-		return string(runes[:telegramMaxMessageRunes])
+	if safeMaxRunes <= suffixRunes {
+		return string(runes[:safeMaxRunes])
 	}
-	return string(runes[:telegramMaxMessageRunes-suffixRunes]) + suffix
+	return string(runes[:safeMaxRunes-suffixRunes]) + suffix
 }
 
 // newMessage creates a MessageConfig with link preview disabled (Hermes parity).
@@ -407,16 +413,24 @@ func (a *App) sendTextParts(chatID int64, text string, editFirstMsgID *int, noFi
 }
 
 func (a *App) sendFormattedParts(chatID int64, displayText string, editFirstMsgID *int, parseMode string) int {
-	// If no parseMode specified, use MDV2 with formatMessage (Hermes pattern).
-	if parseMode == "" {
-		displayText = formatMessage(displayText)
-		parseMode = tgbotapi.ModeMarkdownV2
-	}
 	parts := splitTelegramText(displayText, telegramMaxMessageRunes)
 	if len(parts) == 0 {
 		log.Printf("chat=%d: sendFormattedParts: splitTelegramText returned 0 parts, text len=%d", chatID, len(displayText))
 		return 0
 	}
+
+	// If no parseMode specified, use MDV2 with formatMessage (Hermes pattern).
+	if parseMode == "" {
+		parseMode = tgbotapi.ModeMarkdownV2
+		// Format each part individually after split, so formatting markers
+		// (e.g. ```fence```) are not broken across chunk boundaries.
+		formatted := make([]string, len(parts))
+		for i, part := range parts {
+			formatted[i] = formatMessage(part)
+		}
+		parts = formatted
+	}
+
 	if editFirstMsgID != nil && *editFirstMsgID != 0 {
 		return a.editOverflowSplit(chatID, *editFirstMsgID, parts, parseMode)
 	}
