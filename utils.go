@@ -246,7 +246,23 @@ func (a *App) recordSentText(msgID int, text string) {
 		})
 	}
 	a.sentTextCache.Store(msgID, text)
-	a.saveSentTextCache()
+	a.debounceSaveSentTextCache()
+}
+
+// debounceSaveSentTextCache resets the 5-second debounce timer.
+// Actual disk write happens at most once per 5 seconds of inactivity.
+func (a *App) debounceSaveSentTextCache() {
+	a.sentTextCacheTimerMu.Lock()
+	defer a.sentTextCacheTimerMu.Unlock()
+	if a.sentTextCacheTimer != nil {
+		a.sentTextCacheTimer.Stop()
+	}
+	a.sentTextCacheTimer = time.AfterFunc(5*time.Second, func() {
+		a.sentTextCacheTimerMu.Lock()
+		a.sentTextCacheTimer = nil
+		a.sentTextCacheTimerMu.Unlock()
+		a.saveSentTextCache()
+	})
 }
 
 // lookupSentText retrieves the stored text for a message ID, or "" if not found.

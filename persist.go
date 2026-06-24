@@ -255,6 +255,8 @@ func sessionStats(path string) (messages int, userTurns int, err error) {
 			return 0, 0, err
 		}
 		data = plain
+	} else if len(data) > 0 {
+		log.Printf("sessionStats: %s is not encrypted — stored in plaintext or corrupted", path)
 	}
 
 	dec := json.NewDecoder(bytes.NewReader(data))

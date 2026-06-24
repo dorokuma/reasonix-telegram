@@ -51,7 +51,7 @@ func discoverFallbackIPs() []string {
 	client := &http.Client{Timeout: 5 * time.Second}
 	for _, provider := range dohProviders {
 		url := provider.url + "?" + provider.params
-		req, err := http.NewRequest("GET", url, nil)
+		req, err := http.NewRequestWithContext(context.Background(), "GET", url, nil)
 		if err != nil {
 			continue
 		}
@@ -91,12 +91,14 @@ type TelegramFallbackTransport struct {
 	stickyIP    string
 	stickyOK    bool
 	mu          sync.Mutex
+	sanitizer   *TokenSanitizer
 }
 
 // NewTelegramFallbackTransport creates a transport with fallback IP discovery.
-func NewTelegramFallbackTransport(inner http.RoundTripper, manualIPs string) *TelegramFallbackTransport {
+func NewTelegramFallbackTransport(inner http.RoundTripper, manualIPs string, sanitizer *TokenSanitizer) *TelegramFallbackTransport {
 	t := &TelegramFallbackTransport{
-		inner: inner,
+		inner:     inner,
+		sanitizer: sanitizer,
 	}
 
 	// Manual IPs from env var take precedence
@@ -184,7 +186,7 @@ func (b *bodyWithCloseHook) Close() error {
 func (t *TelegramFallbackTransport) tryIP(req *http.Request, ip string) (*http.Response, error) {
 	clone := req.Clone(req.Context())
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	transport := &http.Transport{
+	innerTransport := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			host, port, err := net.SplitHostPort(addr)
 			if err == nil && (host == "api.telegram.org" || strings.HasSuffix(host, ".api.telegram.org")) {
@@ -194,24 +196,20 @@ func (t *TelegramFallbackTransport) tryIP(req *http.Request, ip string) (*http.R
 		},
 	}
 
+	// Wrap in token-redacting transport for consistent sanitization.
+	transport := &tokenRedactingTransport{
+		inner:     innerTransport,
+		sanitizer: t.sanitizer,
+	}
+
 	resp, err := transport.RoundTrip(clone)
 	if err != nil {
-		transport.CloseIdleConnections()
-		var token string
-		if rt, ok := t.inner.(*tokenRedactingTransport); ok {
-			token = rt.token
-		}
-		if token != "" {
-			sanitized := strings.ReplaceAll(err.Error(), token, "***")
-			if sanitized != err.Error() {
-				return resp, fmt.Errorf("%s", sanitized)
-			}
-		}
-		return resp, err
+		innerTransport.CloseIdleConnections()
+		return resp, t.sanitizer.SanitizeError(err)
 	}
 	resp.Body = &bodyWithCloseHook{
 		ReadCloser: resp.Body,
-		hook:       transport.CloseIdleConnections,
+		hook:       innerTransport.CloseIdleConnections,
 	}
 	return resp, nil
 }

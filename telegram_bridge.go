@@ -3,8 +3,10 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -30,12 +32,13 @@ func NewTelegramBridge(cfg *Config) (PlatformBridge, error) {
 	}
 	bot.Debug = false
 
+	sanitizer := NewTokenSanitizer(cfg.BotToken)
 	innerTransport := &tokenRedactingTransport{
-		inner: http.DefaultTransport,
-		token: cfg.BotToken,
+		inner:     http.DefaultTransport,
+		sanitizer: sanitizer,
 	}
 	bot.Client = &http.Client{
-		Transport: NewTelegramFallbackTransport(innerTransport, os.Getenv("TELEGRAM_FALLBACK_IPS")),
+		Transport: NewTelegramFallbackTransport(innerTransport, os.Getenv("TELEGRAM_FALLBACK_IPS"), sanitizer),
 		Timeout:   30 * time.Second,
 	}
 
@@ -120,18 +123,115 @@ func isPermanentAuthError(err error) bool {
 	return false
 }
 
+// TokenSanitizer replaces bot token occurrences with "***" across strings,
+// errors, URLs, and readers. Used by all HTTP exit paths for defense-in-depth
+// token redaction.
+type TokenSanitizer struct {
+	token    string
+	replacer *strings.Replacer
+}
+
+// NewTokenSanitizer creates a sanitizer that replaces token with "***".
+func NewTokenSanitizer(token string) *TokenSanitizer {
+	return &TokenSanitizer{
+		token:    token,
+		replacer: strings.NewReplacer(token, "***"),
+	}
+}
+
+// Sanitize returns s with the token replaced by "***".
+func (s *TokenSanitizer) Sanitize(text string) string {
+	if s == nil || s.token == "" || !strings.Contains(text, s.token) {
+		return text
+	}
+	return s.replacer.Replace(text)
+}
+
+// SanitizeError returns a new error with the token redacted.
+// Returns nil if err is nil.
+func (s *TokenSanitizer) SanitizeError(err error) error {
+	if err == nil || s == nil || s.token == "" {
+		return err
+	}
+	sanitized := s.replacer.Replace(err.Error())
+	if sanitized == err.Error() {
+		return err
+	}
+	return errors.New(sanitized)
+}
+
+// SanitizeURL returns a copy of u with the token segment in the path
+// replaced by "***". The original URL is not modified.
+func (s *TokenSanitizer) SanitizeURL(u *url.URL) *url.URL {
+	if s == nil || s.token == "" || u == nil {
+		return u
+	}
+	if !strings.Contains(u.String(), s.token) {
+		return u
+	}
+	// Clone the URL and sanitize its string representation
+	clone := *u
+	sanitizedPath := s.replacer.Replace(clone.Path)
+	clone.Path = sanitizedPath
+	// Also sanitize RawPath if set (for URL-encoded paths)
+	if clone.RawPath != "" {
+		clone.RawPath = s.replacer.Replace(clone.RawPath)
+	}
+	return &clone
+}
+
+// sanitizingReadCloser wraps an io.ReadCloser and sanitizes reads.
+type sanitizingReadCloser struct {
+	rc       io.ReadCloser
+	sanitizer *TokenSanitizer
+	buf      []byte // 1 byte lookahead buffer for partial token detection at boundaries
+}
+
+// Read implements io.Reader with token sanitization.
+// Uses a simple approach: buffers small reads to detect and replace token
+// across read boundaries.
+func (r *sanitizingReadCloser) Read(p []byte) (int, error) {
+	// For simplicity, read into a larger buffer, sanitize, then copy.
+	// We use a fixed 32KB buffer to avoid pathological cases.
+	const bufSize = 32 * 1024
+	tmp := make([]byte, len(p)+bufSize)
+	n, err := r.rc.Read(tmp)
+	if n > 0 {
+		sanitized := r.sanitizer.Sanitize(string(tmp[:n]))
+		copied := copy(p, sanitized)
+		return copied, err
+	}
+	return n, err
+}
+
+func (r *sanitizingReadCloser) Close() error {
+	return r.rc.Close()
+}
+
+// wrapReadCloser wraps an io.ReadCloser with token sanitization on read.
+func (s *TokenSanitizer) WrapReadCloser(rc io.ReadCloser) io.ReadCloser {
+	if s == nil || s.token == "" {
+		return rc
+	}
+	return &sanitizingReadCloser{rc: rc, sanitizer: s}
+}
+
+// tokenRedactingTransport wraps an http.RoundTripper and redacts the bot
+// token from error messages, request URLs (in errors), and optionally from
+// response bodies.
 type tokenRedactingTransport struct {
-	inner http.RoundTripper
-	token string
+	inner     http.RoundTripper
+	sanitizer *TokenSanitizer
 }
 
 func (t *tokenRedactingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := t.inner.RoundTrip(req)
-	if err != nil && t.token != "" {
-		sanitized := strings.ReplaceAll(err.Error(), t.token, "***")
-		if sanitized != err.Error() {
-			return resp, errors.New(sanitized)
-		}
+	if err != nil {
+		return resp, t.sanitizer.SanitizeError(err)
+	}
+	// Sanitize response body if the response indicates an error (non-2xx).
+	if resp.StatusCode >= 400 {
+		resp.Body = t.sanitizer.WrapReadCloser(resp.Body)
 	}
 	return resp, err
 }

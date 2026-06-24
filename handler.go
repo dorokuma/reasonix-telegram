@@ -18,7 +18,6 @@ import (
 var seenMsgs sync.Map // inbound message_id dedup
 
 func (a *App) handleMessage(m *tgbotapi.Message) {
-	a.msgWg.Add(1)
 	defer a.msgWg.Done()
 	defer func() {
 		if r := recover(); r != nil {
@@ -31,12 +30,14 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 	}
 	// Per-chat rate limit: at most 1 message per 3 seconds.
 	const minInterval = 3 * time.Second
-	if last, ok := a.rateLimits.Load(m.Chat.ID); ok {
-		if time.Since(last.(time.Time)) < minInterval {
+	now := time.Now()
+	if last, loaded := a.rateLimits.LoadOrStore(m.Chat.ID, now); loaded {
+		lastTime, ok := last.(time.Time)
+		if !ok || now.Sub(lastTime) < minInterval {
 			return // silently drop
 		}
+		a.rateLimits.Store(m.Chat.ID, now)
 	}
-	a.rateLimits.Store(m.Chat.ID, time.Now())
 	// Inbound message_id dedup: drop duplicate Telegram updates.
 	// Entries older than 10 minutes are treated as new (timestamp-based expiry).
 	if m.MessageID != 0 {

@@ -7,6 +7,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"fmt"
 	"io"
@@ -22,7 +23,23 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
-const maxMediaCachePerChat = 100
+const (
+	maxMediaCachePerChat = 100
+	maxDataURLSize       = 10 * 1024 * 1024 // 10 MB — skip base64 encoding beyond this
+	maxTotalCacheSize    = 2 * 1024 * 1024 * 1024 // 2 GB — global LRU cache limit
+)
+
+// downloadSem limits concurrent Telegram file downloads to prevent OOM under load.
+var downloadSem = make(chan struct{}, 3)
+
+// promptSafeName truncates a filename to at most 64 characters for safe
+// embedding in AI prompt text, preventing prompt injection via long filenames.
+func promptSafeName(name string) string {
+	if len(name) > 64 {
+		return name[:64]
+	}
+	return name
+}
 
 // cacheDir returns the cache directory for a given category and chat, creating it if needed.
 func (a *App) cacheDir(category string, chatID int64) string {
@@ -35,6 +52,7 @@ func (a *App) cacheDir(category string, chatID int64) string {
 
 // downloadTelegramFile downloads a file from Telegram by fileID into the local cache.
 // Returns the local file path. Reuses cached files on subsequent calls.
+// Concurrent downloads are throttled by downloadSem (cap 3) to limit peak memory.
 func (a *App) downloadTelegramFile(fileID string, ext string, category string, chatID int64) (string, error) {
 	tf, err := a.bot.GetFile(tgbotapi.FileConfig{FileID: fileID})
 	if err != nil {
@@ -54,15 +72,21 @@ func (a *App) downloadTelegramFile(fileID string, ext string, category string, c
 		return localPath, nil
 	}
 
+	// Throttle concurrent downloads (semaphore acquire).
+	downloadSem <- struct{}{}
+	defer func() { <-downloadSem }()
+
 	// Download from Telegram (use bot.Client which has tokenRedactingTransport)
 	url := tf.Link(a.bot.Token)
-	req, err := http.NewRequest("GET", url, nil)
+	req, err := http.NewRequestWithContext(context.Background(), "GET", url, nil)
 	if err != nil {
 		return "", fmt.Errorf("download file %s: %w", fileID, err)
 	}
 	resp, err := a.bot.Client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("download file %s: %w", fileID, err)
+		// Sanitize token from any error (e.g. timeout, DNS failure) that
+		// might include the download URL with the bot token embedded.
+		return "", fmt.Errorf("download file %s: %v", fileID, redactSecrets(err.Error(), a.cfg.secrets))
 	}
 	defer resp.Body.Close()
 
@@ -93,38 +117,93 @@ func (a *App) downloadTelegramFile(fileID string, ext string, category string, c
 	return localPath, nil
 }
 
-// cleanupCacheDir removes oldest files when a cache directory exceeds the per-chat limit.
+// cleanupCacheDir removes oldest files when a cache directory exceeds the per-chat limit
+// or when the global cache directory exceeds maxTotalCacheSize.
 func (a *App) cleanupCacheDir(category string, chatID int64) {
 	dir := a.cacheDir(category, chatID)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return
 	}
-	if len(entries) <= maxMediaCachePerChat {
+	if len(entries) > maxMediaCachePerChat {
+		type entry struct {
+			name string
+			mod  time.Time
+		}
+		var list []entry
+		for _, e := range entries {
+			info, err := e.Info()
+			if err != nil {
+				continue
+			}
+			list = append(list, entry{e.Name(), info.ModTime()})
+		}
+		sort.Slice(list, func(i, j int) bool {
+			return list[i].mod.Before(list[j].mod)
+		})
+		excess := len(list) - maxMediaCachePerChat
+		for i := 0; i < excess; i++ {
+			path := filepath.Join(dir, list[i].name)
+			if err := os.Remove(path); err != nil {
+				log.Printf("chat=%d: cache cleanup remove %s: %v", chatID, path, err)
+			}
+		}
+	}
+
+	// Global LRU check: if total cache exceeds maxTotalCacheSize, remove oldest files
+	// across all categories and chats.
+	cacheRoot := filepath.Join(a.cfg.StateDir, "cache")
+	totalSize, files := a.walkCacheFiles(cacheRoot)
+	if totalSize <= maxTotalCacheSize {
 		return
 	}
-	type entry struct {
-		name string
-		mod  time.Time
-	}
-	var list []entry
-	for _, e := range entries {
-		info, err := e.Info()
+	// Sort by mod time ascending (oldest first).
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].mod.Before(files[j].mod)
+	})
+	overage := totalSize - maxTotalCacheSize
+	var removed int64
+	for _, f := range files {
+		if removed >= overage {
+			break
+		}
+		info, err := os.Stat(f.path)
 		if err != nil {
 			continue
 		}
-		list = append(list, entry{e.Name(), info.ModTime()})
-	}
-	sort.Slice(list, func(i, j int) bool {
-		return list[i].mod.Before(list[j].mod)
-	})
-	excess := len(list) - maxMediaCachePerChat
-	for i := 0; i < excess; i++ {
-		path := filepath.Join(dir, list[i].name)
-		if err := os.Remove(path); err != nil {
-			log.Printf("chat=%d: cache cleanup remove %s: %v", chatID, path, err)
+		if err := os.Remove(f.path); err != nil {
+			log.Printf("global cache cleanup remove %s: %v", f.path, err)
+			continue
 		}
+		removed += info.Size()
 	}
+	if removed > 0 {
+		log.Printf("global cache cleanup: removed %d bytes across %d files to stay under %d byte limit",
+			removed, len(files), maxTotalCacheSize)
+	}
+}
+
+type cacheFile struct {
+	path string
+	mod  time.Time
+}
+
+// walkCacheFiles walks cacheRoot recursively, collecting all files with their sizes and mod times.
+func (a *App) walkCacheFiles(cacheRoot string) (int64, []cacheFile) {
+	var total int64
+	var files []cacheFile
+	filepath.Walk(cacheRoot, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info == nil {
+			return nil
+		}
+		if !info.Mode().IsRegular() {
+			return nil
+		}
+		total += info.Size()
+		files = append(files, cacheFile{path: path, mod: info.ModTime()})
+		return nil
+	})
+	return total, files
 }
 
 // --- Multimodal encoding helpers ---
@@ -133,7 +212,17 @@ func (a *App) cleanupCacheDir(category string, chatID int64) {
 // data URL string suitable for the OpenAI image_url field, e.g.
 // "data:image/jpeg;base64,/9j/4AAQ...".
 // Supported extensions: .jpg, .jpeg, .png, .gif, .webp.
+// Files larger than maxDataURLSize (10 MB) are skipped to avoid OOM.
 func dataURLFromFile(path string) (string, error) {
+	// Check file size before reading to avoid OOM on large files.
+	fi, err := os.Stat(path)
+	if err != nil {
+		return "", fmt.Errorf("stat %s: %w", path, err)
+	}
+	if fi.Size() > maxDataURLSize {
+		log.Printf("dataURLFromFile: skip %s, size=%d exceeds %d", path, fi.Size(), maxDataURLSize)
+		return "", fmt.Errorf("file too large for data URL (%d > %d bytes)", fi.Size(), maxDataURLSize)
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return "", fmt.Errorf("read %s: %w", path, err)
@@ -303,19 +392,22 @@ func (a *App) handleIncomingMedia(m *tgbotapi.Message) mediaResult {
 	if m.Document != nil {
 		ext := ".dat"
 		if m.Document.FileName != "" {
-			if idx := strings.LastIndex(m.Document.FileName, "."); idx >= 0 {
-				ext = m.Document.FileName[idx:]
+			if e := filepath.Ext(m.Document.FileName); e != "" {
+				switch strings.ToLower(e) {
+				case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4", ".pdf", ".ogg", ".mp3", ".dat":
+					ext = e
+				}
 			}
 		}
 		path, err := a.downloadTelegramFile(m.Document.FileID, ext, "docs", m.Chat.ID)
 		if err != nil {
 			log.Printf("chat=%d: download document: %v", m.Chat.ID, err)
-			return mediaResult{Text: fmt.Sprintf("[用户发送了文件 %s，下载失败]", m.Document.FileName)}
+			return mediaResult{Text: fmt.Sprintf("[用户发送了文件 %s，下载失败]", promptSafeName(m.Document.FileName))}
 		}
 
 		lowerName := strings.ToLower(m.Document.FileName)
 		if strings.HasSuffix(lowerName, ".pdf") {
-			desc := fmt.Sprintf("[用户发送了PDF文件 %s，保存在 %s]", m.Document.FileName, path)
+			desc := fmt.Sprintf("[用户发送了PDF文件 %s，保存在 %s]", promptSafeName(m.Document.FileName), path)
 			urls, err := convertPDFToImages(path)
 			if err != nil {
 				log.Printf("chat=%d: convert PDF: %v", m.Chat.ID, err)
@@ -326,7 +418,7 @@ func (a *App) handleIncomingMedia(m *tgbotapi.Message) mediaResult {
 
 		// For image-type documents (PNG, JPG, etc.), send as image
 		if mimeFromExt(path) != "" {
-			desc := fmt.Sprintf("[用户发送了图片文件 %s，保存在 %s]", m.Document.FileName, path)
+			desc := fmt.Sprintf("[用户发送了图片文件 %s，保存在 %s]", promptSafeName(m.Document.FileName), path)
 			urls, err := dataURLsFromImage(path)
 			if err != nil {
 				log.Printf("chat=%d: encode document image: %v", m.Chat.ID, err)
@@ -335,7 +427,7 @@ func (a *App) handleIncomingMedia(m *tgbotapi.Message) mediaResult {
 			return mediaResult{Text: desc, DataURLs: urls}
 		}
 
-		return mediaResult{Text: fmt.Sprintf("[用户发送了文件 %s，保存在 %s]", m.Document.FileName, path)}
+		return mediaResult{Text: fmt.Sprintf("[用户发送了文件 %s，保存在 %s]", promptSafeName(m.Document.FileName), path)}
 	}
 
 	// --- Video ---
@@ -385,13 +477,16 @@ func (a *App) handleIncomingMedia(m *tgbotapi.Message) mediaResult {
 	if m.Audio != nil {
 		ext := ".mp3"
 		if m.Audio.FileName != "" {
-			if idx := strings.LastIndex(m.Audio.FileName, "."); idx >= 0 {
-				ext = m.Audio.FileName[idx:]
+			if e := filepath.Ext(m.Audio.FileName); e != "" {
+				switch strings.ToLower(e) {
+				case ".jpg", ".jpeg", ".png", ".gif", ".webp", ".mp4", ".pdf", ".ogg", ".mp3", ".dat":
+					ext = e
+				}
 			}
 		}
 		title := m.Audio.Title
 		if title == "" {
-			title = m.Audio.FileName
+			title = promptSafeName(m.Audio.FileName)
 		}
 		if title == "" {
 			title = "音频"

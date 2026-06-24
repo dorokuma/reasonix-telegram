@@ -391,7 +391,6 @@ func (a *App) persistModel(chatID int64, modelID string) error {
 }
 
 func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
-	a.msgWg.Add(1)
 	defer a.msgWg.Done()
 	defer func() {
 		if r := recover(); r != nil {
@@ -402,11 +401,21 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 	if cq.Message == nil || cq.From == nil {
 		return
 	}
+	chatID := cq.Message.Chat.ID
+
+	// Per-chat rate limit: at most 1 callback per 3 seconds.
+	const minInterval = 3 * time.Second
+	now := time.Now()
+	if last, loaded := a.rateLimits.LoadOrStore(chatID, now); loaded {
+		if now.Sub(last.(time.Time)) < minInterval {
+			return // silently drop
+		}
+		a.rateLimits.Store(chatID, now)
+	}
 	if !a.allowed(cq.From) {
 		a.answerCallback(cq.ID, "⛔ 无权限")
 		return
 	}
-	chatID := cq.Message.Chat.ID
 	data := strings.TrimSpace(cq.Data)
 	log.Printf("chat=%d: callback data=%q", chatID, logPreview(data, 200))
 

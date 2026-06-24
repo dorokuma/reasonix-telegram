@@ -279,6 +279,13 @@ func (a *App) triggerCronTask(task *CronTask) {
 	datePrefix := fmt.Sprintf("[系统时间：%s]\n", now.Format("2006年1月2日")+" "+weekdayMap[now.Weekday()])
 	fullPrompt := datePrefix + task.Prompt
 
+	// Truncate prompt to 4096 bytes to prevent passing excessively large
+	// text as a command-line argument, which could cause OS-level truncation
+	// or silently fail (ARG_MAX / exec E2BIG on Linux).
+	if len(fullPrompt) > 4096 {
+		fullPrompt = fullPrompt[:4096]
+	}
+
 	cmd := exec.CommandContext(ctx, a.cfg.ReasonixBin, "run", "--resume", tmpPath, "--model", "deepseek-v4-flash", "--", fullPrompt)
 	out, err := cmd.CombinedOutput()
 	if err != nil {

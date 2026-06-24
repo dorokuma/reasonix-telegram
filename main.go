@@ -280,6 +280,9 @@ func loadConfig() Config {
 	if cf := os.Getenv("CF_TOKEN"); cf != "" {
 		c.secrets = append(c.secrets, cf)
 	}
+	if fb := os.Getenv("TELEGRAM_FALLBACK_IPS"); fb != "" {
+		c.secrets = append(c.secrets, fb)
+	}
 	return c
 }
 
@@ -366,6 +369,8 @@ type App struct {
 	sentTextCache  sync.Map     // message_id → sent text (for reply/quote extraction)
 	sentTextCachePath string       // path to sent_text_cache.json on disk
 	sentTextCacheMu   sync.Mutex   // guards saveSentTextCache disk write
+	sentTextCacheTimer  *time.Timer   // debounce timer for saveSentTextCache
+	sentTextCacheTimerMu sync.Mutex   // guards timer
 	stickerMu         sync.Mutex   // guards stickerCache load/save/handle
 
 	mediaGroupsMu sync.Mutex
@@ -375,6 +380,8 @@ type App struct {
 
 	noticeMu   sync.Mutex
 	lastNotice map[string]time.Time // "chatID|noticeText" → last seen time
+
+	healthCheckStop chan struct{} // closed on shutdown to stop health check goroutine
 }
 
 // redactSecrets returns s with known secrets replaced by "***".
@@ -390,7 +397,9 @@ func redactSecrets(s string, secrets []string) string {
 
 func (a *App) getMode() string {
 	if v := a.mode.Load(); v != nil {
-		return v.(string)
+		if s, ok := v.(string); ok {
+			return s
+		}
 	}
 	return ModeChat
 }
@@ -414,8 +423,8 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	cfg := loadConfig()
 
-	// Strip API key from process environment so /proc/<pid>/environ doesn't leak it.
-	// reasonixEnv() passes it explicitly to child processes from cfg.DeepSeekKey.
+	// Strip API keys from process environment so /proc/<pid>/environ doesn't leak them.
+	// StartServe passes DEEPSEEK_API_KEY to child processes via a temp file + DEEPSEEK_API_KEY_FILE.
 	os.Unsetenv("DEEPSEEK_API_KEY")
 	os.Unsetenv("TG_BOT_TOKEN")
 	os.Unsetenv("CF_TOKEN")
@@ -450,6 +459,7 @@ func main() {
 		state:       st,
 		sess:        map[int64]*session{},
 		mediaGroups: map[int64]map[string]*mediaGroupBatch{},
+		healthCheckStop: make(chan struct{}),
 	}
 	app.setMode(cfg.Mode)
 	if err := app.ensureUserRulesLinked(); err != nil {
@@ -465,11 +475,32 @@ func main() {
 	app.startRestartWatchdog()
 	app.cleanupStaleServesOnStartup()
 	app.restorePersistedSessions()
+	app.startServeHealthCheck()
 	app.notifyBridgeRestarted()
 	app.initCron()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
+
+	// Periodic cleanup of seenMsgs (message_id dedup) — remove entries older than 10 min.
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				now := time.Now().Unix()
+				seenMsgs.Range(func(key, value any) bool {
+					if ts, ok := value.(int64); ok && now-ts > 600 {
+						seenMsgs.Delete(key)
+					}
+					return true
+				})
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
 
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
@@ -479,10 +510,19 @@ func main() {
 		select {
 		case <-ctx.Done():
 			log.Printf("shutdown signal: flushing reasonix sessions…")
+			close(app.healthCheckStop)
 			app.msgWg.Wait()
 			app.cancelAllTasks()
 			app.waitTasksDone(5 * time.Second)
 			app.stopAllServes()
+			// Stop sentTextCache debounce timer and flush remaining data.
+			app.sentTextCacheTimerMu.Lock()
+			if app.sentTextCacheTimer != nil {
+				app.sentTextCacheTimer.Stop()
+				app.sentTextCacheTimer = nil
+			}
+			app.sentTextCacheTimerMu.Unlock()
+			app.saveSentTextCache()
 			if app.cronManager != nil {
 				app.cronManager.cron.Stop()
 				if app.cronManager.watcher != nil {
@@ -492,12 +532,15 @@ func main() {
 			return
 		case upd, ok := <-updates:
 			if !ok {
+				app.msgWg.Wait()
 				return
 			}
 			if upd.Message != nil {
+				app.msgWg.Add(1)
 				go app.handleMessage(upd.Message)
 			}
 			if upd.CallbackQuery != nil {
+				app.msgWg.Add(1)
 				go app.handleCallbackQuery(upd.CallbackQuery)
 			}
 		}

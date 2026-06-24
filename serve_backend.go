@@ -179,8 +179,6 @@ func (a *App) reasonixEnv(chatID int64) []string {
 	safePrefixes := []string{
 		"HOME=", "USER=", "LOGNAME=", "SHELL=",
 		"PATH=", "LANG=", "LC_", "LANGUAGE=", "TZ=",
-		"HTTP_PROXY=", "HTTPS_PROXY=", "NO_PROXY=",
-		"http_proxy=", "https_proxy=", "no_proxy=",
 		"EDITOR=", "VISUAL=", "PAGER=",
 		"XDG_CACHE_HOME=", "XDG_CONFIG_HOME=", "XDG_DATA_HOME=", "XDG_STATE_HOME=",
 	}
@@ -210,11 +208,8 @@ func (a *App) reasonixEnv(chatID int64) []string {
 		}
 	}
 
-	// Only DEEPSEEK_API_KEY is intentionally forwarded.
-	if k := a.cfg.DeepSeekKey; k != "" {
-		env = append(env, "DEEPSEEK_API_KEY="+k)
-	}
-
+	// DEEPSEEK_API_KEY is forwarded via DEEPSEEK_API_KEY_FILE (see startServe)
+	// to avoid leaking the secret in /proc/PID/environ.
 	// systemd ProtectHome=read-only blocks /root/.cache; keep caches under StateDir.
 	cacheBase := filepath.Join(a.cfg.StateDir, "cache")
 	env = append(env,
@@ -409,8 +404,7 @@ func (a *App) startServe(chatID int64, skipPortCheck bool) error {
 				tmpf.Close()
 			}
 		}
-		// Keep DEEPSEEK_API_KEY as compatibility fallback.
-		env = append(env, "DEEPSEEK_API_KEY="+k)
+		// Reasonix reads the key from DEEPSEEK_API_KEY_FILE (set above).
 	}
 	cmd.Env = env
 	// Go wires nil Stderr to /dev/null; forward serve diagnostics (RTK/CTX hit/miss) to journal.
@@ -491,7 +485,13 @@ func (a *App) startServeHealthCheck() {
 	go func() {
 		ticker := time.NewTicker(60 * time.Second)
 		defer ticker.Stop()
-		for range ticker.C {
+		for {
+			select {
+			case <-ticker.C:
+			case <-a.healthCheckStop:
+				log.Printf("health: stop signal received, exiting health check")
+				return
+			}
 			a.sessMu.Lock()
 			type deadChat struct {
 				id  int64
@@ -574,6 +574,8 @@ func (a *App) restorePersistedSessions() {
 		})
 		log.Printf("startup: recovered orphan session jsonl for chat=%d", chatID)
 	}
+	const maxConcurrentRestores = 5
+	sem := make(chan struct{}, maxConcurrentRestores)
 	for _, rec := range records {
 		s := a.getOrCreateSession(rec.ChatID)
 		s.mu.Lock()
@@ -593,7 +595,9 @@ func (a *App) restorePersistedSessions() {
 		s.cumCost = rec.CumCost
 		s.cumCurrency = rec.CumCurrency
 		s.mu.Unlock()
+		sem <- struct{}{}
 		go func(chatID int64) {
+			defer func() { <-sem }()
 			if err := a.startServe(chatID, false); err != nil {
 				log.Printf("chat=%d: restore serve failed (will retry on next message): %v", chatID, err)
 			}
@@ -658,7 +662,10 @@ func (a *App) waitServeReady(port int, timeout time.Duration) error {
 		resp, err := client.Get(url)
 		if err == nil {
 			if resp.StatusCode == http.StatusOK {
-				body, _ := io.ReadAll(resp.Body)
+				body, err := io.ReadAll(resp.Body)
+				if err != nil {
+					log.Printf("waitServeReady: read body: %v", err)
+				}
 				resp.Body.Close()
 				if strings.Contains(string(body), "label") {
 					return nil
@@ -677,7 +684,7 @@ func (a *App) postJSON(port int, path string, body any) error {
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodPost, serveBaseURL(port)+path, bytes.NewReader(b))
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, serveBaseURL(port)+path, bytes.NewReader(b))
 	if err != nil {
 		return err
 	}
@@ -688,7 +695,10 @@ func (a *App) postJSON(port int, path string, body any) error {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 300 {
-		msg, _ := io.ReadAll(resp.Body)
+		msg, err := io.ReadAll(resp.Body)
+		if err != nil {
+			log.Printf("postJSON: read error response body: %v", err)
+		}
 		return fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(msg)))
 	}
 	return nil
@@ -743,11 +753,18 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 	if err != nil {
 		return fmt.Errorf("reasonix events: %w", err)
 	}
-	defer resp.Body.Close()
+	var closeBodyOnce sync.Once
+	closeBody := func() {
+		closeBodyOnce.Do(func() {
+			resp.Body.Close()
+		})
+	}
+	defer closeBody()
 
 	// Verify this is an SSE stream; non-SSE responses (e.g. HTML error pages
 	// from a misconfigured serve) are fatal and should not be retried.
 	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
+		closeBody()
 		return fmt.Errorf("%w: %q (URL: %s)", errNonSSEResponse, ct, serveBaseURL(port)+"/events")
 	}
 
@@ -756,7 +773,7 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 	go func() {
 		select {
 		case <-ctx.Done():
-			resp.Body.Close()
+			closeBody()
 		case <-ctxDoneChan:
 		}
 	}()
@@ -784,7 +801,7 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 				elapsed := time.Now().Unix() - atomic.LoadInt64(&lastActivityUnix)
 				if elapsed > 300 {
 					log.Printf("port=%d: SSE idle for %ds, closing stream", port, elapsed)
-					resp.Body.Close()
+					closeBody()
 					return
 				}
 			case <-watchdogCtx.Done():
@@ -1336,10 +1353,14 @@ func toolDisplayLine(toolName, argsJSON string) string {
 			return "🧠 " + t
 		}
 		return "🧠 remember"
+	case "forget":
+		return "🗑️ forget"
 	case "note", "ctx_read", "ctx_search":
 		return "📝 " + toolName
 	case "ctx_run":
 		return "💻 bash"
+	case "ctx_index":
+		return "📑 ctx_index"
 	case "audit_finish":
 		return "📋 audit"
 	case "delete_range", "delete_symbol":
@@ -1348,10 +1369,29 @@ func toolDisplayLine(toolName, argsJSON string) string {
 		return "📓 notebook"
 	case "bash_output", "wait", "kill_shell":
 		return "⏱ " + toolName
+	case "list_scheduled_tasks":
+		return "📅 scheduled"
+	case "list_sessions":
+		return "💬 sessions"
+	case "read_session":
+		return "📜 read_session"
 	case "run_skill", "install_skill", "install_source", "slash_command":
 		return "📚 " + toolName
+	case "read_skill":
+		return "📖 read_skill"
 	case "task":
+		if desc := str("description"); desc != "" {
+			return fmt.Sprintf("🤖 task(%s)", desc)
+		}
 		return "🤖 task"
+	case "explore":
+		return "🔍 explore"
+	case "research":
+		return "🧪 research"
+	case "review":
+		return "🧐 review"
+	case "security_review":
+		return "🛡️ security"
 	case "gh", "git":
 		return "🔀 " + toolName
 	case "docker":
@@ -1360,20 +1400,29 @@ func toolDisplayLine(toolName, argsJSON string) string {
 		return "⚙️ " + toolName
 	case "ask":
 		return "❓"
+	case "lsp_definition":
+		return "🎯 definition"
+	case "lsp_diagnostics":
+		return "⚠️ diagnostics"
+	case "lsp_hover":
+		return "🖱️ hover"
+	case "lsp_references":
+		return "🔗 references"
 	default:
 		// MCP tools: match by prefix.
 		switch {
-		case strings.HasPrefix(toolName, "mcp__cf-bindings__"):
-			return "☁️ " + strings.TrimPrefix(toolName, "mcp__cf-bindings__")
-		case strings.HasPrefix(toolName, "mcp__cf-observability__"):
-			return "📊 " + strings.TrimPrefix(toolName, "mcp__cf-observability__")
-		case strings.HasPrefix(toolName, "mcp__cf-builds__"):
-			return "🔨 " + strings.TrimPrefix(toolName, "mcp__cf-builds__")
-		case strings.HasPrefix(toolName, "mcp__cf-docs__"):
-			return "📖 " + strings.TrimPrefix(toolName, "mcp__cf-docs__")
-		case strings.HasPrefix(toolName, "mcp__jina__"):
-			return "🌐 " + strings.TrimPrefix(toolName, "mcp__jina__")
-		// (deleted mcp__codegraph__)
+		case strings.HasPrefix(toolName, "mcp_cf-bindings_"):
+			return "☁️ " + strings.TrimPrefix(toolName, "mcp_cf-bindings_")
+		case strings.HasPrefix(toolName, "mcp_cf-observability_"):
+			return "📊 " + strings.TrimPrefix(toolName, "mcp_cf-observability_")
+		case strings.HasPrefix(toolName, "mcp_cf-builds_"):
+			return "🔨 " + strings.TrimPrefix(toolName, "mcp_cf-builds_")
+		case strings.HasPrefix(toolName, "mcp_cf-docs_"):
+			return "📖 " + strings.TrimPrefix(toolName, "mcp_cf-docs_")
+		case strings.HasPrefix(toolName, "mcp_jina_"):
+			return "🌐 " + strings.TrimPrefix(toolName, "mcp_jina_")
+		case strings.HasPrefix(toolName, "mcp_codegraph_"):
+			return "🔬 " + strings.TrimPrefix(toolName, "mcp_codegraph_")
 		default:
 			// Fallback: try to find a string arg for display.
 			if args != nil {

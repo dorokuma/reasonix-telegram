@@ -65,6 +65,40 @@ func loadOrCreateKey() ([]byte, error) {
 	return key, nil
 }
 
+// encryptWithAAD encrypts plaintext with AES-256-GCM, binding aad (additional
+// authenticated data) to the ciphertext. Output: magic(4) || nonce(12) || ciphertext || tag.
+func encryptWithAAD(plaintext, aad []byte) ([]byte, error) {
+	key, err := loadOrCreateKey()
+	if err != nil {
+		return nil, err
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, fmt.Errorf("sessioncrypt: cipher: %w", err)
+	}
+	gcm, err := cipher.NewGCM(block)
+	if err != nil {
+		return nil, fmt.Errorf("sessioncrypt: gcm: %w", err)
+	}
+	nonceSize := gcm.NonceSize()
+	nonce := make([]byte, nonceSize)
+	if _, err := rand.Read(nonce); err != nil {
+		return nil, fmt.Errorf("sessioncrypt: nonce: %w", err)
+	}
+	// Layout: magic || nonce || ciphertext(with tag appended by Seal)
+	out := make([]byte, magicLen+nonceSize+len(plaintext)+gcm.Overhead())
+	copy(out, magicPrefix)
+	copy(out[magicLen:], nonce)
+	gcm.Seal(out[magicLen+nonceSize:magicLen+nonceSize], nonce, plaintext, aad)
+	return out, nil
+}
+
+// Encrypt encrypts plaintext with AES-256-GCM.
+// Output: magic(4) || nonce(12) || ciphertext || tag.
+func Encrypt(plaintext []byte) ([]byte, error) {
+	return encryptWithAAD(plaintext, nil)
+}
+
 func DecryptWithAAD(data, aad []byte) ([]byte, error) {
 	if len(data) < magicLen {
 		return nil, errors.New("sessioncrypt: data too short (missing magic)")

@@ -548,9 +548,6 @@ func (a *App) sendWithRetry(msg tgbotapi.Chattable, chatID int64) (tgbotapi.Mess
 			if waitSec < 1 {
 				waitSec = 5
 			}
-			if waitSec > 15 {
-				waitSec = 15
-			}
 			log.Printf("chat=%d: flood wait %ds (attempt %d/%d)", chatID, waitSec, attempt+1, maxAttempts)
 			time.Sleep(time.Duration(waitSec) * time.Second)
 			continue

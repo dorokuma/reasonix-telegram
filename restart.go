@@ -2,10 +2,13 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -29,8 +32,15 @@ func saveRestartNotify(stateDir string, chatID int64) error {
 	defer restartNotifyMu.Unlock()
 	path := restartNotifyPath(stateDir)
 	var nf restartNotifyFile
-	if b, err := os.ReadFile(path); err == nil {
+	// Use O_NOFOLLOW to prevent symlink-following TOCTOU attacks between
+	// the read and the subsequent write+rename.
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
+	if err == nil {
+		b, _ := io.ReadAll(f)
+		f.Close()
 		_ = json.Unmarshal(b, &nf)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("open restart notify: %w", err)
 	}
 	for _, id := range nf.NotifyChats {
 		if id == chatID {
@@ -81,11 +91,16 @@ func loadRestartNotify(stateDir string) ([]int64, error) {
 	restartNotifyMu.Lock()
 	defer restartNotifyMu.Unlock()
 	path := restartNotifyPath(stateDir)
-	b, err := os.ReadFile(path)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
 		}
+		return nil, err
+	}
+	defer f.Close()
+	b, err := io.ReadAll(f)
+	if err != nil {
 		return nil, err
 	}
 	var nf restartNotifyFile

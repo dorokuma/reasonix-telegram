@@ -4,6 +4,7 @@ language: go
 module: github.com/dorokuma/reasonix-telegram
 go_version: 1.24.4
 build:
+  cmd: go build -ldflags="-s -w" -o /usr/local/bin/reasonix-telegram .
   output: /usr/local/bin/reasonix-telegram
   ldflags: "-s -w"
 deploy:

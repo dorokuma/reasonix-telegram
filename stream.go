@@ -840,6 +840,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		draftMu.Lock()
 		streamDone = true
 		draftMu.Unlock()
+		a.dismissSessionDraft(chatID) // clear any live draft on error
 		if replyDelivered.Load() && errors.Is(procErr, context.Canceled) {
 			log.Printf("chat=%d prompt=%q: canceled after reply delivered (draft cleared)", chatID, "[content]")
 			return
