@@ -145,6 +145,19 @@ func IsEncrypted(data []byte) bool {
 	return bytes.HasPrefix(data, magicPrefix)
 }
 
+// DecryptFully repeatedly decrypts data until it is no longer encrypted,
+// handling cases where data was encrypted multiple times (double encryption).
+func DecryptFully(data []byte) ([]byte, error) {
+	for IsEncrypted(data) {
+		var err error
+		data, err = Decrypt(data)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return data, nil
+}
+
 // WriteEncryptedFile writes data to path, encrypted with AES-256-GCM.
 // If the session key file does not exist, writes plaintext as fallback
 // to maintain backward compatibility with environments lacking a key.

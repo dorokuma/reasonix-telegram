@@ -248,7 +248,7 @@ func decryptToPlain(src, dst string) error {
 		// Empty file — nothing to decrypt.
 		return nil
 	}
-	plain, err := ReadEncryptedFile(src)
+	plain, err := DecryptFully(data)
 	if err != nil {
 		// If decryption fails (e.g. key changed), copy raw as fallback.
 		plain = data
@@ -274,6 +274,11 @@ func encryptFromPlain(src, dst string) error {
 		// Empty file — remove dst if it exists.
 		os.Remove(dst)
 		return nil
+	}
+	// Ensure data is plaintext before encrypting (handles double encryption).
+	data, err = DecryptFully(data)
+	if err != nil {
+		return err
 	}
 	return WriteEncryptedFile(dst, data)
 }
@@ -374,11 +379,11 @@ func sessionStats(path string) (messages int, userTurns int, err error) {
 		return 0, 0, err
 	}
 	if IsEncrypted(data) {
-		plain, err := Decrypt(data)
+		var err error
+		data, err = DecryptFully(data)
 		if err != nil {
 			return 0, 0, err
 		}
-		data = plain
 	} else if len(data) > 0 {
 		log.Printf("sessionStats: %s is not encrypted — stored in plaintext or corrupted", path)
 	}
