@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"log"
@@ -527,8 +529,13 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 
 				// Show the FIRST question with buttons
 				q := questions[0]
-				cidNum := atomic.AddUint64(&a.clarifySeq, 1)
-				cid := strconv.FormatUint(cidNum, 36)
+				var cidBytes [8]byte
+				var cid string
+				if _, err := rand.Read(cidBytes[:]); err == nil {
+					cid = base64.RawURLEncoding.EncodeToString(cidBytes[:])
+				} else {
+					cid = strconv.FormatUint(atomic.AddUint64(&a.clarifySeq, 1), 36) // fallback
+				}
 				s.mu.Lock()
 				s.pendingClarify = &clarifyState{
 					question:      q.Text,
@@ -561,13 +568,15 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				if len(q.Options) > 0 {
 					var rows [][]tgbotapi.InlineKeyboardButton
 					for i, choice := range q.Options {
-						data := fmt.Sprintf("%s%s:%d", prefixClarify, cid, i)
+						payload := fmt.Sprintf("%s%s:%d", prefixClarify, cid, i)
+						data := signCallback(s.hmacKey, payload)
 						btnText := truncateForButton(fmt.Sprintf("%d. %s", i+1, choice))
 						rows = append(rows, []tgbotapi.InlineKeyboardButton{
 							{Text: btnText, CallbackData: &data},
 						})
 					}
-					otherData := fmt.Sprintf("%s%s:%s", prefixClarify, cid, actionOther)
+					otherPayload := fmt.Sprintf("%s%s:%s", prefixClarify, cid, actionOther)
+					otherData := signCallback(s.hmacKey, otherPayload)
 					rows = append(rows, []tgbotapi.InlineKeyboardButton{
 						{Text: "✏️ 其他（输入答案）", CallbackData: &otherData},
 					})
@@ -625,9 +634,12 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				s.mu.Unlock()
 
 				text := fmt.Sprintf("%s 需要批准：%s", emoji, escapeMdv2(label))
-				onceData := fmt.Sprintf("%s:%s", apID, actionOnce)
-				sessionData := fmt.Sprintf("%s:%s", apID, actionSession)
-				denyData := fmt.Sprintf("%s:%s", apID, actionDeny)
+				oncePayload := fmt.Sprintf("%s:%s", apID, actionOnce)
+				onceData := signCallback(s.hmacKey, oncePayload)
+				sessionPayload := fmt.Sprintf("%s:%s", apID, actionSession)
+				sessionData := signCallback(s.hmacKey, sessionPayload)
+				denyPayload := fmt.Sprintf("%s:%s", apID, actionDeny)
+				denyData := signCallback(s.hmacKey, denyPayload)
 				msg := newMessage(chatID, text)
 				msg.ParseMode = tgbotapi.ModeMarkdownV2
 				msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
@@ -683,6 +695,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 					CumTotal:    s.cumTotal,
 					CumCost:     s.cumCost,
 					CumCurrency: s.cumCurrency,
+					HMACKey:     base64.StdEncoding.EncodeToString(s.hmacKey),
 				}
 				s.mu.Unlock()
 				// Persist cumulative values outside the lock so they survive restart.
@@ -809,6 +822,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				done := streamDone
 				draftMu.Unlock()
 				if done {
+					debounce.Stop()
 					return
 				}
 				// runServeTurn returned before turn_done flush; wait briefly for it.
@@ -819,6 +833,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				case <-time.After(3 * time.Second):
 					log.Printf("chat=%d: pusher: finished without finalize, giving up", chatID)
 				}
+				debounce.Stop()
 				return
 			}
 		}
@@ -946,12 +961,17 @@ func (a *App) sendDraft(chatID int64, draftID int64, text string) bool {
 	if text == "" {
 		return false
 	}
-	_, err := a.bot.MakeRequest("sendRichMessageDraft", tgbotapi.Params{
-		"chat_id":  strconv.FormatInt(chatID, 10),
-		"draft_id": strconv.FormatInt(draftID, 10),
-		"rich_message": mustMarshal(map[string]any{
-			"markdown": text,
-		}),
+	richMsg, err := marshalAPI(map[string]any{
+		"markdown": text,
+	})
+	if err != nil {
+		log.Printf("chat=%d: sendDraft marshal rich_message: %v", chatID, err)
+		return false
+	}
+	_, err = a.bot.MakeRequest("sendRichMessageDraft", tgbotapi.Params{
+		"chat_id":     strconv.FormatInt(chatID, 10),
+		"draft_id":    strconv.FormatInt(draftID, 10),
+		"rich_message": richMsg,
 	})
 	if err != nil {
 		log.Printf("sendRichMessageDraft failed (fallback to edit): %v", err)
@@ -961,11 +981,16 @@ func (a *App) sendDraft(chatID int64, draftID int64, text string) bool {
 }
 
 func (a *App) dismissDraft(chatID int64, draftID int64) {
+	richMsg, err := marshalAPI(map[string]any{
+		"markdown": "",
+	})
+	if err != nil {
+		log.Printf("chat=%d: dismissDraft marshal rich_message: %v", chatID, err)
+		return
+	}
 	_, _ = a.bot.MakeRequest("sendRichMessageDraft", tgbotapi.Params{
-		"chat_id":  strconv.FormatInt(chatID, 10),
-		"draft_id": strconv.FormatInt(draftID, 10),
-		"rich_message": mustMarshal(map[string]any{
-			"markdown": "",
-		}),
+		"chat_id":     strconv.FormatInt(chatID, 10),
+		"draft_id":    strconv.FormatInt(draftID, 10),
+		"rich_message": richMsg,
 	})
 }

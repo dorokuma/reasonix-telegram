@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -14,76 +13,43 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
-// killDescendants terminates a process tree with SIGTERM + grace + SIGKILL.
-// Best-effort: relies on /proc being readable, which is true on Linux.
+// killDescendants terminates a process with SIGTERM + grace + SIGKILL.
+// If the process belongs to a process group (Setpgid was set), it signals the
+// entire group by using -pgid. Otherwise it falls back to killing the single PID.
 func killDescendants(rootPid int) {
-	visited := map[int]bool{rootPid: true}
-	// Phase 1: SIGTERM all descendants
-	var walkTerm func(int)
-	walkTerm = func(ppid int) {
-		entries, err := os.ReadDir("/proc")
-		if err != nil {
-			return
-		}
-		for _, e := range entries {
-			if !e.IsDir() {
-				continue
-			}
-			pid, err := strconv.Atoi(e.Name())
-			if err != nil || visited[pid] {
-				continue
-			}
-			statBytes, err := os.ReadFile("/proc/" + e.Name() + "/stat")
-			if err != nil {
-				continue
-			}
-			stat := string(statBytes)
-			rpar := strings.LastIndex(stat, ")")
-			if rpar < 0 || rpar+2 >= len(stat) {
-				continue
-			}
-			fields := strings.Fields(stat[rpar+2:])
-			if len(fields) < 2 {
-				continue
-			}
-			parent, err := strconv.Atoi(fields[1])
-			if err != nil {
-				continue
-			}
-			if parent == ppid {
-				visited[pid] = true
-				_ = syscall.Kill(pid, syscall.SIGTERM)
-				walkTerm(pid)
-			}
-		}
+	pgid, err := syscall.Getpgid(rootPid)
+	if err != nil {
+		// Process already gone or no pgid — kill just the parent.
+		_ = syscall.Kill(rootPid, syscall.SIGTERM)
+		waitKill(rootPid, 3*time.Second)
+		_ = syscall.Kill(rootPid, syscall.SIGKILL)
+		time.Sleep(100 * time.Millisecond)
+		return
 	}
-	walkTerm(rootPid)
 
-	// Phase 2: wait for graceful exit (up to 3s)
+	// Signal the whole process group.
+	_ = syscall.Kill(-pgid, syscall.SIGTERM)
+
 	deadline := time.Now().Add(3 * time.Second)
 	for time.Now().Before(deadline) {
-		allDone := true
-		for pid := range visited {
-			if pid == rootPid {
-				continue
-			}
-			if err := syscall.Kill(pid, 0); err == nil {
-				allDone = false
-				break
-			}
-		}
-		if allDone {
+		if err := syscall.Kill(rootPid, 0); err != nil {
 			return
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	// Phase 3: SIGKILL survivors
-	for pid := range visited {
-		if pid == rootPid {
-			continue
+	_ = syscall.Kill(-pgid, syscall.SIGKILL)
+	time.Sleep(100 * time.Millisecond)
+}
+
+// waitKill waits up to timeout for pid to exit (probe via kill(pid, 0)).
+func waitKill(pid int, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(pid, 0); err != nil {
+			return
 		}
-		_ = syscall.Kill(pid, syscall.SIGKILL)
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
@@ -275,7 +241,8 @@ func (a *App) lookupSentText(msgID int) string {
 	return ""
 }
 
-// saveSentTextCache writes the entire in-memory cache to disk as JSON.
+// saveSentTextCache writes the entire in-memory cache to disk as JSON,
+// encrypted with AES-256-GCM via WriteEncryptedFile.
 // Uses atomic write (tmp file + rename) to prevent partial-file corruption.
 // Called after every recordSentText. The file is capped at ~500 entries so
 // the write is small (~50 KB) and does not need throttling.
@@ -298,12 +265,20 @@ func (a *App) saveSentTextCache() {
 		return
 	}
 
+	// Encrypt (falls back to plaintext if session key is unavailable).
+	out := b
+	if enc, err := Encrypt(b); err == nil {
+		out = enc
+	} else {
+		log.Printf("sentTextCache: encrypt unavailable, writing plaintext: %v", err)
+	}
+
 	a.sentTextCacheMu.Lock()
 	defer a.sentTextCacheMu.Unlock()
 
 	// Atomic write: tmp file → rename to prevent partial file on crash.
 	tmpPath := a.sentTextCachePath + ".tmp"
-	if err := os.WriteFile(tmpPath, b, 0o600); err != nil {
+	if err := os.WriteFile(tmpPath, out, 0o600); err != nil {
 		log.Printf("sentTextCache: write tmp %s: %v", tmpPath, err)
 		return
 	}
@@ -319,6 +294,10 @@ func (a *App) loadSentTextCache() {
 	if a.sentTextCachePath == "" {
 		return
 	}
+
+	// Backward-compatibility: migrate old plaintext .json → encrypted .json.enc.
+	a.migrateOldSentTextCache()
+
 	disk := loadSentTextCacheFromDisk(a.sentTextCachePath)
 	for id, text := range disk {
 		a.sentTextCache.Store(id, text)
@@ -326,44 +305,98 @@ func (a *App) loadSentTextCache() {
 	log.Printf("sentTextCache: loaded %d entries from %s", len(disk), a.sentTextCachePath)
 }
 
+// migrateOldSentTextCache checks for a legacy plaintext .json file (same path
+// with .json.enc → .json) and, if present, reads it, writes the data encrypted
+// to the current path, and deletes the old file.
+func (a *App) migrateOldSentTextCache() {
+	oldPath := strings.TrimSuffix(a.sentTextCachePath, ".enc")
+	if oldPath == a.sentTextCachePath {
+		return
+	}
+	if _, err := os.Stat(oldPath); os.IsNotExist(err) {
+		return
+	}
+	log.Printf("sentTextCache: migrating old plaintext cache %s → %s", oldPath, a.sentTextCachePath)
+	data, err := os.ReadFile(oldPath)
+	if err != nil {
+		log.Printf("sentTextCache: read old file %s: %v", oldPath, err)
+		return
+	}
+	// Write encrypted to the new path (WriteEncryptedFile falls back to
+	// plaintext if the session key is not available).
+	if err := WriteEncryptedFile(a.sentTextCachePath, data); err != nil {
+		log.Printf("sentTextCache: write encrypted %s: %v", a.sentTextCachePath, err)
+		return
+	}
+	if err := os.Remove(oldPath); err != nil {
+		log.Printf("sentTextCache: remove old file %s: %v", oldPath, err)
+	}
+}
+
 // loadSentTextCacheFromDisk reads and parses the JSON cache file.
+// If the file starts with the encryption magic prefix it is transparently
+// decrypted; plaintext (legacy) files are returned as-is.
 // Returns nil if the file does not exist or is corrupt.
 func loadSentTextCacheFromDisk(path string) map[int]string {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			log.Printf("sentTextCache: read %s: %v", path, err)
+			// Rename corrupt file so it won't block next startup but
+			// remains available for forensic inspection.
+			corruptPath := path + ".json.enc.corrupt"
+			if re := os.Rename(path, corruptPath); re != nil {
+				log.Printf("sentTextCache: rename corrupt %s → %s: %v", path, corruptPath, re)
+			}
 		}
 		return nil
 	}
+	// Transparently decrypt if the file carries the encryption magic prefix.
+	data := b
+	if IsEncrypted(b) {
+		dec, err := Decrypt(b)
+		if err != nil {
+			log.Printf("sentTextCache: decrypt %s: %v", path, err)
+			corruptPath := path + ".corrupt"
+			if re := os.Rename(path, corruptPath); re != nil {
+				log.Printf("sentTextCache: rename corrupt %s → %s: %v", path, corruptPath, re)
+			}
+			return nil
+		}
+		data = dec
+	}
 	var m map[int]string
-	if err := json.Unmarshal(b, &m); err != nil {
+	if err := json.Unmarshal(data, &m); err != nil {
 		log.Printf("sentTextCache: unmarshal %s: %v", path, err)
+		corruptPath := path + ".corrupt"
+		if re := os.Rename(path, corruptPath); re != nil {
+			log.Printf("sentTextCache: rename corrupt %s → %s: %v", path, corruptPath, re)
+		}
 		return nil
 	}
 	return m
 }
 
-// fetchMessageText retrieves the text of a message by temporarily forwarding
-// it and immediately deleting the copy. This is a last-resort fallback when
+// fetchMessageText retrieves the text of a message by temporarily copying it
+// and immediately deleting the copy. This is a last-resort fallback when
 // ReplyToMessage.Text is empty (sendRichMessage) and the local cache misses
 // (e.g. messages sent before the persistent cache was deployed).
-// The forward is silent (no notification) and the copy is deleted within the
+// The copy is silent (no notification) and the copy is deleted within the
 // same handler turn, so users should not notice it.
 // The retrieved text is also recorded into the sentTextCache for future lookups.
 func (a *App) fetchMessageText(chatID int64, msgID int) string {
-	fwd := tgbotapi.NewForward(chatID, chatID, msgID)
-	fwd.DisableNotification = true
-	msg, err := a.bot.Send(fwd)
+	copyMsg := tgbotapi.NewCopyMessage(chatID, chatID, msgID)
+	copyMsg.DisableNotification = true
+	msg, err := a.bot.Send(copyMsg)
 	if err != nil {
-		log.Printf("chat=%d: fetchMessageText forward %d: %v", chatID, msgID, err)
+		log.Printf("chat=%d: fetchMessageText copy %d: %v", chatID, msgID, err)
 		return ""
 	}
 	text := msg.Text
 	if text == "" {
 		text = msg.Caption
 	}
-	// Delete the forwarded copy immediately.
+	// Delete the copied message immediately.
 	a.deleteMessage(chatID, msg.MessageID)
 	if text != "" {
 		log.Printf("chat=%d: fetchMessageText msgID=%d len=%d", chatID, msgID, len(text))

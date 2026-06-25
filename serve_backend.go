@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -343,14 +344,28 @@ func (a *App) startServe(chatID int64, skipPortCheck bool) error {
 		s.mu.Unlock()
 	}
 
+	// Determine the plaintext temp path for reasonix serve (it reads/writes
+	// plain JSONL).  We decrypt .jsonl.enc -> .jsonl before starting serve
+	// and re-encrypt after it exits.
+	plainPath := a.state.sessionPathForChatPlain(chatID)
+
 	msgs, users, _ := sessionStats(sessionPath)
 	if users > 0 {
 		log.Printf("chat=%d: resume session %s (%d messages, %d user turns)", chatID, sessionPath, msgs, users)
+		// Decrypt the encrypted session file for the serve process.
+		if err := decryptToPlain(sessionPath, plainPath); err != nil {
+			log.Printf("chat=%d: decrypt session for serve: %v", chatID, err)
+		}
 	} else {
 		// No pre-created empty JSONL — an empty --resume file used to replace the
 		// boot-time system prompt and drop global REASONIX.md from the model context.
-		_ = os.Remove(sessionPath)
-		log.Printf("chat=%d: new session at %s", chatID, sessionPath)
+		if err := os.Remove(sessionPath); err != nil && !os.IsNotExist(err) {
+			log.Printf("remove %s: %v", sessionPath, err)
+		}
+		if err := os.Remove(plainPath); err != nil && !os.IsNotExist(err) {
+			log.Printf("remove %s: %v", plainPath, err)
+		}
+		log.Printf("chat=%d: new session at %s", chatID, plainPath)
 	}
 
 	args := []string{"serve", "--addr", serveAddr(port)}
@@ -361,9 +376,9 @@ func (a *App) startServe(chatID int64, skipPortCheck bool) error {
 	if model != "" {
 		args = append(args, "--model", model)
 	}
-	// Always --resume so auto-save stays on sessionPath (not ~/.config/reasonix/sessions).
+	// Always --resume so auto-save stays on plainPath (not ~/.config/reasonix/sessions).
 	// Reasonix Resume now re-applies the boot system prompt even when the file is empty.
-	args = append(args, "--resume", sessionPath)
+	args = append(args, "--resume", plainPath)
 
 	if !skipPortCheck {
 		if err := a.waitServeReady(port, 2*time.Second); err == nil {
@@ -386,6 +401,27 @@ func (a *App) startServe(chatID int64, skipPortCheck bool) error {
 		}
 	}
 
+	// Port availability check: if the assigned port is already in use,
+	// try subsequent ports before giving up.
+	portOK := false
+	for i := 0; i < 10; i++ {
+		if !isPortInUse(port) {
+			portOK = true
+			break
+		}
+		if i < 9 {
+			log.Printf("chat=%d: port %d in use, trying %d", chatID, port, port+1)
+			port++
+		}
+	}
+	if !portOK {
+		return fmt.Errorf("chat=%d: no available TCP port after 10 attempts", chatID)
+	}
+	// Persist the chosen port so future restarts use the same offset.
+	s.mu.Lock()
+	s.servePort = port
+	s.mu.Unlock()
+
 	cmd := exec.Command(a.cfg.ReasonixBin, args...)
 	cmd.Dir = workDir
 	env := a.reasonixEnv(chatID)
@@ -407,19 +443,37 @@ func (a *App) startServe(chatID int64, skipPortCheck bool) error {
 		// Reasonix reads the key from DEEPSEEK_API_KEY_FILE (set above).
 	}
 	cmd.Env = env
-	// Go wires nil Stderr to /dev/null; forward serve diagnostics (RTK/CTX hit/miss) to journal.
-	cmd.Stderr = os.Stderr
+	// Pipe stderr through log.Printf so diagnostics go through the sanitized log pipeline.
+	stderrPipe, err := cmd.StderrPipe()
+	if err != nil {
+		return fmt.Errorf("create stderr pipe: %w", err)
+	}
+	go func() {
+		scanner := bufio.NewScanner(stderrPipe)
+		for scanner.Scan() {
+			log.Printf("[serve stderr] %s", scanner.Text())
+		}
+		if err := scanner.Err(); err != nil {
+			log.Printf("[serve stderr] pipe read error: %v", err)
+		}
+	}()
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: 0}
 
 	if err := cmd.Start(); err != nil {
 		if keyFile != "" {
-			os.Remove(keyFile)
+			if err := os.Remove(keyFile); err != nil {
+			log.Printf("remove %s: %v", keyFile, err)
+		}
 		}
 		return fmt.Errorf("start reasonix serve: %w", err)
 	}
 	// Clean up temp key file after the child has started (it reads it at startup).
 	if keyFile != "" {
-		defer os.Remove(keyFile)
+		defer func() {
+			if err := os.Remove(keyFile); err != nil {
+				log.Printf("remove %s: %v", keyFile, err)
+			}
+		}()
 	}
 
 	s.mu.Lock()
@@ -437,6 +491,10 @@ func (a *App) startServe(chatID int64, skipPortCheck bool) error {
 		s.mu.Unlock()
 		if err != nil {
 			log.Printf("chat=%d: reasonix serve exited: %v", chatID, err)
+		}
+		// Re-encrypt the plaintext session file back to encrypted storage.
+		if err := encryptFromPlain(plainPath, sessionPath); err != nil {
+			log.Printf("chat=%d: re-encrypt session after serve exit: %v", chatID, err)
 		}
 	}()
 
@@ -456,6 +514,7 @@ func (a *App) startServe(chatID int64, skipPortCheck bool) error {
 		CumTotal:    cumTotal,
 		CumCost:     cumCost,
 		CumCurrency: cumCurrency,
+		HMACKey:     base64.StdEncoding.EncodeToString(s.hmacKey),
 	}); err != nil {
 		log.Printf("chat=%d: persist state failed: %v", chatID, err)
 	}
@@ -553,6 +612,7 @@ func (a *App) startServeHealthCheck() {
 }
 
 func (a *App) restorePersistedSessions() {
+	a.state.migrateOldSessions()
 	a.state.cleanupOrphanSessionArtifacts()
 	records, err := a.state.load()
 	if err != nil {
@@ -594,6 +654,12 @@ func (a *App) restorePersistedSessions() {
 		s.cumTotal = rec.CumTotal
 		s.cumCost = rec.CumCost
 		s.cumCurrency = rec.CumCurrency
+		// Restore HMAC key from persisted state.
+		if rec.HMACKey != "" {
+			if decoded, err := base64.StdEncoding.DecodeString(rec.HMACKey); err == nil && len(decoded) == 32 {
+				s.hmacKey = decoded
+			}
+		}
 		s.mu.Unlock()
 		sem <- struct{}{}
 		go func(chatID int64) {
@@ -812,7 +878,8 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 	}()
 
 	sc := bufio.NewScanner(resp.Body)
-	sc.Buffer(make([]byte, 64*1024), 1024*1024)
+	sc.Buffer(make([]byte, 64*1024), 256*1024)
+	consecutiveErrors := 0
 	for sc.Scan() {
 		// If context was cancelled (pre-empted by a newer turn), stop processing events
 		// immediately to avoid duplicate messages from concurrent goroutines.
@@ -830,8 +897,15 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 		payload := strings.TrimPrefix(line, "data: ")
 		var ev wireEvent
 		if err := json.Unmarshal([]byte(payload), &ev); err != nil {
+			consecutiveErrors++
+			log.Printf("SSE parse error for chat=%d: %v, payload=%.200s", chatID, err, payload)
+			if consecutiveErrors >= 5 {
+				log.Printf("SSE: %d consecutive parse errors for chat=%d, breaking connection", consecutiveErrors, chatID)
+				break
+			}
 			continue
 		}
+		consecutiveErrors = 0
 		switch ev.Kind {
 		case "text":
 			// Streaming token deltas — append in place (never suffix "\n" per chunk).
@@ -943,7 +1017,7 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 		case "ask_request":
 			if ev.Ask != nil {
 				for _, q := range ev.Ask.Questions {
-					log.Printf("port=%d: ask_request q.id=%s q.prompt=%q", port, q.ID, logPreview(q.Prompt, 100))
+					log.Printf("port=%d: ask_request q.id=%s q.prompt=%s", port, q.ID, logPreviewLen(q.Prompt, 100))
 				}
 			}
 			bufferingAsk = false
@@ -1026,7 +1100,7 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 // cancellation, dead serve process) are returned immediately without retry.
 func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string) int, onAskRequest func(askID string, questions []askQuestionData), onApprovalRequest func(approvalID string, toolName string), onUsage func(wireUsage)) turnResult {
 	const maxRetries = 3
-	backoffs := []time.Duration{500 * time.Millisecond, 1 * time.Second, 2 * time.Second}
+	backoffs := []time.Duration{500 * time.Millisecond, 5 * time.Second, 30 * time.Second}
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
@@ -1053,6 +1127,11 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 		}
 
 		log.Printf("chat=%d: SSE connection lost (attempt %d/%d): %v", chatID, attempt+1, maxRetries+1, err)
+	}
+	log.Printf("chat=%d: SSE connection failed after %d retries, restarting serve process", chatID, maxRetries+1)
+	a.stopServe(chatID)
+	if startErr := a.startServe(chatID, true); startErr != nil {
+		log.Printf("chat=%d: failed to restart serve after SSE failure: %v", chatID, startErr)
 	}
 	return turnResult{err: fmt.Errorf("SSE connection failed after %d retries", maxRetries+1)}
 }

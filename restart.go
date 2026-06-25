@@ -63,16 +63,22 @@ func writeRestartNotify(path string, nf restartNotifyFile) error {
 	}
 	if _, err := f.Write(b); err != nil {
 		f.Close()
-		os.Remove(tmp)
+		if err := os.Remove(tmp); err != nil {
+			log.Printf("remove %s: %v", tmp, err)
+		}
 		return err
 	}
 	if err := f.Sync(); err != nil {
 		f.Close()
-		os.Remove(tmp)
+		if err := os.Remove(tmp); err != nil {
+			log.Printf("remove %s: %v", tmp, err)
+		}
 		return err
 	}
 	if err := f.Close(); err != nil {
-		os.Remove(tmp)
+		if err := os.Remove(tmp); err != nil {
+			log.Printf("remove %s: %v", tmp, err)
+		}
 		return err
 	}
 	if err := os.Rename(tmp, path); err != nil {
@@ -113,7 +119,9 @@ func loadRestartNotify(stateDir string) ([]int64, error) {
 func clearRestartNotify(stateDir string) {
 	restartNotifyMu.Lock()
 	defer restartNotifyMu.Unlock()
-	_ = os.Remove(restartNotifyPath(stateDir))
+	if err := os.Remove(restartNotifyPath(stateDir)); err != nil {
+		log.Printf("remove %s: %v", restartNotifyPath(stateDir), err)
+	}
 }
 
 func (a *App) notifyBridgeRestarted() {
@@ -236,6 +244,7 @@ func (a *App) gracefulServiceRestart(chatID int64) {
 	a.reply(chatID, msgRestarting)
 
 	go func() {
+		a.restartingInProgress.Store(true)
 		a.cancelAllTasks()
 		a.waitTasksDone(30 * time.Second)
 		a.stopAllServes()
@@ -253,6 +262,7 @@ func (a *App) startRestartWatchdog() {
 	restartWatch.Do(func() {
 		go func() {
 			t := time.NewTicker(15 * time.Second)
+			defer t.Stop()
 			for range t.C {
 				a.restartMu.Lock()
 				stuck := a.restarting && time.Since(a.restartStarted) > 45*time.Second

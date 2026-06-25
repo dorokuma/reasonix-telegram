@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
@@ -255,6 +256,12 @@ func logPreview(s string, maxBytes int) string {
 		return s
 	}
 	return trimUTF8Bytes(s, maxBytes) + "…"
+}
+
+// logPreviewLen logs only the byte length of s, hiding the content entirely.
+// Use for logging user-provided text that should not appear in logs.
+func logPreviewLen(s string, maxBytes int) string {
+	return fmt.Sprintf("[%d bytes]", len(s))
 }
 
 // trimUTF8Bytes trims s to at most maxBytes without breaking a UTF-8 code point.
@@ -527,7 +534,7 @@ func (a *App) sendMessageParts(chatID int64, parts []string, parseMode string, r
 // sendWithRetry sends any Chattable with retry for flood/network errors.
 func (a *App) sendWithRetry(msg tgbotapi.Chattable, chatID int64) (tgbotapi.Message, error) {
 	const maxAttempts = 3
-	reFloodWait := regexp.MustCompile(`(\d+)`)
+	reFloodWait := regexp.MustCompile(`(?i)retry after (\d+)`)
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		m, err := a.bot.Send(msg)
@@ -572,7 +579,11 @@ func (a *App) tryRichMessage(chatID int64, text string, editMsgID ...int) int {
 		runes = runes[:maxLen]
 	}
 	msgText := string(runes)
-	richMsg := mustMarshal(map[string]any{"markdown": msgText})
+	richMsg, err := marshalAPI(map[string]any{"markdown": msgText})
+	if err != nil {
+		log.Printf("chat=%d: marshal rich_message: %v", chatID, err)
+		return 0
+	}
 	params := tgbotapi.Params{
 		"rich_message": richMsg,
 	}
@@ -608,11 +619,11 @@ func (a *App) tryRichMessage(chatID int64, text string, editMsgID ...int) int {
 	return msg.MessageID
 }
 
-// mustMarshal JSON-encodes v, panicking on failure (used for API params).
-func mustMarshal(v any) string {
+// marshalAPI JSON-encodes v, returning an empty string on failure with the error.
+func marshalAPI(v any) (string, error) {
 	b, err := json.Marshal(v)
 	if err != nil {
-		panic(err)
+		return "", err
 	}
-	return string(b)
+	return string(b), nil
 }

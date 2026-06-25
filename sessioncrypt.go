@@ -7,6 +7,7 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -52,7 +53,9 @@ func loadOrCreateKey() ([]byte, error) {
 			_ = f.Close()
 			return nil, fmt.Errorf("sessioncrypt: write key: %w", werr)
 		}
-		_ = f.Close()
+		if cerr := f.Close(); cerr != nil {
+			log.Printf("sessioncrypt: close key file: %v", cerr)
+		}
 	} else if os.IsExist(err) {
 		if data, rerr := os.ReadFile(path); rerr == nil && len(data) == keyLen {
 			return data, nil
@@ -61,7 +64,10 @@ func loadOrCreateKey() ([]byte, error) {
 	} else {
 		return nil, fmt.Errorf("sessioncrypt: create key file: %w", err)
 	}
-	_ = os.Chmod(path, 0o600)
+	if err := os.Chmod(path, 0o600); err != nil {
+		os.Remove(path)
+		return nil, fmt.Errorf("sessioncrypt: chmod key file: %w", err)
+	}
 	return key, nil
 }
 
@@ -137,4 +143,30 @@ func Decrypt(data []byte) ([]byte, error) {
 
 func IsEncrypted(data []byte) bool {
 	return bytes.HasPrefix(data, magicPrefix)
+}
+
+// WriteEncryptedFile writes data to path, encrypted with AES-256-GCM.
+// If the session key file does not exist, writes plaintext as fallback
+// to maintain backward compatibility with environments lacking a key.
+func WriteEncryptedFile(path string, data []byte) error {
+	encrypted, err := Encrypt(data)
+	if err != nil {
+		// Key unavailable — write plaintext so the system remains usable.
+		return os.WriteFile(path, data, 0o600)
+	}
+	return os.WriteFile(path, encrypted, 0o600)
+}
+
+// ReadEncryptedFile reads a file from path and, if it starts with the
+// encryption magic prefix, decrypts it transparently.  Plaintext files
+// (legacy or written by reasonix serve) are returned as-is.
+func ReadEncryptedFile(path string) ([]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	if IsEncrypted(data) {
+		return Decrypt(data)
+	}
+	return data, nil
 }

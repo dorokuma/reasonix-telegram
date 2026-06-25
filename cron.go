@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/fsnotify/fsnotify"
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -38,6 +39,7 @@ type CronManager struct {
 	mu              sync.Mutex
 	watcher         *fsnotify.Watcher
 	lastFileContent []byte
+	runningJobs     sync.WaitGroup // tracks in-flight cron jobs for graceful shutdown
 }
 
 func (a *App) initCron() {
@@ -159,7 +161,9 @@ func (cm *CronManager) watchLoop() {
 			if !ok {
 				return
 			}
-			if filepath.Clean(event.Name) == filepath.Clean(cm.filePath) {
+			absEv, _ := filepath.Abs(event.Name)
+			absCm, _ := filepath.Abs(cm.filePath)
+			if absEv == absCm {
 				if event.Has(fsnotify.Write) || event.Has(fsnotify.Create) {
 					if timer != nil {
 						timer.Stop()
@@ -228,6 +232,9 @@ func (cm *CronManager) clearTasksLocked() {
 }
 
 func (a *App) triggerCronTask(task *CronTask) {
+	a.cronManager.runningJobs.Add(1)
+	defer a.cronManager.runningJobs.Done()
+
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("PANIC recovered: %v\nstack: %s", r, debug.Stack())
@@ -264,8 +271,6 @@ func (a *App) triggerCronTask(task *CronTask) {
 	tmpPath := tmpFile.Name()
 	tmpFile.Close() // 空文件，不写任何内容
 
-	defer os.Remove(tmpPath)
-
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
 
@@ -284,6 +289,10 @@ func (a *App) triggerCronTask(task *CronTask) {
 	// or silently fail (ARG_MAX / exec E2BIG on Linux).
 	if len(fullPrompt) > 4096 {
 		fullPrompt = fullPrompt[:4096]
+		// Ensure we don't end in the middle of a multi-byte UTF-8 rune
+		for !utf8.ValidString(fullPrompt) {
+			fullPrompt = fullPrompt[:len(fullPrompt)-1]
+		}
 	}
 
 	cmd := exec.CommandContext(ctx, a.cfg.ReasonixBin, "run", "--resume", tmpPath, "--model", "deepseek-v4-flash", "--", fullPrompt)
@@ -362,6 +371,9 @@ func (a *App) triggerCronTask(task *CronTask) {
 		log.Printf("cron: task %d - WARNING: sendTextParts sent 0 messages, result %d bytes", task.ID, len(result))
 	}
 
+	if err := os.Remove(tmpPath); err != nil {
+		log.Printf("remove %s: %v", tmpPath, err)
+	}
 }
 
 

@@ -27,6 +27,7 @@ const (
 	maxMediaCachePerChat = 100
 	maxDataURLSize       = 10 * 1024 * 1024 // 10 MB — skip base64 encoding beyond this
 	maxTotalCacheSize    = 2 * 1024 * 1024 * 1024 // 2 GB — global LRU cache limit
+	maxPages             = 50
 )
 
 // downloadSem limits concurrent Telegram file downloads to prevent OOM under load.
@@ -103,11 +104,15 @@ func (a *App) downloadTelegramFile(fileID string, ext string, category string, c
 	limitReader := io.LimitReader(resp.Body, maxDownloadSize+1)
 	written, err := io.Copy(f, limitReader)
 	if err != nil {
-		os.Remove(localPath)
+		if err := os.Remove(localPath); err != nil {
+			log.Printf("remove %s: %v", localPath, err)
+		}
 		return "", fmt.Errorf("write: %w", err)
 	}
 	if written > maxDownloadSize {
-		os.Remove(localPath)
+		if err := os.Remove(localPath); err != nil {
+			log.Printf("remove %s: %v", localPath, err)
+		}
 		return "", fmt.Errorf("file size exceeds limit of %d bytes", maxDownloadSize)
 	}
 
@@ -120,6 +125,9 @@ func (a *App) downloadTelegramFile(fileID string, ext string, category string, c
 // cleanupCacheDir removes oldest files when a cache directory exceeds the per-chat limit
 // or when the global cache directory exceeds maxTotalCacheSize.
 func (a *App) cleanupCacheDir(category string, chatID int64) {
+	a.cacheMu.Lock()
+	defer a.cacheMu.Unlock()
+
 	dir := a.cacheDir(category, chatID)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -264,7 +272,11 @@ func extractVideoFrames(localPath string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create temp dir: %w", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() {
+		if err := os.RemoveAll(tmpDir); err != nil {
+			log.Printf("removeAll %s: %v", tmpDir, err)
+		}
+	}()
 
 	// ffmpeg: output one JPEG per second at ~QVGA quality (scaled to 640 width)
 	pattern := filepath.Join(tmpDir, "frame-%04d.jpg")
@@ -315,7 +327,11 @@ func convertPDFToImages(localPath string) ([]string, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create temp dir: %w", err)
 	}
-	defer os.RemoveAll(tmpDir)
+	defer func() {
+		if err := os.RemoveAll(tmpDir); err != nil {
+			log.Printf("removeAll %s: %v", tmpDir, err)
+		}
+	}()
 
 	// pdftoppm: one PNG per page at 150 DPI
 	prefix := filepath.Join(tmpDir, "page")
@@ -340,8 +356,7 @@ func convertPDFToImages(localPath string) ([]string, error) {
 		return nil, fmt.Errorf("pdftoppm produced no pages from %s", localPath)
 	}
 
-	// Limit to at most 10 pages
-	const maxPages = 10
+	// Limit to at most 50 pages
 	var urls []string
 	for _, e := range entries {
 		if len(urls) >= maxPages {
@@ -378,7 +393,7 @@ func (a *App) handleIncomingMedia(m *tgbotapi.Message) mediaResult {
 			log.Printf("chat=%d: download photo: %v", m.Chat.ID, err)
 			return mediaResult{Text: "[用户发送了图片，下载失败]"}
 		}
-		desc := fmt.Sprintf("[用户发送了图片，保存在 %s]", path)
+		desc := fmt.Sprintf("[用户发送了图片，保存在 %s]", filepath.Base(path))
 		urls, err := dataURLsFromImage(path)
 		if err != nil {
 			log.Printf("chat=%d: encode photo: %v", m.Chat.ID, err)
@@ -407,7 +422,7 @@ func (a *App) handleIncomingMedia(m *tgbotapi.Message) mediaResult {
 
 		lowerName := strings.ToLower(m.Document.FileName)
 		if strings.HasSuffix(lowerName, ".pdf") {
-			desc := fmt.Sprintf("[用户发送了PDF文件 %s，保存在 %s]", promptSafeName(m.Document.FileName), path)
+			desc := fmt.Sprintf("[用户发送了PDF文件 %s，保存在 %s]", promptSafeName(m.Document.FileName), filepath.Base(path))
 			urls, err := convertPDFToImages(path)
 			if err != nil {
 				log.Printf("chat=%d: convert PDF: %v", m.Chat.ID, err)
@@ -418,7 +433,7 @@ func (a *App) handleIncomingMedia(m *tgbotapi.Message) mediaResult {
 
 		// For image-type documents (PNG, JPG, etc.), send as image
 		if mimeFromExt(path) != "" {
-			desc := fmt.Sprintf("[用户发送了图片文件 %s，保存在 %s]", promptSafeName(m.Document.FileName), path)
+			desc := fmt.Sprintf("[用户发送了图片文件 %s，保存在 %s]", promptSafeName(m.Document.FileName), filepath.Base(path))
 			urls, err := dataURLsFromImage(path)
 			if err != nil {
 				log.Printf("chat=%d: encode document image: %v", m.Chat.ID, err)
@@ -427,7 +442,7 @@ func (a *App) handleIncomingMedia(m *tgbotapi.Message) mediaResult {
 			return mediaResult{Text: desc, DataURLs: urls}
 		}
 
-		return mediaResult{Text: fmt.Sprintf("[用户发送了文件 %s，保存在 %s]", promptSafeName(m.Document.FileName), path)}
+		return mediaResult{Text: fmt.Sprintf("[用户发送了文件 %s，保存在 %s]", promptSafeName(m.Document.FileName), filepath.Base(path))}
 	}
 
 	// --- Video ---
@@ -437,7 +452,7 @@ func (a *App) handleIncomingMedia(m *tgbotapi.Message) mediaResult {
 			log.Printf("chat=%d: download video: %v", m.Chat.ID, err)
 			return mediaResult{Text: "[用户发送了视频，下载失败]"}
 		}
-		desc := fmt.Sprintf("[用户发送了视频，保存在 %s]", path)
+		desc := fmt.Sprintf("[用户发送了视频，保存在 %s]", filepath.Base(path))
 		urls, err := extractVideoFrames(path)
 		if err != nil {
 			log.Printf("chat=%d: extract video frames: %v", m.Chat.ID, err)
@@ -453,7 +468,7 @@ func (a *App) handleIncomingMedia(m *tgbotapi.Message) mediaResult {
 			log.Printf("chat=%d: download animation: %v", m.Chat.ID, err)
 			return mediaResult{Text: "[用户发送了GIF，下载失败]"}
 		}
-		desc := fmt.Sprintf("[用户发送了GIF，保存在 %s]", path)
+		desc := fmt.Sprintf("[用户发送了GIF，保存在 %s]", filepath.Base(path))
 		// Extract frames from GIF too
 		urls, err := extractVideoFrames(path)
 		if err != nil {
@@ -470,7 +485,7 @@ func (a *App) handleIncomingMedia(m *tgbotapi.Message) mediaResult {
 			log.Printf("chat=%d: download voice: %v", m.Chat.ID, err)
 			return mediaResult{Text: "[用户发送了语音消息，下载失败]"}
 		}
-		return mediaResult{Text: fmt.Sprintf("[用户发送了语音消息，保存在 %s]", path)}
+		return mediaResult{Text: fmt.Sprintf("[用户发送了语音消息，保存在 %s]", filepath.Base(path))}
 	}
 
 	// --- Audio (no vision) ---
@@ -496,7 +511,7 @@ func (a *App) handleIncomingMedia(m *tgbotapi.Message) mediaResult {
 			log.Printf("chat=%d: download audio: %v", m.Chat.ID, err)
 			return mediaResult{Text: "[用户发送了音频，下载失败]"}
 		}
-		return mediaResult{Text: fmt.Sprintf("[用户发送了音频 %s，保存在 %s]", title, path)}
+		return mediaResult{Text: fmt.Sprintf("[用户发送了音频 %s，保存在 %s]", title, filepath.Base(path))}
 	}
 
 	return mediaResult{}

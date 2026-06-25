@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"log"
 	"os"
@@ -64,9 +66,14 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 	}
 	// Read text or caption from the incoming message.
 	// Telegram puts media descriptions in Caption, not Text.
+	const maxInputBytes = 32768
 	text := m.Text
 	if text == "" {
 		text = m.Caption
+	}
+	if len(text) > maxInputBytes {
+		log.Printf("chat=%d: truncating message from %d to %d bytes", m.Chat.ID, len(text), maxInputBytes)
+		text = text[:maxInputBytes]
 	}
 	text = strings.TrimSpace(text)
 
@@ -99,7 +106,13 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 	// the reasonix agent will parse and convert to image Parts. This avoids
 	// changing the HTTP API between bridge and reasonix serve.
 	if len(mediaDataURLs) > 0 {
-		log.Printf("chat=%d: embedding %d data URLs", m.Chat.ID, len(mediaDataURLs))
+		log.Printf("chat=%d: embedding %d data URLs (capped at 10)", m.Chat.ID, len(mediaDataURLs))
+		const maxImages = 10
+		excess := 0
+		if len(mediaDataURLs) > maxImages {
+			excess = len(mediaDataURLs) - maxImages
+			mediaDataURLs = mediaDataURLs[:maxImages]
+		}
 		if parts.Len() > 0 {
 			// Insert media markers after the description but before user text
 			mediaBlock := "\n"
@@ -111,6 +124,9 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 			for _, du := range mediaDataURLs {
 				parts.WriteString("[REASONIX_IMAGE:" + du + "]\n")
 			}
+		}
+		if excess > 0 {
+			parts.WriteString(fmt.Sprintf("\n[还有 %d 张图片未显示]", excess))
 		}
 	}
 
@@ -130,86 +146,112 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 
 	// Check if we're awaiting a clarify answer.
 	s := a.getOrCreateSession(m.Chat.ID)
-	s.mu.Lock()
-	pc := s.pendingClarify
-	log.Printf("chat=%d: handleMessage text=%q pendingClarify=%v", m.Chat.ID, "[message]", pc != nil)
-	if pc != nil {
+
+	// Process clarify under lock, snapshot data needed outside the lock.
+	var (
+		clarifyHandled   bool
+		submitPC         *clarifyState
+		clarifyPrevMsgID int
+		nextQText        string
+		nextOptions      []string
+		nextClarifyID    string
+		nextHeader       string
+	)
+	func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+
+		pc := s.pendingClarify
+		log.Printf("chat=%d: handleMessage text=%q pendingClarify=%v", m.Chat.ID, "[message]", pc != nil)
+		if pc == nil {
+			return
+		}
+
 		cleanText := strings.TrimSpace(text)
 		if cleanText == "/cancel" || cleanText == "/stop" || strings.HasPrefix(cleanText, "/cancel ") || strings.HasPrefix(cleanText, "/stop ") {
 			s.pendingClarify = nil
-			s.mu.Unlock()
-		} else {
-			// Store text answer (under lock to avoid concurrent-map write).
-			answerText := text
-			if pc.awaitingCustom {
-				pc.awaitingCustom = false
-				answerText = "(自定义) " + text
+			return // falls through to normal processing
+		}
+
+		// Store text answer (under lock to avoid concurrent-map write).
+		answerText := text
+		if pc.awaitingCustom {
+			pc.awaitingCustom = false
+			answerText = "(自定义) " + text
+		}
+		log.Printf("chat=%d: clarify text answer for q=%s: %s", m.Chat.ID, pc.questionID, logPreviewLen(answerText, 100))
+		pc.answers[pc.questionID] = []string{answerText}
+
+		nextIdx := pc.qIndex + 1
+		if nextIdx < len(pc.allQuestions) {
+			// Advance to next question (all fields mutated under lock).
+			nextQ := pc.allQuestions[nextIdx]
+			pc.qIndex = nextIdx
+			pc.questionID = nextQ.ID
+			pc.choices = nextQ.Options
+			var cidBytes [8]byte
+			if _, err := rand.Read(cidBytes[:]); err == nil {
+				pc.clarifyID = base64.RawURLEncoding.EncodeToString(cidBytes[:])
+			} else {
+				pc.clarifyID = strconv.FormatUint(atomic.AddUint64(&a.clarifySeq, 1), 36) // fallback
 			}
-			log.Printf("chat=%d: clarify text answer for q=%s: %q", m.Chat.ID, pc.questionID, logPreview(answerText, 100))
-			pc.answers[pc.questionID] = []string{answerText}
-
-			nextIdx := pc.qIndex + 1
-			if nextIdx < len(pc.allQuestions) {
-				// Advance to next question (all fields mutated under lock).
-				nextQ := pc.allQuestions[nextIdx]
-				pc.qIndex = nextIdx
-				pc.questionID = nextQ.ID
-				pc.choices = nextQ.Options
-				cidNum := atomic.AddUint64(&a.clarifySeq, 1)
-				pc.clarifyID = strconv.FormatUint(cidNum, 36)
-				// Snapshot data needed outside lock.
-				qText := escapeMdv2(strings.TrimSpace(nextQ.Text))
-				if qText == "" {
-					qText = escapeMdv2(strings.TrimSpace(nextQ.ID))
-				}
-				if qText == "" {
-					qText = "请选择："
-				}
-				header := fmt.Sprintf("问题 %d/%d\n", nextIdx+1, len(pc.allQuestions))
-				options := nextQ.Options
-				clarifyID := pc.clarifyID
-				prevMsgID := pc.messageID
-				s.mu.Unlock()
-
-				a.removeKeyboard(m.Chat.ID, prevMsgID)
-				replyText := "❓ " + header + qText
-				msg := newMessage(m.Chat.ID, replyText)
-				msg.ParseMode = tgbotapi.ModeMarkdownV2
-				if len(options) > 0 {
-					var rows [][]tgbotapi.InlineKeyboardButton
-					for i, choice := range options {
-						data := fmt.Sprintf("%s%s:%d", prefixClarify, clarifyID, i)
-						btnText := truncateForButton(fmt.Sprintf("%d. %s", i+1, choice))
-						rows = append(rows, []tgbotapi.InlineKeyboardButton{
-							{Text: btnText, CallbackData: &data},
-						})
-					}
-					otherData := fmt.Sprintf("%s%s:%s", prefixClarify, clarifyID, actionOther)
-					rows = append(rows, []tgbotapi.InlineKeyboardButton{
-						{Text: "✏️ 其他（输入答案）", CallbackData: &otherData},
-					})
-					msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
-				}
-				if sent, err := a.sendWithRetry(msg, m.Chat.ID); err != nil {
-					log.Printf("send failed: %v", err)
-				} else {
-					s.mu.Lock()
-					s.pendingClarify.messageID = sent.MessageID
-					s.mu.Unlock()
-				}
-				return
+			// Snapshot data needed outside lock.
+			qText := escapeMdv2(strings.TrimSpace(nextQ.Text))
+			if qText == "" {
+				qText = escapeMdv2(strings.TrimSpace(nextQ.ID))
 			}
-
-			// All answered — submit.
-			prevMsgID := pc.messageID
-			s.pendingClarify = nil
-			s.mu.Unlock()
-			a.removeKeyboard(m.Chat.ID, prevMsgID)
-			a.submitClarifyAnswers(pc, m.Chat.ID)
+			if qText == "" {
+				qText = "请选择："
+			}
+			nextQText = qText
+			nextOptions = nextQ.Options
+			nextClarifyID = pc.clarifyID
+			clarifyPrevMsgID = pc.messageID
+			nextHeader = fmt.Sprintf("问题 %d/%d\n", nextIdx+1, len(pc.allQuestions))
+			clarifyHandled = true
 			return
 		}
+
+		// All answered — submit.
+		clarifyPrevMsgID = pc.messageID
+		submitPC = pc
+		s.pendingClarify = nil
+		clarifyHandled = true
+	}()
+
+	if !clarifyHandled {
+		// No pending clarify (or was cancelled): continue to slash commands.
+	} else if submitPC != nil {
+		a.removeKeyboard(m.Chat.ID, clarifyPrevMsgID)
+		a.submitClarifyAnswers(submitPC, m.Chat.ID)
+		return
 	} else {
-		s.mu.Unlock()
+		// Send next clarification question.
+		a.removeKeyboard(m.Chat.ID, clarifyPrevMsgID)
+		replyText := "❓ " + nextHeader + nextQText
+		msg := newMessage(m.Chat.ID, replyText)
+		msg.ParseMode = tgbotapi.ModeMarkdownV2
+		if len(nextOptions) > 0 {
+			var rows [][]tgbotapi.InlineKeyboardButton
+			for i, choice := range nextOptions {
+				payload := fmt.Sprintf("%s%s:%d", prefixClarify, nextClarifyID, i)
+				data := signCallback(s.hmacKey, payload)
+				btnText := truncateForButton(fmt.Sprintf("%d. %s", i+1, choice))
+				rows = append(rows, []tgbotapi.InlineKeyboardButton{
+					{Text: btnText, CallbackData: &data},
+				})
+			}
+			otherPayload := fmt.Sprintf("%s%s:%s", prefixClarify, nextClarifyID, actionOther)
+			otherData := signCallback(s.hmacKey, otherPayload)
+			rows = append(rows, []tgbotapi.InlineKeyboardButton{
+				{Text: "✏️ 其他（输入答案）", CallbackData: &otherData},
+			})
+			msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
+		}
+		if _, err := a.sendWithRetry(msg, m.Chat.ID); err != nil {
+			log.Printf("send failed: %v", err)
+		}
+		return
 	}
 
 	// Slash commands.
@@ -337,7 +379,7 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 		s.mu.Unlock()
 		if port > 0 {
 			if used, window := fetchContext(port); window > 0 {
-				pct := used * 100 / window
+				pct := int(int64(used) * 100 / int64(window))
 				threshold := 80 // default compact ratio
 				left := threshold - pct
 				if left < 0 {
@@ -429,10 +471,7 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 
 func (a *App) allowed(u *tgbotapi.User) bool {
 	if len(a.cfg.AllowedUsers) == 0 {
-		if os.Getenv("DEV_MODE") != "" {
-			return true
-		}
-		log.Printf("WARNING: ALLOWED_USERS not set, denying access. Set DEV_MODE=1 to allow all users in development.")
+		log.Printf("WARNING: ALLOWED_USERS not set, denying access to user %d.", u.ID)
 		return false
 	}
 	for _, id := range a.cfg.AllowedUsers {
@@ -454,6 +493,13 @@ func (a *App) getOrCreateSession(chatID int64) *session {
 		sessionPath: a.state.sessionPathForChat(chatID),
 		servePort:   portForChat(chatID),
 	}
+	// Generate 32-byte HMAC key for callback signing.
+	hmacKey := make([]byte, 32)
+	if _, err := rand.Read(hmacKey); err == nil {
+		s.hmacKey = hmacKey
+	} else {
+		log.Printf("chat=%d: failed to generate hmac key: %v", chatID, err)
+	}
 	a.sess[chatID] = s
 	return s
 }
@@ -462,10 +508,11 @@ func (a *App) resetReasonixSession(chatID int64) {
 	a.stopServe(chatID)
 	s := a.getOrCreateSession(chatID)
 	s.mu.Lock()
-	path := s.sessionPath
-	if path == "" {
-		path = a.state.sessionPathForChat(chatID)
+	encPath := s.sessionPath
+	if encPath == "" {
+		encPath = a.state.sessionPathForChat(chatID)
 	}
+	plainPath := a.state.sessionPathForChatPlain(chatID)
 	// Reset cumulative usage counters for the new session.
 	s.cumPrompt = 0
 	s.cumCompletion = 0
@@ -474,7 +521,13 @@ func (a *App) resetReasonixSession(chatID int64) {
 	s.cumCurrency = ""
 	s.lastUsage = wireUsage{}
 	s.mu.Unlock()
-	_ = os.Remove(path)
+	// Remove both the encrypted and any plaintext temp file.
+	if err := os.Remove(encPath); err != nil && !os.IsNotExist(err) {
+		log.Printf("remove %s: %v", encPath, err)
+	}
+	if err := os.Remove(plainPath); err != nil && !os.IsNotExist(err) {
+		log.Printf("remove %s: %v", plainPath, err)
+	}
 	_ = a.state.remove(chatID)
 }
 

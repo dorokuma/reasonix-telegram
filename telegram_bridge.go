@@ -108,11 +108,11 @@ func newBotWithRetry(cfg *Config) (*tgbotapi.BotAPI, error) {
 		lastErr = err
 
 		if isPermanentAuthError(err) {
-			return nil, fmt.Errorf("permanent auth failure: %w", err)
+			return nil, fmt.Errorf("permanent auth failure: %w", NewTokenSanitizer(cfg.BotToken).SanitizeError(err))
 		}
 		log.Printf("telegram auth temporary failure: %v", redactSecrets(err.Error(), cfg.secrets))
 	}
-	return nil, fmt.Errorf("telegram auth failed after %d attempts: %w", maxRetries+1, lastErr)
+	return nil, fmt.Errorf("telegram auth failed after %d attempts: %w", maxRetries+1, NewTokenSanitizer(cfg.BotToken).SanitizeError(lastErr))
 }
 
 func isPermanentAuthError(err error) bool {
@@ -229,9 +229,7 @@ func (t *tokenRedactingTransport) RoundTrip(req *http.Request) (*http.Response, 
 	if err != nil {
 		return resp, t.sanitizer.SanitizeError(err)
 	}
-	// Sanitize response body if the response indicates an error (non-2xx).
-	if resp.StatusCode >= 400 {
-		resp.Body = t.sanitizer.WrapReadCloser(resp.Body)
-	}
+	// Sanitize response body to prevent token leakage in any response.
+	resp.Body = t.sanitizer.WrapReadCloser(resp.Body)
 	return resp, err
 }

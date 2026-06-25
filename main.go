@@ -10,6 +10,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -206,7 +207,7 @@ type Config struct {
 	ReasonixBin  string  // REASONIX_BIN, default "reasonix"
 	AllowedUsers []int64 // ALLOWED_USERS, comma-separated TG user IDs; empty = anyone
 	MaxOutputBytes int     // MAX_OUTPUT_BYTES, default 524288 (stream buffer before split-send)
-	MaxDuration    int     // MAX_DURATION_MIN, default 30
+	MaxDuration    int     // MAX_DURATION_MIN, default 120
 	StateDir string // STATE_DIR, default /var/lib/reasonix-telegram
 	Mode     string // MODE: "chat" (default, tools locked) or "tool" (full agent access)
 	DeepSeekKey string // read from /etc/reasonix-api.env, never in os.Environ
@@ -215,17 +216,21 @@ type Config struct {
 	secrets []string // collected at startup for log redaction
 }
 
-func loadEnvFile(path, key string) string {
+func loadEnvFile(path, key string) (string, error) {
+	fi, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", err
+	}
+	perm := fi.Mode().Perm()
+	if perm&0077 != 0 {
+		return "", fmt.Errorf("api key file %s has overly permissive permissions %04o, must be 0600 or stricter", path, perm)
+	}
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return ""
-	}
-	// Warn if the file is world-readable (other or group can read).
-	if fi, err := os.Stat(path); err == nil {
-		perm := fi.Mode().Perm()
-		if perm&0o044 != 0 {
-			log.Printf("WARN: %s has permissive mode %o (建议 chmod 600)", path, perm)
-		}
+		return "", err
 	}
 	for _, line := range strings.Split(string(b), "\n") {
 		line = strings.TrimSpace(line)
@@ -239,25 +244,29 @@ func loadEnvFile(path, key string) string {
 			if len(val) >= 2 && (val[0] == '"' && val[len(val)-1] == '"' || val[0] == '\'' && val[len(val)-1] == '\'') {
 				val = val[1 : len(val)-1]
 			}
-			return val
+			return val, nil
 		}
 	}
-	return ""
+	return "", nil
 }
 
-func loadConfig() Config {
+func loadConfig() (Config, error) {
 	mode := getenv("MODE", ModeChat)
 	if mode != ModeChat && mode != ModeTool {
 		mode = ModeChat
+	}
+	deepSeekKey, err := loadEnvFile("/etc/reasonix-api.env", "DEEPSEEK_API_KEY")
+	if err != nil {
+		return Config{}, err
 	}
 	c := Config{
 		BotToken:       os.Getenv("TG_BOT_TOKEN"),
 		ReasonixBin:    getenv("REASONIX_BIN", "reasonix"),
 		MaxOutputBytes: atoi(getenv("MAX_OUTPUT_BYTES", "524288")),
-		MaxDuration:    atoi(getenv("MAX_DURATION_MIN", "30")),
+		MaxDuration:    atoi(getenv("MAX_DURATION_MIN", "120")),
 		StateDir: getenv("STATE_DIR", defaultStateDir),
 		Mode:           mode,
-		DeepSeekKey: loadEnvFile("/etc/reasonix-api.env", "DEEPSEEK_API_KEY"),
+		DeepSeekKey:    deepSeekKey,
 		NotificationMode: getenv("NOTIFICATION_MODE", "important"),
 		WorkDir:        os.Getenv("WORK_DIR"),
 	}
@@ -283,7 +292,7 @@ func loadConfig() Config {
 	if fb := os.Getenv("TELEGRAM_FALLBACK_IPS"); fb != "" {
 		c.secrets = append(c.secrets, fb)
 	}
-	return c
+	return c, nil
 }
 
 func getenv(k, def string) string {
@@ -336,6 +345,7 @@ type session struct {
 	wakePusher       func() // signal the turn pusher to check for new content
 	model            string // per-session model override (empty = use global)
 	lastUsage        wireUsage // latest usage data from serve
+	hmacKey          []byte    // 32-byte HMAC-SHA256 key for callback signing
 	// Cumulative session totals (accumulated across turns).
 	cumPrompt     int
 	cumCompletion int
@@ -356,8 +366,9 @@ type App struct {
 	bridge      PlatformBridge
 	bot         *tgbotapi.BotAPI
 	cronManager *CronManager
-	state      *stateStore
-	sessMu     sync.Mutex
+	state        *stateStore
+	handlerSem   chan struct{} // max concurrent handleMessage/handleCallbackQuery
+	sessMu       sync.Mutex
 	sess       map[int64]*session
 	restartMu      sync.Mutex
 	restarting     bool
@@ -365,12 +376,14 @@ type App struct {
 	msgWg          sync.WaitGroup // tracks in-flight handleMessage goroutines
 	draftSeq       uint64 // per-process draft_id sequence (avoids same-second collisions)
 	clarifySeq     uint64 // monotonic counter for clarify IDs
-	mode           atomic.Value // string: ModeChat or ModeTool
+	mode                atomic.Value // string: ModeChat or ModeTool
+	restartingInProgress atomic.Bool
 	sentTextCache  sync.Map     // message_id → sent text (for reply/quote extraction)
 	sentTextCachePath string       // path to sent_text_cache.json on disk
 	sentTextCacheMu   sync.Mutex   // guards saveSentTextCache disk write
 	sentTextCacheTimer  *time.Timer   // debounce timer for saveSentTextCache
 	sentTextCacheTimerMu sync.Mutex   // guards timer
+	cacheMu          sync.Mutex   // guards cleanupCacheDir
 	stickerMu         sync.Mutex   // guards stickerCache load/save/handle
 
 	mediaGroupsMu sync.Mutex
@@ -421,7 +434,10 @@ func (a *App) modeLabel() string {
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	cfg := loadConfig()
+	cfg, err := loadConfig()
+	if err != nil {
+		log.Fatalf("config: %v", err)
+	}
 
 	// Strip API keys from process environment so /proc/<pid>/environ doesn't leak them.
 	// StartServe passes DEEPSEEK_API_KEY to child processes via a temp file + DEEPSEEK_API_KEY_FILE.
@@ -456,8 +472,9 @@ func main() {
 		cfg:         cfg,
 		bridge:      bridge,
 		bot:         bot,
-		state:       st,
-		sess:        map[int64]*session{},
+		state:        st,
+		handlerSem:   make(chan struct{}, 100),
+		sess:         map[int64]*session{},
 		mediaGroups: map[int64]map[string]*mediaGroupBatch{},
 		healthCheckStop: make(chan struct{}),
 	}
@@ -469,7 +486,7 @@ func main() {
 	log.Printf("telegram stream: sendMessageDraft + sendMessage finalize (TelePi/Hermes pattern)")
 
 	// Load persisted sent-text cache for reply/quote extraction across restarts.
-	app.sentTextCachePath = filepath.Join(st.dir, "sent_text_cache.json")
+	app.sentTextCachePath = filepath.Join(st.dir, "sent_text_cache.json.enc")
 	app.loadSentTextCache()
 
 	app.startRestartWatchdog()
@@ -509,10 +526,14 @@ func main() {
 	for {
 		select {
 		case <-ctx.Done():
+			if app.restartingInProgress.Load() {
+				log.Printf("Restart in progress, skipping graceful shutdown cleanup")
+				os.Exit(0)
+			}
 			log.Printf("shutdown signal: flushing reasonix sessions…")
 			close(app.healthCheckStop)
-			app.msgWg.Wait()
 			app.cancelAllTasks()
+			app.msgWg.Wait()
 			app.waitTasksDone(5 * time.Second)
 			app.stopAllServes()
 			// Stop sentTextCache debounce timer and flush remaining data.
@@ -525,6 +546,18 @@ func main() {
 			app.saveSentTextCache()
 			if app.cronManager != nil {
 				app.cronManager.cron.Stop()
+				// Wait for running cron jobs to finish (max 30s timeout).
+				done := make(chan struct{})
+				go func() {
+					app.cronManager.runningJobs.Wait()
+					close(done)
+				}()
+				select {
+				case <-done:
+					log.Println("cron: all running jobs completed")
+				case <-time.After(30 * time.Second):
+					log.Println("cron: timed out waiting for running jobs after 30s")
+				}
 				if app.cronManager.watcher != nil {
 					app.cronManager.watcher.Close()
 				}
@@ -537,11 +570,19 @@ func main() {
 			}
 			if upd.Message != nil {
 				app.msgWg.Add(1)
-				go app.handleMessage(upd.Message)
+				app.handlerSem <- struct{}{}
+				go func() {
+					defer func() { <-app.handlerSem }()
+					app.handleMessage(upd.Message)
+				}()
 			}
 			if upd.CallbackQuery != nil {
 				app.msgWg.Add(1)
-				go app.handleCallbackQuery(upd.CallbackQuery)
+				app.handlerSem <- struct{}{}
+				go func() {
+					defer func() { <-app.handlerSem }()
+					app.handleCallbackQuery(upd.CallbackQuery)
+				}()
 			}
 		}
 	}

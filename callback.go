@@ -1,6 +1,10 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -83,12 +87,20 @@ func (a *App) modelHandler(m *tgbotapi.Message, arg string) {
 
 	arg = strings.ToLower(strings.TrimSpace(arg))
 	if arg == "" {
+		if len(availableModels) == 0 {
+			a.reply(m.Chat.ID, "⚠️ 未能加载可用模型列表。请检查 reasonix 配置。")
+			return
+		}
 		a.sendModelPicker(m.Chat.ID, 0)
 		return
 	}
 
 	name, ok := modelByID(arg)
 	if !ok {
+		if len(availableModels) == 0 {
+			a.reply(m.Chat.ID, fmt.Sprintf("未知模型：%s\n⚠️ 未能加载可用模型列表。请检查 reasonix 配置。", arg))
+			return
+		}
 		ids := make([]string, len(availableModels))
 		for i, m := range availableModels {
 			ids[i] = m.ID
@@ -146,7 +158,8 @@ func (a *App) sendModelPicker(chatID int64, page int) {
 		if m.ID == current {
 			label = "✅ " + label
 		}
-		data := fmt.Sprintf("%s%s", prefixModel, m.ID)
+		payload := fmt.Sprintf("%s%s", prefixModel, m.ID)
+		data := signCallback(s.hmacKey, payload)
 		rows = append(rows, []tgbotapi.InlineKeyboardButton{
 			{Text: label, CallbackData: &data},
 		})
@@ -156,12 +169,14 @@ func (a *App) sendModelPicker(chatID int64, page int) {
 	if totalPages > 1 {
 		var nav []tgbotapi.InlineKeyboardButton
 		if page > 0 {
-			pdata := fmt.Sprintf("%s%s:%d", prefixModel, actionPage, page-1)
+			pPayload := fmt.Sprintf("%s%s:%d", prefixModel, actionPage, page-1)
+			pdata := signCallback(s.hmacKey, pPayload)
 			nav = append(nav, tgbotapi.InlineKeyboardButton{Text: "◀️ 上一页", CallbackData: &pdata})
 		}
 		nav = append(nav, tgbotapi.InlineKeyboardButton{Text: fmt.Sprintf("%d/%d", page+1, totalPages), CallbackData: strPtr("_")})
 		if page < totalPages-1 {
-			pdata := fmt.Sprintf("%s%s:%d", prefixModel, actionPage, page+1)
+			pPayload := fmt.Sprintf("%s%s:%d", prefixModel, actionPage, page+1)
+			pdata := signCallback(s.hmacKey, pPayload)
 			nav = append(nav, tgbotapi.InlineKeyboardButton{Text: "下一页 ▶️", CallbackData: &pdata})
 		}
 		rows = append(rows, nav)
@@ -206,7 +221,8 @@ func (a *App) editModelPicker(chatID int64, messageID int, page int) {
 		if m.ID == current {
 			label = "✅ " + label
 		}
-		data := fmt.Sprintf("%s%s", prefixModel, m.ID)
+		payload := fmt.Sprintf("%s%s", prefixModel, m.ID)
+		data := signCallback(s.hmacKey, payload)
 		rows = append(rows, []tgbotapi.InlineKeyboardButton{
 			{Text: label, CallbackData: &data},
 		})
@@ -216,12 +232,14 @@ func (a *App) editModelPicker(chatID int64, messageID int, page int) {
 	if totalPages > 1 {
 		var nav []tgbotapi.InlineKeyboardButton
 		if page > 0 {
-			pdata := fmt.Sprintf("%s%s:%d", prefixModel, actionPage, page-1)
+			pPayload := fmt.Sprintf("%s%s:%d", prefixModel, actionPage, page-1)
+			pdata := signCallback(s.hmacKey, pPayload)
 			nav = append(nav, tgbotapi.InlineKeyboardButton{Text: "◀️ 上一页", CallbackData: &pdata})
 		}
 		nav = append(nav, tgbotapi.InlineKeyboardButton{Text: fmt.Sprintf("%d/%d", page+1, totalPages), CallbackData: strPtr("_")})
 		if page < totalPages-1 {
-			pdata := fmt.Sprintf("%s%s:%d", prefixModel, actionPage, page+1)
+			pPayload := fmt.Sprintf("%s%s:%d", prefixModel, actionPage, page+1)
+			pdata := signCallback(s.hmacKey, pPayload)
 			nav = append(nav, tgbotapi.InlineKeyboardButton{Text: "下一页 ▶️", CallbackData: &pdata})
 		}
 		rows = append(rows, nav)
@@ -233,6 +251,11 @@ func (a *App) editModelPicker(chatID int64, messageID int, page int) {
 	edit.ReplyMarkup = &tgbotapi.InlineKeyboardMarkup{InlineKeyboard: rows}
 	if _, err := a.bot.Request(edit); err != nil {
 		log.Printf("edit model picker failed: %v", err)
+		// Fallback: send a new message when editing the picker fails
+		fallback := tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ 模型已切换为 %s", a.modelDisplayName(current)))
+		if _, sendErr := a.bot.Send(fallback); sendErr != nil {
+			log.Printf("send fallback message failed: %v", sendErr)
+		}
 	}
 }
 
@@ -365,7 +388,8 @@ func (a *App) sendEffortPicker(chatID int64, _ int) {
 
 	var rows [][]tgbotapi.InlineKeyboardButton
 	for _, l := range effortLevels {
-		data := fmt.Sprintf("%s%s", prefixEffort, l.ID)
+		payload := fmt.Sprintf("%s%s", prefixEffort, l.ID)
+		data := signCallback(s.hmacKey, payload)
 		rows = append(rows, []tgbotapi.InlineKeyboardButton{
 			{Text: l.Name, CallbackData: &data},
 		})
@@ -388,6 +412,43 @@ func (a *App) persistModel(chatID int64, modelID string) error {
 		}
 		return append(records, chatRecord{ChatID: chatID, Model: modelID})
 	})
+}
+
+// signCallback signs a callback payload with HMAC-SHA256 and returns
+// "payload.base64url(signature)".  If key is nil (legacy), returns payload unchanged.
+func signCallback(key []byte, payload string) string {
+	if key == nil {
+		return payload
+	}
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(payload))
+	sig := base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+	return payload + "." + sig
+}
+
+// verifyCallback verifies a signed callback string.  It extracts the payload and
+// HMAC-SHA256 signature, checks the MAC, and returns the verified payload on
+// success.  If key is nil (legacy) it returns the raw input unchanged.
+func verifyCallback(key []byte, signed string) (string, bool) {
+	if key == nil {
+		return signed, true
+	}
+	idx := strings.LastIndex(signed, ".")
+	if idx < 0 {
+		return "", false
+	}
+	payload := signed[:idx]
+	sig, err := base64.RawURLEncoding.DecodeString(signed[idx+1:])
+	if err != nil {
+		return "", false
+	}
+	mac := hmac.New(sha256.New, key)
+	mac.Write([]byte(payload))
+	expected := mac.Sum(nil)
+	if !hmac.Equal(expected, sig) {
+		return "", false
+	}
+	return payload, true
 }
 
 func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
@@ -418,6 +479,17 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 	}
 	data := strings.TrimSpace(cq.Data)
 	log.Printf("chat=%d: callback data=%q", chatID, logPreview(data, 200))
+
+	// Verify HMAC-SHA256 signature on the callback data.
+	s := a.getOrCreateSession(chatID)
+	verifiedPayload, ok := verifyCallback(s.hmacKey, data)
+	if !ok {
+		log.Printf("chat=%d: HMAC verification failed for callback %q", chatID, logPreview(data, 200))
+		a.answerCallback(cq.ID, "⛔ 验证失败")
+		return
+	}
+	log.Printf("chat=%d: verified payload=%q", chatID, logPreview(verifiedPayload, 200))
+	data = verifiedPayload // use verified payload for all downstream processing
 
 	// --- Approval callbacks: ap:{approvalID}:{action} ---
 	if strings.HasPrefix(data, prefixApproval) {
@@ -466,13 +538,14 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 
 	// --- Model callbacks: md:{modelID} or md:page:{page} ---
 	if strings.HasPrefix(data, prefixModel) {
-		a.answerCallback(cq.ID, "")
 		payload := strings.TrimPrefix(data, prefixModel)
 		if payload == "_" {
+			a.answerCallback(cq.ID, "")
 			return // no-op (page indicator)
 		}
 		if strings.HasPrefix(payload, actionPage+":") {
 			// Pagination — edit current message instead of sending a new one
+			a.answerCallback(cq.ID, "")
 			pageStr := strings.TrimPrefix(payload, actionPage+":")
 			page, _ := strconv.Atoi(pageStr)
 			a.editModelPicker(chatID, cq.Message.MessageID, page)
@@ -482,8 +555,11 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 		modelID := payload
 		name, ok := modelByID(modelID)
 		if !ok {
+			a.answerCallback(cq.ID, "⚠️ 模型列表已更新，请重新选择")
+			a.sendModelPicker(chatID, 0)
 			return
 		}
+		a.answerCallback(cq.ID, "")
 		s := a.getOrCreateSession(chatID)
 		s.mu.Lock()
 		current := s.model
@@ -549,7 +625,6 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 	clarifyID := parts[1]
 	choiceIdx := parts[2]
 
-	s := a.getOrCreateSession(chatID)
 	s.mu.Lock()
 	pc := s.pendingClarify
 	if pc == nil || pc.clarifyID != clarifyID {
@@ -589,8 +664,12 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 		pc.qIndex = nextIdx
 		pc.questionID = nextQ.ID
 		pc.choices = nextQ.Options
-		cidNum := atomic.AddUint64(&a.clarifySeq, 1)
-		pc.clarifyID = strconv.FormatUint(cidNum, 36)
+		var cidBytes [8]byte
+		if _, err := rand.Read(cidBytes[:]); err == nil {
+			pc.clarifyID = base64.RawURLEncoding.EncodeToString(cidBytes[:])
+		} else {
+			pc.clarifyID = strconv.FormatUint(atomic.AddUint64(&a.clarifySeq, 1), 36) // fallback
+		}
 		// Snapshot data for message building.
 		qText := escapeMdv2(strings.TrimSpace(nextQ.Text))
 		if qText == "" {
@@ -613,24 +692,22 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 		if len(options) > 0 {
 			var rows [][]tgbotapi.InlineKeyboardButton
 			for i, choice := range options {
-				data := fmt.Sprintf("%s%s:%d", prefixClarify, clarifyID, i)
+				payload := fmt.Sprintf("%s%s:%d", prefixClarify, clarifyID, i)
+				data := signCallback(s.hmacKey, payload)
 				btnText := truncateForButton(fmt.Sprintf("%d. %s", i+1, choice))
 				rows = append(rows, []tgbotapi.InlineKeyboardButton{
 					{Text: btnText, CallbackData: &data},
 				})
 			}
-			otherData := fmt.Sprintf("%s%s:%s", prefixClarify, clarifyID, actionOther)
+			otherPayload := fmt.Sprintf("%s%s:%s", prefixClarify, clarifyID, actionOther)
+			otherData := signCallback(s.hmacKey, otherPayload)
 			rows = append(rows, []tgbotapi.InlineKeyboardButton{
 				{Text: "✏️ 其他（输入答案）", CallbackData: &otherData},
 			})
 			msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(rows...)
 		}
-		if sent, err := a.sendWithRetry(msg, chatID); err != nil {
+		if _, err := a.sendWithRetry(msg, chatID); err != nil {
 			log.Printf("send failed: %v", err)
-		} else {
-			s.mu.Lock()
-			s.pendingClarify.messageID = sent.MessageID
-			s.mu.Unlock()
 		}
 		a.answerCallback(cq.ID, "")
 		return
