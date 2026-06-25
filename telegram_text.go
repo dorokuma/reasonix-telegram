@@ -252,16 +252,6 @@ func telegramPreviewTail(text string, maxRunes int) string {
 
 // logPreview shortens text for logs (no user-visible [cut] marker).
 func logPreview(s string, maxBytes int) string {
-	s = strings.TrimSpace(s)
-	if len(s) <= maxBytes {
-		return s
-	}
-	return trimUTF8Bytes(s, maxBytes) + "…"
-}
-
-// logPreviewLen logs only the byte length of s, hiding the content entirely.
-// Use for logging user-provided text that should not appear in logs.
-func logPreviewLen(s string, maxBytes int) string {
 	return fmt.Sprintf("[%d bytes]", len(s))
 }
 

@@ -1053,7 +1053,7 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 		case "ask_request":
 			if ev.Ask != nil {
 				for _, q := range ev.Ask.Questions {
-					log.Printf("port=%d: ask_request q.id=%s q.prompt=%s", port, q.ID, logPreviewLen(q.Prompt, 100))
+					log.Printf("port=%d: ask_request q.id=%s q.prompt=%s", port, q.ID, logPreview(q.Prompt, 100))
 				}
 			}
 			bufferingAsk = false

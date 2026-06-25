@@ -181,7 +181,7 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 			pc.awaitingCustom = false
 			answerText = "(自定义) " + text
 		}
-		log.Printf("chat=%d: clarify text answer for q=%s: %s", m.Chat.ID, pc.questionID, logPreviewLen(answerText, 100))
+		log.Printf("chat=%d: clarify text answer for q=%s: %s", m.Chat.ID, pc.questionID, logPreview(answerText, 100))
 		pc.answers[pc.questionID] = []string{answerText}
 
 		nextIdx := pc.qIndex + 1
