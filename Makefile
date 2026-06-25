@@ -1,4 +1,4 @@
-.PHONY: build install deploy push reasonix clean test vet
+.PHONY: build install start deploy push reasonix clean test vet
 
 VERSION := $(shell git describe --tags --always 2>/dev/null || echo dev)
 BINARY := reasonix-telegram
@@ -10,8 +10,10 @@ build:
 install: build
 	chmod 0755 /usr/local/bin/$(BINARY)
 	systemctl daemon-reload
-	systemctl enable --now reasonix-telegram
 	@echo "tail logs: journalctl -u reasonix-telegram -f"
+
+start:
+	systemctl enable --now reasonix-telegram
 
 deploy: test vet build install
 	@echo "=== deploy complete: built, tested, installed, restarted ==="

@@ -784,6 +784,7 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 	var lastToolMsgID int
 	var lastToolText string // raw text of last tool dispatch (for appending result)
 	var lastToolName string // last dispatched tool name (for consolidation)
+	var lastToolBase string // base display text of last tool (without (xN) suffix)
 	var toolCount int      // consecutive same-tool calls
 	var bufferingAsk bool // true while accumulating question text for ask tool
 	var askTextBuffer strings.Builder
@@ -883,8 +884,8 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 					}
 					newLine := toolDisplayLine(ev.Tool.Name, ev.Tool.Args)
 
-					// Consolidate consecutive same-tool calls into one line with count.
-					if ev.Tool.Name == lastToolName && lastToolMsgID != 0 && toolCount > 0 {
+					// Consolidate consecutive same-tool calls (same base display text) into one line with count.
+					if ev.Tool.Name == lastToolName && newLine == lastToolBase && lastToolMsgID != 0 && toolCount > 0 {
 						toolCount++
 						var updated string
 						if toolCount == 2 {
@@ -904,9 +905,10 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 						lastToolText = updated
 						continue
 					}
-					// Different tool (or first tool): always send a new bubble.
+					// Different tool (or first tool, or same name but different display text): always send a new bubble.
 					toolCount = 1
 					lastToolName = ev.Tool.Name
+					lastToolBase = newLine
 					if onCommentary != nil {
 						lastToolMsgID = onCommentary(newLine)
 						lastToolText = newLine
@@ -1355,20 +1357,60 @@ func toolDisplayLine(toolName, argsJSON string) string {
 		return "🧠 remember"
 	case "forget":
 		return "🗑️ forget"
-	case "note", "ctx_read", "ctx_search":
-		return "📝 " + toolName
+	case "note":
+		if p := str("path"); p != "" {
+			return "📝 " + trimUTF8Bytes(p, 80)
+		}
+		if k := str("kind"); k != "" {
+			return "📝 " + k
+		}
+		return "📝 note"
+	case "ctx_read":
+		if ref := str("ref"); ref != "" {
+			return "📑 ctx_read(" + ref + ")"
+		}
+		return "📑 ctx_read"
+	case "ctx_search":
+		if p := str("pattern"); p != "" {
+			return "🔍 ctx_search(" + trimUTF8Bytes(p, 60) + ")"
+		}
+		return "🔍 ctx_search"
 	case "ctx_run":
-		return "💻 bash"
+		return "💻 ctx_run"
 	case "ctx_index":
+		if p := str("path"); p != "" {
+			return "📑 " + trimUTF8Bytes(p, 80)
+		}
 		return "📑 ctx_index"
 	case "audit_finish":
 		return "📋 audit"
-	case "delete_range", "delete_symbol":
-		return "🗑️ " + toolName
+	case "delete_range":
+		if p := str("path"); p != "" {
+			return "🗑️ " + trimUTF8Bytes(p, 80)
+		}
+		return "🗑️ delete_range"
+	case "delete_symbol":
+		if n := str("name"); n != "" {
+			return "🗑️ " + n
+		}
+		return "🗑️ delete_symbol"
 	case "notebook_edit":
+		if p := str("path"); p != "" {
+			return "📓 " + trimUTF8Bytes(p, 80)
+		}
 		return "📓 notebook"
-	case "bash_output", "wait", "kill_shell":
-		return "⏱ " + toolName
+	case "bash_output":
+		if j := str("job_id"); j != "" {
+			return "⏱ bash_output(" + j + ")"
+		}
+		return "⏱ bash_output"
+	case "wait":
+		return "⏱ wait"
+	case "kill_shell":
+		if j := str("job_id"); j != "" {
+			return "⏱ kill_shell(" + j + ")"
+		}
+		return "⏱ kill_shell"
 	case "list_scheduled_tasks":
 		return "📅 scheduled"
 	case "list_sessions":
@@ -1385,12 +1427,24 @@ func toolDisplayLine(toolName, argsJSON string) string {
 		}
 		return "🤖 task"
 	case "explore":
+		if task := str("task"); task != "" {
+			return "🔍 explore(" + trimUTF8Bytes(task, 60) + ")"
+		}
 		return "🔍 explore"
 	case "research":
+		if task := str("task"); task != "" {
+			return "🧪 research(" + trimUTF8Bytes(task, 60) + ")"
+		}
 		return "🧪 research"
 	case "review":
+		if task := str("task"); task != "" {
+			return "🧐 review(" + trimUTF8Bytes(task, 60) + ")"
+		}
 		return "🧐 review"
 	case "security_review":
+		if task := str("task"); task != "" {
+			return "🛡️ security(" + trimUTF8Bytes(task, 60) + ")"
+		}
 		return "🛡️ security"
 	case "gh", "git":
 		return "🔀 " + toolName
@@ -1399,14 +1453,26 @@ func toolDisplayLine(toolName, argsJSON string) string {
 	case "systemctl", "service":
 		return "⚙️ " + toolName
 	case "ask":
-		return "❓"
+		return "❓ ask"
 	case "lsp_definition":
+		if sym := str("symbol"); sym != "" {
+			return "🎯 definition(" + sym + ")"
+		}
 		return "🎯 definition"
 	case "lsp_diagnostics":
+		if f := str("file"); f != "" {
+			return "⚠️ diagnostics(" + trimUTF8Bytes(f, 80) + ")"
+		}
 		return "⚠️ diagnostics"
 	case "lsp_hover":
+		if sym := str("symbol"); sym != "" {
+			return "🖱️ hover(" + sym + ")"
+		}
 		return "🖱️ hover"
 	case "lsp_references":
+		if sym := str("symbol"); sym != "" {
+			return "🔗 references(" + sym + ")"
+		}
 		return "🔗 references"
 	default:
 		// MCP tools: match by prefix.
