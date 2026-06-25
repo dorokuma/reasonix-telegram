@@ -337,20 +337,44 @@ func (a *App) startServe(chatID int64, skipPortCheck bool) error {
 	cumCurrency := s.cumCurrency
 	s.mu.Unlock()
 
-	if sessionPath == "" {
-		sessionPath = a.state.sessionPathForChat(chatID)
-		s.mu.Lock()
-		s.sessionPath = sessionPath
-		s.servePort = port
-		s.mu.Unlock()
-	}
+	// Always use the canonical encrypted path (.jsonl.enc) so state.json never
+	// stores the plain-text path (.jsonl) — the latter would cause encryptFromPlain
+	// to read and overwrite the same file (self-destruction).
+	sessionPath = a.state.sessionPathForChat(chatID)
+	s.mu.Lock()
+	s.sessionPath = sessionPath
+	s.servePort = port
+	s.mu.Unlock()
 
 	// Determine the plaintext temp path for reasonix serve (it reads/writes
 	// plain JSONL).  We decrypt .jsonl.enc -> .jsonl before starting serve
 	// and re-encrypt after it exits.
 	plainPath := a.state.sessionPathForChatPlain(chatID)
 
-	msgs, users, _ := sessionStats(sessionPath)
+	msgs, users, err := sessionStats(sessionPath)
+	if err != nil {
+		// sessionStats failed — the file may be encrypted, damaged, or the key
+		// has changed.  Try recovering by decrypting to the plain path first,
+		// then re-stating on the plaintext copy.
+		log.Printf("chat=%d: sessionStats(%s) error: %v — attempting recovery", chatID, sessionPath, err)
+		if decErr := decryptToPlain(sessionPath, plainPath); decErr == nil {
+			var msgs2, users2 int
+			msgs2, users2, err = sessionStats(plainPath)
+			if err == nil {
+				msgs, users = msgs2, users2
+				log.Printf("chat=%d: recovery via plaintext succeeded (%d messages, %d user turns)", chatID, msgs, users)
+			}
+		}
+		if err != nil {
+			// Recovery via decryption also failed.  Check for checkpoint data.
+			ckptDir := filepath.Join(a.state.sessionsDir(), fmt.Sprintf("%d.ckpt", chatID))
+			if fi, statErr := os.Stat(ckptDir); statErr == nil && fi.IsDir() {
+				log.Printf("chat=%d: checkpoint %s exists — will attempt recovery from checkpoint", chatID, ckptDir)
+			} else {
+				log.Printf("chat=%d: no checkpoint, session data may be lost", chatID)
+			}
+		}
+	}
 	if users > 0 {
 		log.Printf("chat=%d: resume session %s (%d messages, %d user turns)", chatID, sessionPath, msgs, users)
 		// Decrypt the encrypted session file for the serve process.
@@ -358,15 +382,16 @@ func (a *App) startServe(chatID int64, skipPortCheck bool) error {
 			log.Printf("chat=%d: decrypt session for serve: %v", chatID, err)
 		}
 	} else {
-		// No pre-created empty JSONL — an empty --resume file used to replace the
-		// boot-time system prompt and drop global REASONIX.md from the model context.
-		if err := os.Remove(sessionPath); err != nil && !os.IsNotExist(err) {
-			log.Printf("remove %s: %v", sessionPath, err)
+		// Preserve existing files by renaming to .bak.timestamp instead of deleting,
+		// so session data is not irretrievably lost on a failed stat or an empty-file edge case.
+		bakSuffix := ".bak." + strconv.FormatInt(time.Now().UnixMilli(), 36)
+		if err := os.Rename(sessionPath, sessionPath+bakSuffix); err != nil && !os.IsNotExist(err) {
+			log.Printf("rename %s -> %s: %v", sessionPath, sessionPath+bakSuffix, err)
 		}
-		if err := os.Remove(plainPath); err != nil && !os.IsNotExist(err) {
-			log.Printf("remove %s: %v", plainPath, err)
+		if err := os.Rename(plainPath, plainPath+bakSuffix); err != nil && !os.IsNotExist(err) {
+			log.Printf("rename %s -> %s: %v", plainPath, plainPath+bakSuffix, err)
 		}
-		log.Printf("chat=%d: new session at %s", chatID, plainPath)
+		log.Printf("chat=%d: new session at %s (preserved previous files as .bak.*)", chatID, plainPath)
 	}
 
 	args := []string{"serve", "--addr", serveAddr(port)}
@@ -642,7 +667,7 @@ func (a *App) restorePersistedSessions() {
 		s.mu.Lock()
 		s.workdir = a.workDir()
 		s.sessionPath = rec.SessionPath
-		if s.sessionPath == "" {
+		if s.sessionPath == "" || !strings.HasSuffix(s.sessionPath, ".jsonl.enc") {
 			s.sessionPath = a.state.sessionPathForChat(rec.ChatID)
 		}
 		s.servePort = rec.Port

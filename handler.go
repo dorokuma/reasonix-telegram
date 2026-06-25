@@ -523,12 +523,14 @@ func (a *App) resetReasonixSession(chatID int64) {
 	s.cumCurrency = ""
 	s.lastUsage = wireUsage{}
 	s.mu.Unlock()
-	// Remove both the encrypted and any plaintext temp file.
-	if err := os.Remove(encPath); err != nil && !os.IsNotExist(err) {
-		log.Printf("remove %s: %v", encPath, err)
+	// Rename the session files to .bak.timestamp so they can be recovered if
+	// the session data is still needed (e.g. for debugging or manual restoration).
+	bakSuffix := ".bak." + strconv.FormatInt(time.Now().UnixMilli(), 36)
+	if err := os.Rename(encPath, encPath+bakSuffix); err != nil && !os.IsNotExist(err) {
+		log.Printf("rename %s -> %s: %v", encPath, encPath+bakSuffix, err)
 	}
-	if err := os.Remove(plainPath); err != nil && !os.IsNotExist(err) {
-		log.Printf("remove %s: %v", plainPath, err)
+	if err := os.Rename(plainPath, plainPath+bakSuffix); err != nil && !os.IsNotExist(err) {
+		log.Printf("rename %s -> %s: %v", plainPath, plainPath+bakSuffix, err)
 	}
 	_ = a.state.remove(chatID)
 }

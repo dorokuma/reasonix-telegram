@@ -260,6 +260,9 @@ func decryptToPlain(src, dst string) error {
 // to dst.  If src does not exist dst is left untouched.  If the encryption key
 // is unavailable, dst is written as plaintext (fallback).
 func encryptFromPlain(src, dst string) error {
+	if src == dst {
+		return fmt.Errorf("encryptFromPlain: src and dst are the same path %q — would overwrite the plaintext file with encrypted data", src)
+	}
 	data, err := os.ReadFile(src)
 	if err != nil {
 		if os.IsNotExist(err) {

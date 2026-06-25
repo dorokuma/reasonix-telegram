@@ -688,7 +688,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				rec := chatRecord{
 					ChatID:      chatID,
 					Workdir:     s.workdir,
-					SessionPath: s.sessionPath,
+					SessionPath: a.state.sessionPathForChat(chatID),
 					Port:        s.servePort,
 					Model:       s.model,
 					CumPrompt:   s.cumPrompt,
