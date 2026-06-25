@@ -8,7 +8,7 @@ build:
   output: /usr/local/bin/reasonix-telegram
   ldflags: "-s -w"
 install:
-  cmd: cp /usr/local/bin/reasonix-telegram /usr/local/bin/reasonix-telegram
+  cmd: chmod 0755 /usr/local/bin/reasonix-telegram
 deploy:
   bridge: telegram
   env_check:
