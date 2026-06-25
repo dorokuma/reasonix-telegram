@@ -22,38 +22,7 @@ import (
 func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 	s := a.getOrCreateSession(chatID)
 
-	s.mu.Lock()
-	s.lastActivity = time.Now()
-	if t := s.task; t != nil {
-		log.Printf("chat=%d: pre-empting running turn", chatID)
-		t.cancel()
-	}
-	s.mu.Unlock()
-	a.dismissSessionDraft(chatID)
-
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		s.mu.Lock()
-		busy := s.task != nil
-		s.mu.Unlock()
-		if !busy {
-			break
-		}
-		if time.Now().After(deadline) {
-			log.Printf("WARN: chat=%d previous turn didn't exit in 3s", chatID)
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-
-	if err := a.ensureServe(chatID); err != nil {
-		a.reply(chatID, fmt.Sprintf("Reasonix 服务启动失败: %v", err))
-		return
-	}
-
-	stopTyping := a.beginTyping(chatID)
-	defer stopTyping()
-
+	// Construct thisTask before locking (cancel function must be ready).
 	var ctx context.Context
 	var cancel context.CancelFunc
 	if a.cfg.MaxDuration > 0 {
@@ -61,10 +30,41 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 	} else {
 		ctx, cancel = context.WithCancel(context.Background())
 	}
-	s.mu.Lock()
 	thisTask := &runningTask{cancel: cancel}
+
+	// Atomically: cancel any previous task and set the new one under a single
+	// lock, eliminating the TOCTOU window between cancellation and assignment.
+	// Cancel the old task's cancel func outside the lock (may block).
+	var oldCancel context.CancelFunc
+	s.mu.Lock()
+	s.lastActivity = time.Now()
+	if t := s.task; t != nil {
+		log.Printf("chat=%d: pre-empting running turn", chatID)
+		oldCancel = t.cancel
+	}
 	s.task = thisTask
 	s.mu.Unlock()
+
+	if oldCancel != nil {
+		oldCancel()
+	}
+
+	a.dismissSessionDraft(chatID)
+
+	if err := a.ensureServe(chatID); err != nil {
+		// Clean up thisTask since we won't proceed.
+		s.mu.Lock()
+		if s.task == thisTask {
+			s.task = nil
+		}
+		s.mu.Unlock()
+		cancel()
+		a.reply(chatID, fmt.Sprintf("Reasonix 服务启动失败: %v", err))
+		return
+	}
+
+	stopTyping := a.beginTyping(chatID)
+	defer stopTyping()
 
 	defer func() {
 		s.mu.Lock()
@@ -143,6 +143,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		bufMu.Unlock()
 		body := streamFinalizeBody(raw, lastDraftBody)
 		body = stripErrorLines(body)
+		body = stripBackgroundJobs(body)
 		if body != "" && strings.TrimSpace(raw) == "" && strings.TrimSpace(lastDraftBody) != "" {
 			log.Printf("chat=%d: endStream using lastDraftBody fallback len=%d", chatID, len(body))
 		}

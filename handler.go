@@ -41,17 +41,19 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 		a.rateLimits.Store(m.Chat.ID, now)
 	}
 	// Inbound message_id dedup: drop duplicate Telegram updates.
-	// Entries older than 10 minutes are treated as new (timestamp-based expiry).
+	// LoadOrStore provides an atomic check-and-store, eliminating the TOCTOU
+	// race between Load and Store. Entries older than 10 minutes are replaced
+	// with the current timestamp (treated as new).
 	if m.MessageID != 0 {
-		if v, ok := seenMsgs.Load(m.MessageID); ok {
-			if ts, ok := v.(int64); ok && time.Now().Unix()-ts < 600 {
+		now := time.Now().Unix()
+		if actual, loaded := seenMsgs.LoadOrStore(m.MessageID, now); loaded {
+			if ts, ok := actual.(int64); ok && now-ts < 600 {
 				log.Printf("chat=%d: duplicate message %d ignored", m.Chat.ID, m.MessageID)
 				return
 			}
-			// Stale entry (>10 min) — delete and re-store
-			seenMsgs.Delete(m.MessageID)
+			// Stale entry (>10 min) — update timestamp and continue
+			seenMsgs.Store(m.MessageID, now)
 		}
-		seenMsgs.Store(m.MessageID, time.Now().Unix())
 	}
 	if !a.allowed(m.From) {
 		a.reply(m.Chat.ID, "⛔ 无权使用此机器人")

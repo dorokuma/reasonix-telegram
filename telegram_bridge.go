@@ -7,7 +7,6 @@ import (
 	"log"
 	"net/http"
 	"net/url"
-	"os"
 	"strings"
 	"time"
 
@@ -38,8 +37,8 @@ func NewTelegramBridge(cfg *Config) (PlatformBridge, error) {
 		sanitizer: sanitizer,
 	}
 	bot.Client = &http.Client{
-		Transport: NewTelegramFallbackTransport(innerTransport, os.Getenv("TELEGRAM_FALLBACK_IPS"), sanitizer),
-		Timeout:   30 * time.Second,
+		Transport: innerTransport,
+		Timeout:   65 * time.Second,
 	}
 
 	log.Printf("reasonix-telegram %s — authorized as @%s (id=%d)", version, bot.Self.UserName, bot.Self.ID)
@@ -95,8 +94,6 @@ func newBotWithRetry(cfg *Config) (*tgbotapi.BotAPI, error) {
 			}
 			log.Printf("telegram auth retry %d/%d after %v (last error: %v)",
 				attempt, maxRetries, delay, redactSecrets(lastErr.Error(), cfg.secrets))
-
-			discoverFallbackIPs()
 
 			time.Sleep(delay)
 		}
@@ -188,20 +185,30 @@ type sanitizingReadCloser struct {
 }
 
 // Read implements io.Reader with token sanitization.
-// Uses a simple approach: buffers small reads to detect and replace token
-// across read boundaries.
+// Uses an internal buffer (max 64KB) to handle reads where the underlying
+// reader returns more data than the caller's buffer, avoiding silent data loss.
 func (r *sanitizingReadCloser) Read(p []byte) (int, error) {
-	// For simplicity, read into a larger buffer, sanitize, then copy.
-	// We use a fixed 32KB buffer to avoid pathological cases.
-	const bufSize = 32 * 1024
-	tmp := make([]byte, len(p)+bufSize)
-	n, err := r.rc.Read(tmp)
-	if n > 0 {
-		sanitized := r.sanitizer.Sanitize(string(tmp[:n]))
-		copied := copy(p, sanitized)
-		return copied, err
+	if len(r.buf) == 0 {
+		const readSize = 64 * 1024
+		tmp := make([]byte, readSize)
+		n, err := r.rc.Read(tmp)
+		if n > 0 {
+			sanitized := r.sanitizer.Sanitize(string(tmp[:n]))
+			r.buf = []byte(sanitized)
+		}
+		if err != nil {
+			// If there's data in buffer and EOF, return data now, error next call.
+			if len(r.buf) > 0 && err == io.EOF {
+				// fall through to copy data below
+			} else {
+				return 0, err
+			}
+		}
 	}
-	return n, err
+	// Copy from internal buffer to caller's buffer
+	copied := copy(p, r.buf)
+	r.buf = r.buf[copied:]
+	return copied, nil
 }
 
 func (r *sanitizingReadCloser) Close() error {

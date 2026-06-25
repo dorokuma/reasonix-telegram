@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -535,10 +536,39 @@ func (a *App) sendMessageParts(chatID int64, parts []string, parseMode string, r
 func (a *App) sendWithRetry(msg tgbotapi.Chattable, chatID int64) (tgbotapi.Message, error) {
 	const maxAttempts = 3
 	reFloodWait := regexp.MustCompile(`(?i)retry after (\d+)`)
+
+	// Dedup: skip duplicate text sends within 30s.
+	contentKey := messageContentKey(msg)
+	if contentKey != "" {
+		a.sentCacheMu.Lock()
+		hash := fmt.Sprintf("%x", sha256.Sum256([]byte(contentKey)))
+		if lastSent, ok := a.sentCache[hash]; ok && time.Since(lastSent) < 30*time.Second {
+			a.sentCacheMu.Unlock()
+			log.Printf("chat=%d: dedup — same content sent %v ago, skipping", chatID, time.Since(lastSent).Round(time.Second))
+			return tgbotapi.Message{}, nil
+		}
+
+		// Clean entries older than 30s.
+		now := time.Now()
+		for h, t := range a.sentCache {
+			if now.Sub(t) > 30*time.Second {
+				delete(a.sentCache, h)
+			}
+		}
+		a.sentCacheMu.Unlock()
+	}
+
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		m, err := a.bot.Send(msg)
 		if err == nil {
+			// Record successful send in cache.
+			if contentKey != "" {
+				hash := fmt.Sprintf("%x", sha256.Sum256([]byte(contentKey)))
+				a.sentCacheMu.Lock()
+				a.sentCache[hash] = time.Now()
+				a.sentCacheMu.Unlock()
+			}
 			return m, nil
 		}
 		lastErr = err
@@ -567,6 +597,22 @@ func (a *App) sendWithRetry(msg tgbotapi.Chattable, chatID int64) (tgbotapi.Mess
 		}
 	}
 	return tgbotapi.Message{}, lastErr
+}
+
+// messageContentKey returns a string uniquely identifying the content of a
+// Chattable message for dedup hashing. Returns "" for types where dedup is
+// not applicable (media, documents, etc.).
+func messageContentKey(msg tgbotapi.Chattable) string {
+	switch v := msg.(type) {
+	case tgbotapi.MessageConfig:
+		return "text:" + v.Text
+	case tgbotapi.EditMessageTextConfig:
+		return fmt.Sprintf("edit:%d:%s", v.MessageID, v.Text)
+	default:
+		// For other types (media, documents, etc.), use the full struct
+		// representation as a conservative fallback.
+		return fmt.Sprintf("%T:%+v", msg, msg)
+	}
 }
 
 // tryRichMessage attempts to send text via sendRichMessage with raw markdown.

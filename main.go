@@ -289,9 +289,6 @@ func loadConfig() (Config, error) {
 	if cf := os.Getenv("CF_TOKEN"); cf != "" {
 		c.secrets = append(c.secrets, cf)
 	}
-	if fb := os.Getenv("TELEGRAM_FALLBACK_IPS"); fb != "" {
-		c.secrets = append(c.secrets, fb)
-	}
 	return c, nil
 }
 
@@ -394,6 +391,9 @@ type App struct {
 	noticeMu   sync.Mutex
 	lastNotice map[string]time.Time // "chatID|noticeText" → last seen time
 
+	sentCache   map[string]time.Time // content hash → send time (dedup guard)
+	sentCacheMu sync.Mutex
+
 	healthCheckStop chan struct{} // closed on shutdown to stop health check goroutine
 }
 
@@ -476,6 +476,7 @@ func main() {
 		handlerSem:   make(chan struct{}, 100),
 		sess:         map[int64]*session{},
 		mediaGroups: map[int64]map[string]*mediaGroupBatch{},
+		sentCache:   make(map[string]time.Time),
 		healthCheckStop: make(chan struct{}),
 	}
 	app.setMode(cfg.Mode)

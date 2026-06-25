@@ -125,6 +125,7 @@ type wireUsage struct {
 // wireEvent mirrors reasonix serve SSE JSON (internal/serve/wire.go).
 type wireEvent struct {
 	Kind      string `json:"kind"`
+	Seq       int64  `json:"seq,omitempty"`
 	Text      string `json:"text,omitempty"`
 	Reasoning string `json:"reasoning,omitempty"`
 	Err       string `json:"err,omitempty"`
@@ -810,14 +811,18 @@ func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onC
 // should not be retried, since retrying would produce the same non-SSE response.
 var errNonSSEResponse = errors.New("serve returned non-SSE response")
 
-func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string) int, onAskRequest func(askID string, questions []askQuestionData), onApprovalRequest func(approvalID string, toolName string), onUsage func(wireUsage)) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serveBaseURL(port)+"/events", nil)
+func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, lastSeq int64, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string) int, onAskRequest func(askID string, questions []askQuestionData), onApprovalRequest func(approvalID string, toolName string), onUsage func(wireUsage)) (int64, error) {
+	eventsURL := serveBaseURL(port) + "/events"
+	if lastSeq > 0 {
+		eventsURL = fmt.Sprintf("%s/events?offset=%d", serveBaseURL(port), lastSeq)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, eventsURL, nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	resp, err := sseClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("reasonix events: %w", err)
+		return 0, fmt.Errorf("reasonix events: %w", err)
 	}
 	var closeBodyOnce sync.Once
 	closeBody := func() {
@@ -831,7 +836,7 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 	// from a misconfigured serve) are fatal and should not be retried.
 	if ct := resp.Header.Get("Content-Type"); !strings.HasPrefix(ct, "text/event-stream") {
 		closeBody()
-		return fmt.Errorf("%w: %q (URL: %s)", errNonSSEResponse, ct, serveBaseURL(port)+"/events")
+		return 0, fmt.Errorf("%w: %q (URL: %s)", errNonSSEResponse, ct, eventsURL)
 	}
 
 	ctxDoneChan := make(chan struct{})
@@ -886,7 +891,7 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 		select {
 		case <-ctx.Done():
 			log.Printf("port=%d: SSE context cancelled, stopping event processing", port)
-			return ctx.Err()
+			return lastSeq, ctx.Err()
 		default:
 		}
 		atomic.StoreInt64(&lastActivityUnix, time.Now().Unix())
@@ -906,6 +911,12 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 			continue
 		}
 		consecutiveErrors = 0
+
+		// Track highest seq for offset-based reconnection.
+		if ev.Seq > lastSeq {
+			lastSeq = ev.Seq
+		}
+
 		switch ev.Kind {
 		case "text":
 			// Streaming token deltas — append in place (never suffix "\n" per chunk).
@@ -1061,7 +1072,7 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 				log.Printf("chat=%d: onComplete via turn_done", chatID)
 				onComplete()
 			}
-			return turnErr
+			return lastSeq, turnErr
 		case "notice":
 			if t := strings.TrimSpace(ev.Text); t != "" && !isReasonixNoise(t) {
 				key := fmt.Sprintf("%d|%s", chatID, t)
@@ -1085,13 +1096,13 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 	if err := sc.Err(); err != nil {
 		log.Printf("chat=%d: consumeServeEvents scanner error: %v", chatID, err)
 		if ctx.Err() == nil {
-			return err
+			return lastSeq, err
 		}
 	}
 	if ctx.Err() != nil {
-		return ctx.Err()
+		return lastSeq, ctx.Err()
 	}
-	return nil
+	return lastSeq, nil
 }
 
 // consumeServeEvents connects to the serve SSE stream and processes events.
@@ -1101,6 +1112,7 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string) int, onAskRequest func(askID string, questions []askQuestionData), onApprovalRequest func(approvalID string, toolName string), onUsage func(wireUsage)) turnResult {
 	const maxRetries = 3
 	backoffs := []time.Duration{500 * time.Millisecond, 5 * time.Second, 30 * time.Second}
+	var offset int64
 
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
@@ -1112,11 +1124,14 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 			if err := a.waitServeReady(port, 2*time.Second); err != nil {
 				return turnResult{err: fmt.Errorf("serve process dead, cannot retry: %w", err)}
 			}
-			log.Printf("chat=%d: SSE reconnect attempt %d/%d after %v", chatID, attempt, maxRetries, backoffs[attempt-1])
+			log.Printf("chat=%d: SSE reconnect attempt %d/%d after %v (offset=%d)", chatID, attempt, maxRetries, backoffs[attempt-1], offset)
 			time.Sleep(backoffs[attempt-1])
 		}
 
-		err := a.connectAndConsumeSSE(ctx, chatID, port, onChunk, onComplete, onToolDispatch, onCommentary, onAskRequest, onApprovalRequest, onUsage)
+		lastSeq, err := a.connectAndConsumeSSE(ctx, chatID, port, offset, onChunk, onComplete, onToolDispatch, onCommentary, onAskRequest, onApprovalRequest, onUsage)
+		if lastSeq > 0 {
+			offset = lastSeq
+		}
 		if err == nil {
 			return turnResult{}
 		}
@@ -1126,7 +1141,7 @@ func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, on
 			return turnResult{err: err}
 		}
 
-		log.Printf("chat=%d: SSE connection lost (attempt %d/%d): %v", chatID, attempt+1, maxRetries+1, err)
+		log.Printf("chat=%d: SSE connection lost (attempt %d/%d, offset=%d): %v", chatID, attempt+1, maxRetries+1, offset, err)
 	}
 	log.Printf("chat=%d: SSE connection failed after %d retries, restarting serve process", chatID, maxRetries+1)
 	a.stopServe(chatID)
@@ -1321,11 +1336,17 @@ func stripHookMessages(output string) string {
 }
 
 // stripBackgroundJobs removes reasonix background-job lifecycle blocks from text.
+// The actual format from reasonix serve is:
+//
+//	background bash started: bash-1 (sleep 10)
+//	background bash finished: bash-1
+//
+// This strips any "background <type> <action>: <id>" line.
 func stripBackgroundJobs(text string) string {
-	if !strings.Contains(text, "job_") {
+	if !strings.Contains(text, "background") {
 		return text
 	}
-	re := regexp.MustCompile(`\n?⏳.*job_[a-z_]+\s+(started|completed|failed|cancelled|rescheduled|skipped).*`)
+	re := regexp.MustCompile(`(?m)^\s*background\s+\S+\s+(started|finished|failed|killed):\s+\S+.*(\n|$)`)
 	return strings.TrimSpace(re.ReplaceAllString(text, ""))
 }
 
@@ -1383,7 +1404,7 @@ func toolDisplayLine(toolName, argsJSON string) string {
 		if len(runes) > capRunes {
 			cmd = string(runes[:capRunes]) + "…"
 		}
-		return fmt.Sprintf("💻 bash\n```\n%s\n```", cmd)
+		return fmt.Sprintf("💻 bash\n\n```\n%s\n```", cmd)
 	case "python", "python3", "execute_code", "code":
 		return "🐍 " + toolName
 	case "read_file", "cat":
