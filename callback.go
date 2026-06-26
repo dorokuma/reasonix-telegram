@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -373,7 +374,9 @@ func (a *App) effortHandler(m *tgbotapi.Message, arg string) {
 		a.reply(m.Chat.ID, "serve 未运行")
 		return
 	}
-	if err := a.postJSON(port, "/submit", map[string]string{"input": "/effort " + arg}); err != nil {
+	reqCtx, reqCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer reqCancel()
+	if err := a.postJSON(reqCtx, port, "/submit", map[string]string{"input": "/effort " + arg}); err != nil {
 		a.reply(m.Chat.ID, fmt.Sprintf("切换 effort 失败: %v", err))
 		return
 	}
@@ -527,7 +530,9 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 			session = false
 		}
 
-		if err := a.postJSON(pa.port, "/approve", map[string]any{
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := a.postJSON(ctx, pa.port, "/approve", map[string]any{
 			"id": approvalID, "allow": allow, "session": session,
 		}); err != nil {
 			a.reply(chatID, "操作失败，reasonix serve 可能已重启，请重新操作")
@@ -605,7 +610,9 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 			a.reply(chatID, "serve 未运行")
 			return
 		}
-		if err := a.postJSON(port, "/submit", map[string]string{"input": "/effort " + level}); err != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := a.postJSON(ctx, port, "/submit", map[string]string{"input": "/effort " + level}); err != nil {
 			a.reply(chatID, fmt.Sprintf("切换 effort 失败: %v", err))
 			return
 		}

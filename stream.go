@@ -64,7 +64,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 	}
 
 	stopTyping := a.beginTyping(chatID)
-	defer stopTyping()
+	thisTask.stopTyping = stopTyping
 
 	defer func() {
 		s.mu.Lock()
@@ -76,6 +76,8 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		s.mu.Unlock()
 		cancel()
 	}()
+
+	defer stopTyping()
 
 	var (
 		buf            strings.Builder

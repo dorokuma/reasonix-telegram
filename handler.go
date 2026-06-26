@@ -19,6 +19,7 @@ import (
 )
 
 var seenMsgs sync.Map // inbound message_id dedup
+var chatRunMu sync.Map // map[int64]*sync.Mutex — per-chat serialization for runTask
 
 func (a *App) handleMessage(m *tgbotapi.Message) {
 	defer a.msgWg.Done()
@@ -319,6 +320,9 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 		// Signal the goroutine: it will SIGINT the process group, wait up to
 		// 5s, then SIGKILL if still alive. s.task is cleared by runTask's defer
 		// when the process actually exits, NOT here — so /status stays accurate.
+		if t.stopTyping != nil {
+			t.stopTyping()
+		}
 		t.cancel()
 		a.reply(m.Chat.ID, "🛑 已发送中止信号")
 		return
@@ -469,6 +473,10 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 		log.Printf("chat=%d: no ReplyToMessage (msgID=%d)", m.Chat.ID, m.MessageID)
 	}
 
+	muI, _ := chatRunMu.LoadOrStore(m.Chat.ID, &sync.Mutex{})
+	mu := muI.(*sync.Mutex)
+	mu.Lock()
+	defer mu.Unlock()
 	a.runTask(m.Chat.ID, m.MessageID, text)
 }
 

@@ -356,7 +356,8 @@ type session struct {
 }
 
 type runningTask struct {
-	cancel context.CancelFunc
+	cancel     context.CancelFunc
+	stopTyping context.CancelFunc // nil if typing not started yet
 }
 
 type App struct {

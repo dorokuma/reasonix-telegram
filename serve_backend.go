@@ -780,12 +780,12 @@ func (a *App) waitServeReady(port int, timeout time.Duration) error {
 	return fmt.Errorf("reasonix serve not ready at %s", url)
 }
 
-func (a *App) postJSON(port int, path string, body any) error {
+func (a *App) postJSON(ctx context.Context, port int, path string, body any) error {
 	b, err := json.Marshal(body)
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, serveBaseURL(port)+path, bytes.NewReader(b))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, serveBaseURL(port)+path, bytes.NewReader(b))
 	if err != nil {
 		return err
 	}
@@ -821,7 +821,7 @@ func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onC
 		eventsDone <- a.consumeServeEvents(ctx, chatID, port, onChunk, onComplete, onToolDispatch, onCommentary, onAskRequest, onApprovalRequest, onUsage)
 	}()
 
-	if err := a.postJSON(port, "/submit", map[string]string{"input": prompt}); err != nil {
+	if err := a.postJSON(ctx, port, "/submit", map[string]string{"input": prompt}); err != nil {
 		cancel()
 		return fmt.Errorf("submit: %w", err)
 	}
@@ -830,7 +830,9 @@ func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onC
 	case tr := <-eventsDone:
 		return tr.err
 	case <-ctx.Done():
-		_ = a.postJSON(port, "/cancel", map[string]any{})
+		cancelCtx, cancelCancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancelCancel()
+		_ = a.postJSON(cancelCtx, port, "/cancel", map[string]any{})
 		select {
 		case tr := <-eventsDone:
 			return tr.err
@@ -894,7 +896,7 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 	var bufferingAsk bool // true while accumulating question text for ask tool
 	var askTextBuffer strings.Builder
 
-	// SSE idle watchdog: close body if no data for 5 min (Hermes-inspired).
+	// SSE idle watchdog: close body if no data for 2 min (Hermes-inspired).
 	var lastActivityUnix int64 = time.Now().Unix()
 	watchdogCtx, watchdogCancel := context.WithCancel(ctx)
 	defer watchdogCancel()
@@ -905,7 +907,7 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 			select {
 			case <-ticker.C:
 				elapsed := time.Now().Unix() - atomic.LoadInt64(&lastActivityUnix)
-				if elapsed > 300 {
+				if elapsed > 120 {
 					log.Printf("port=%d: SSE idle for %ds, closing stream", port, elapsed)
 					closeBody()
 					return
@@ -986,7 +988,7 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 					}
 					cancelOnce.Do(func() {
 						log.Printf("chat-only: blocked tool %s, cancelling turn", ev.Tool.Name)
-						_ = a.postJSON(port, "/cancel", map[string]any{})
+						_ = a.postJSON(ctx, port, "/cancel", map[string]any{})
 					})
 				}
 			} else {
