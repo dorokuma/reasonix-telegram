@@ -385,6 +385,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		leakProbe.Reset()
 		leakDecided = false
 		leakDetected = false
+		leakTail = ""
 	}
 
 	// Register pusher signal on session so clarify answer handlers can kick the stream.
@@ -459,6 +460,10 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				bufMu.Lock()
 				if !leakDecided {
 					probe := leakProbe.String()
+					if leakTail != "" {
+						probe += leakTail
+						leakTail = ""
+					}
 					if probe != "" {
 						decision := detectThinkingLeak(probe, true)
 						if decision == leakKeep {
@@ -706,6 +711,10 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		bufMu.Lock()
 		if !leakDecided {
 			probe := leakProbe.String()
+			if leakTail != "" {
+				probe += leakTail
+				leakTail = ""
+			}
 			if probe != "" {
 				decision := detectThinkingLeak(probe, true)
 				if decision == leakKeep {

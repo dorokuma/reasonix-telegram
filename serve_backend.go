@@ -74,6 +74,13 @@ func (a *App) isServeStale(port int, expectedArgs []string, expectedCWD string) 
 		if !isReasonixServeCmd(cmdline, a.cfg.ReasonixBin) {
 			continue
 		}
+		// Check whether the binary at /proc/PID/exe has been replaced
+		// (e.g. after a bridge upgrade). If the old binary was deleted,
+		// the symlink target will contain "(deleted)".
+		exe, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
+		if err != nil || strings.Contains(exe, "(deleted)") {
+			return true
+		}
 		// Compare CWD.
 		if readProcCWD(pid) != expectedCWD {
 			return true
@@ -1199,9 +1206,10 @@ func stripThinkBlocks(s string) string {
 			}
 			end := strings.Index(s[start+len(open):], close)
 			if end < 0 {
-				// No closing tag — remove from open to end
-				s = s[:start]
-				break
+				// No closing tag — could be split across chunks.
+				// Only remove the opening tag itself, keep everything after.
+				s = s[:start] + s[start+len(open):]
+				continue
 			}
 			end = start + len(open) + end + len(close)
 			s = s[:start] + s[end:]

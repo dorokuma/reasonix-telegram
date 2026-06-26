@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -40,10 +41,42 @@ func (a *App) cleanupStaleServesOnStartup() {
 	if len(stale) == 0 {
 		return
 	}
+
+	// Capture ports from stale PIDs before killing, so we can wait for
+	// them to be released even if they aren't in persistedServePorts.
+	for pid := range stale {
+		cmdline := readProcCmdline(pid)
+		if port := portFromServeCmdline(cmdline); port > 0 {
+			ports[port] = struct{}{}
+		}
+	}
+
 	for pid := range stale {
 		log.Printf("startup: stopping stale reasonix serve pid=%d", pid)
 		terminateProcessGroup(pid, 8*time.Second)
 	}
+
+	// Wait for all captured serve ports to be released before returning,
+	// otherwise restorePersistedSessions may find the port still responding
+	// (TIME_WAIT / socket not yet released) and reuse the old process.
+	// Concurrently wait for all ports so N ports don't add N×6s to startup.
+	var wg sync.WaitGroup
+	for port := range ports {
+		wg.Add(1)
+		go func(p int) {
+			defer wg.Done()
+			if isPortInUse(p) {
+				log.Printf("startup: waiting for port %d to be released", p)
+				for i := 0; i < 30; i++ {
+					if !isPortInUse(p) {
+						return
+					}
+					time.Sleep(200 * time.Millisecond)
+				}
+			}
+		}(port)
+	}
+	wg.Wait()
 }
 
 func persistedServePorts(st *stateStore) map[int]struct{} {
@@ -98,6 +131,24 @@ func isReasonixServeCmd(cmd string, reasonixBin string) bool {
 	// Check the binary path ends with the expected name (or /name).
 	// Then verify the first argument is "serve".
 	return (strings.HasSuffix(bin, "/"+reasonixBin) || bin == reasonixBin) && parts[1] == "serve"
+}
+
+// portFromServeCmdline extracts the listening port from a reasonix serve cmdline
+// by parsing the --addr argument (e.g. "127.0.0.1:23650").
+func portFromServeCmdline(cmdline string) int {
+	parts := strings.Fields(cmdline)
+	for i, p := range parts {
+		if p == "--addr" && i+1 < len(parts) {
+			addr := parts[i+1]
+			if idx := strings.LastIndex(addr, ":"); idx >= 0 {
+				portStr := addr[idx+1:]
+				if port, err := strconv.Atoi(portStr); err == nil {
+					return port
+				}
+			}
+		}
+	}
+	return 0
 }
 
 func readProcCmdline(pid int) string {

@@ -252,7 +252,11 @@ func telegramPreviewTail(text string, maxRunes int) string {
 
 // logPreview shortens text for logs (no user-visible [cut] marker).
 func logPreview(s string, maxBytes int) string {
-	return fmt.Sprintf("[%d bytes]", len(s))
+	if len(s) <= maxBytes {
+		return fmt.Sprintf("[%d bytes] %q", len(s), s)
+	}
+	truncated := trimUTF8Bytes(s, maxBytes)
+	return fmt.Sprintf("[%d bytes] %q...", len(s), truncated)
 }
 
 // trimUTF8Bytes trims s to at most maxBytes without breaking a UTF-8 code point.
@@ -638,6 +642,7 @@ func (a *App) tryRichMessage(chatID int64, text string, editMsgID ...int) int {
 		log.Printf("chat=%d: %s failed: %v", chatID, endpoint, err)
 		return 0
 	}
+	log.Printf("chat=%d: tryRichMessage succeeded", chatID)
 	// For edits, the message ID is already known.
 	if len(editMsgID) > 0 && editMsgID[0] > 0 {
 		return editMsgID[0]
