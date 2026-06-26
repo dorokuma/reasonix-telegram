@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"runtime/debug"
 	"strconv"
 	"strings"
@@ -509,30 +510,49 @@ func (a *App) getOrCreateSession(chatID int64) *session {
 func (a *App) resetReasonixSession(chatID int64) {
 	a.stopServe(chatID)
 	s := a.getOrCreateSession(chatID)
-	s.mu.Lock()
-	encPath := s.sessionPath
-	if encPath == "" {
-		encPath = a.state.sessionPathForChat(chatID)
+
+	// 等待旧 serve 的 encrypt goroutine 完成
+	if s.encryptDone != nil {
+		select {
+		case <-s.encryptDone:
+		case <-time.After(3 * time.Second):
+			log.Printf("chat=%d: timed out waiting for encrypt goroutine", chatID)
+		}
 	}
+
+	basePath := a.state.sessionPathForChat(chatID)
 	plainPath := a.state.sessionPathForChatPlain(chatID)
-	// Reset cumulative usage counters for the new session.
+	ckptDir := filepath.Join(filepath.Dir(basePath), fmt.Sprintf("%d.ckpt", chatID))
+
+	// 删除所有会话数据
+	for _, p := range []string{
+		basePath,       // .jsonl.enc
+		plainPath,      // .jsonl
+		basePath + ".meta",
+		plainPath + ".cost",
+	} {
+		if err := os.Remove(p); err != nil && !os.IsNotExist(err) {
+			log.Printf("chat=%d: remove %s: %v", chatID, p, err)
+		}
+	}
+	os.RemoveAll(ckptDir)
+
+	// 重置 session 对象
+	s.mu.Lock()
+	s.sessionPath = ""
 	s.cumPrompt = 0
 	s.cumCompletion = 0
 	s.cumTotal = 0
 	s.cumCost = 0
 	s.cumCurrency = ""
 	s.lastUsage = wireUsage{}
+	s.hmacKey = nil
 	s.mu.Unlock()
-	// Rename the session files to .bak.timestamp so they can be recovered if
-	// the session data is still needed (e.g. for debugging or manual restoration).
-	bakSuffix := ".bak." + strconv.FormatInt(time.Now().UnixMilli(), 36)
-	if err := os.Rename(encPath, encPath+bakSuffix); err != nil && !os.IsNotExist(err) {
-		log.Printf("rename %s -> %s: %v", encPath, encPath+bakSuffix, err)
+
+	// 从 state.json 移除（检查错误，但不要因为文件不存在就报错）
+	if err := a.state.remove(chatID); err != nil {
+		log.Printf("chat=%d: state.remove failed: %v", chatID, err)
 	}
-	if err := os.Rename(plainPath, plainPath+bakSuffix); err != nil && !os.IsNotExist(err) {
-		log.Printf("rename %s -> %s: %v", plainPath, plainPath+bakSuffix, err)
-	}
-	_ = a.state.remove(chatID)
 }
 
 func (a *App) reply(chatID int64, text string) {

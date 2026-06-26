@@ -352,6 +352,7 @@ type session struct {
 	liveDraftID   int64 // open sendMessageDraft on Telegram (session-level for pre-empt cleanup)
 	serveRestartCount int       // consecutive health-check restart failures
 	serveLastRestart  time.Time // last restart attempt time
+	encryptDone       chan struct{} // closed when the encrypt-from-plain goroutine finishes
 }
 
 type runningTask struct {

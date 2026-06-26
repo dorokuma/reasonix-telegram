@@ -506,9 +506,11 @@ func (a *App) startServe(chatID int64, skipPortCheck bool) error {
 	s.serveCmd = cmd
 	s.sessionPath = sessionPath
 	s.servePort = port
+	s.encryptDone = make(chan struct{})
 	s.mu.Unlock()
 
 	go func() {
+		defer close(s.encryptDone)
 		err := cmd.Wait()
 		s.mu.Lock()
 		if s.serveCmd == cmd {
