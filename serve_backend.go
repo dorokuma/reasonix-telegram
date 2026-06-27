@@ -491,12 +491,18 @@ func (a *App) startServe(chatID int64, skipPortCheck bool) error {
 		return fmt.Errorf("create stderr pipe: %w", err)
 	}
 	go func() {
-		scanner := bufio.NewScanner(stderrPipe)
-		for scanner.Scan() {
-			log.Printf("[serve stderr] %s", scanner.Text())
-		}
-		if err := scanner.Err(); err != nil {
-			log.Printf("[serve stderr] pipe read error: %v", err)
+		reader := bufio.NewReader(stderrPipe)
+		for {
+			line, err := reader.ReadString('\n')
+			if len(line) > 0 {
+				log.Printf("[serve stderr] %s", strings.TrimSuffix(line, "\n"))
+			}
+			if err != nil {
+				if err != io.EOF {
+					log.Printf("[serve stderr] pipe read error: %v", err)
+				}
+				break
+			}
 		}
 	}()
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true, Pgid: 0}
