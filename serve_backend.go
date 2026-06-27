@@ -108,7 +108,16 @@ var localHTTPClient = &http.Client{Timeout: 10 * time.Second}
 
 // sseClient is a separate HTTP client for long-lived SSE streams.
 // It must NOT have an overall timeout — the application-level idle watchdog handles that.
-var sseClient = &http.Client{}
+// Transport-level dial & TLS handshake timeouts prevent permanent hangs if the serve
+// process is unresponsive during the initial connection.
+var sseClient = &http.Client{
+	Transport: &http.Transport{
+		DialContext: (&net.Dialer{
+			Timeout: 10 * time.Second,
+		}).DialContext,
+		TLSHandshakeTimeout: 10 * time.Second,
+	},
+}
 
 // wireUsage mirrors usage stats from the reasonix serve SSE stream.
 type wireUsage struct {

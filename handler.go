@@ -19,7 +19,6 @@ import (
 )
 
 var seenMsgs sync.Map // inbound message_id dedup
-var chatRunMu sync.Map // map[int64]*sync.Mutex — per-chat serialization for runTask
 
 func (a *App) handleMessage(m *tgbotapi.Message) {
 	defer a.msgWg.Done()
@@ -473,12 +472,10 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 		log.Printf("chat=%d: no ReplyToMessage (msgID=%d)", m.Chat.ID, m.MessageID)
 	}
 
-	muI, _ := chatRunMu.LoadOrStore(m.Chat.ID, &sync.Mutex{})
-	mu := muI.(*sync.Mutex)
-	mu.Lock()
-	defer mu.Unlock()
 	a.runTask(m.Chat.ID, m.MessageID, text)
 }
+
+
 
 func (a *App) allowed(u *tgbotapi.User) bool {
 	if len(a.cfg.AllowedUsers) == 0 {
@@ -570,9 +567,20 @@ func (a *App) reply(chatID int64, text string) {
 }
 
 // sendTyping shows the client "typing…" indicator (API returns bool, not Message).
+// Uses a 5 second timeout to avoid accumulating hanging requests when Telegram API
+// is slow — the typing indicator is best-effort and should never block the caller.
 func (a *App) sendTyping(chatID int64) {
-	if _, err := a.bot.Request(tgbotapi.NewChatAction(chatID, tgbotapi.ChatTyping)); err != nil {
-		log.Printf("chat=%d: sendChatAction typing: %v", chatID, err)
+	done := make(chan struct{}, 1)
+	go func() {
+		if _, err := a.bot.Request(tgbotapi.NewChatAction(chatID, tgbotapi.ChatTyping)); err != nil {
+			log.Printf("chat=%d: sendChatAction typing: %v", chatID, err)
+		}
+		done <- struct{}{}
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		log.Printf("chat=%d: sendChatAction typing timed out (5s)", chatID)
 	}
 }
 

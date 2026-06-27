@@ -6,7 +6,6 @@ package main
 import (
 	"fmt"
 	"log"
-	"sync"
 	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
@@ -121,9 +120,5 @@ func (a *App) flushMediaGroup(chatID int64, groupID string) {
 
 	log.Printf("chat=%d: flushing media group %s (%d photos)", chatID, groupID, len(paths))
 
-	muI, _ := chatRunMu.LoadOrStore(chatID, &sync.Mutex{})
-	mu := muI.(*sync.Mutex)
-	mu.Lock()
-	defer mu.Unlock()
 	a.runTask(chatID, 0, prompt)
 }
