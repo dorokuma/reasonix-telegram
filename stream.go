@@ -641,7 +641,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				}
 				s.mu.Unlock()
 
-				text := fmt.Sprintf("%s 需要批准：%s", emoji, escapeMdv2(label))
+				text := fmt.Sprintf("%s 需要批准：%s\n\n```\n%s\n```\n\n请选择：", emoji, escapeMdv2(label), escapeMdv2(label))
 				oncePayload := fmt.Sprintf("%s:%s", apID, actionOnce)
 				onceData := signCallback(s.hmacKey, oncePayload)
 				sessionPayload := fmt.Sprintf("%s:%s", apID, actionSession)

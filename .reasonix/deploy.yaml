@@ -4,11 +4,11 @@ language: go
 module: github.com/dorokuma/reasonix-telegram
 go_version: 1.24.4
 build:
-  cmd: go build -ldflags="-s -w" -o /usr/local/bin/reasonix-telegram .
-  output: /usr/local/bin/reasonix-telegram
+  cmd: go build -ldflags="-s -w" -o ./reasonix-telegram .
+  output: ./reasonix-telegram
   ldflags: "-s -w"
 install:
-  cmd: chmod 0755 /usr/local/bin/reasonix-telegram
+  cmd: rm -f /usr/local/bin/reasonix-telegram && cp ./reasonix-telegram /usr/local/bin/reasonix-telegram && chmod 0755 /usr/local/bin/reasonix-telegram
 deploy:
   bridge: telegram
   env_check:

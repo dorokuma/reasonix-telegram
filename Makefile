@@ -5,9 +5,11 @@ BINARY := reasonix-telegram
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
 build:
-	CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o /usr/local/bin/$(BINARY) .
+	CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o $(BINARY) .
 
 install: build
+	rm -f /usr/local/bin/$(BINARY)
+	cp $(BINARY) /usr/local/bin/$(BINARY)
 	chmod 0755 /usr/local/bin/$(BINARY)
 	systemctl daemon-reload
 	@echo "tail logs: journalctl -u reasonix-telegram -f"
@@ -16,7 +18,8 @@ start:
 	systemctl enable --now reasonix-telegram
 
 deploy: test vet build install
-	@echo "=== deploy complete: built, tested, installed, restarted ==="
+	@echo "=== deploy complete: built, tested, installed ==="
+	@echo ">>> restart manually if service is running: systemctl restart reasonix-telegram"
 
 push:
 	git add -A
@@ -28,7 +31,7 @@ push:
 	@echo "=== pushed ==="
 
 reasonix:
-	(cd ../reasonix && CGO_ENABLED=0 go build -o /usr/local/bin/reasonix ./cmd/reasonix)
+	(cd ../reasonix && CGO_ENABLED=0 go build -o reasonix ./cmd/reasonix && rm -f /usr/local/bin/reasonix && cp reasonix /usr/local/bin/reasonix)
 	@reasonix --version
 
 test:
