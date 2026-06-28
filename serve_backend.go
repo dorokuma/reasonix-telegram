@@ -16,12 +16,15 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
 var portSeq atomic.Int64 // next port offset
@@ -146,11 +149,13 @@ type wireEvent struct {
 	Reasoning string `json:"reasoning,omitempty"`
 	Err       string `json:"err,omitempty"`
 	Tool      *struct {
-		Name    string `json:"name"`
-		Args    string `json:"args,omitempty"`
-		Output  string `json:"output,omitempty"`
-		Err     string `json:"err,omitempty"`
-		Partial bool   `json:"partial,omitempty"`
+		Name     string `json:"name"`
+		ID       string `json:"id,omitempty"`
+		Args     string `json:"args,omitempty"`
+		Output   string `json:"output,omitempty"`
+		Err      string `json:"err,omitempty"`
+		Partial  bool   `json:"partial,omitempty"`
+		ParentID string `json:"parentId,omitempty"`
 	} `json:"tool,omitempty"`
 	Approval *struct {
 		ID   string `json:"id"`
@@ -184,8 +189,169 @@ type askQuestionData struct {
 	Text    string // question text accumulated from model output
 }
 
+// subagentTracker 跟踪一个子代理的工具调用汇总（summary/silent 模式使用）
+type subagentTracker struct {
+	parentID   string
+	msgID      int            // summary 模式下 Telegram 消息 ID
+	toolCounts map[string]int // 工具名 → 调用次数
+	totalCalls int
+	finalized  bool
+}
+
+func (t *subagentTracker) update(toolName string) {
+	t.toolCounts[toolName]++
+	t.totalCalls++
+}
+
+func (t *subagentTracker) summaryLine() string {
+	type tc struct {
+		name  string
+		count int
+		emoji string
+	}
+	var items []tc
+	for name, count := range t.toolCounts {
+		items = append(items, tc{name, count, toolEmoji(name)})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].count > items[j].count })
+	var parts []string
+	for _, it := range items {
+		parts = append(parts, fmt.Sprintf("%s x%d", it.emoji, it.count))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// toolEmoji 返回工具的 emoji 图标，与 toolDisplayLine 保持一致
+func toolEmoji(toolName string) string {
+	switch toolName {
+	case "read_file":
+		return "📖"
+	case "write_file", "edit_file", "multi_edit":
+		return "✍️"
+	case "grep":
+		return "🔎"
+	case "glob", "ls":
+		return "📁"
+	case "bash":
+		return "💻"
+	case "task":
+		return "🤖"
+	case "explore":
+		return "🔍"
+	case "research":
+		return "🧪"
+	case "review":
+		return "🧐"
+	case "security_review":
+		return "🛡️"
+	case "ctx_read":
+		return "📑"
+	case "ctx_search":
+		return "🔍"
+	case "ctx_run":
+		return "💻"
+	case "ctx_index":
+		return "📑"
+	case "note":
+		return "📝"
+	case "remember":
+		return "🧠"
+	case "forget":
+		return "🗑️"
+	case "ask":
+		return "❓"
+	case "wait":
+		return "⏱"
+	case "bash_output":
+		return "⏱"
+	case "kill_shell":
+		return "⏱"
+	case "lsp_definition":
+		return "🎯"
+	case "lsp_hover":
+		return "🖱️"
+	case "lsp_references":
+		return "🔗"
+	case "lsp_diagnostics":
+		return "⚠️"
+	case "search_web", "web_search":
+		return "🌐"
+	case "web_fetch", "read_url":
+		return "🌐"
+	case "audit_finish":
+		return "📋"
+	case "python", "python3", "execute_code", "code":
+		return "🐍"
+	case "curl", "wget":
+		return "📄"
+	case "delete_range", "delete_symbol":
+		return "🗑️"
+	case "notebook_edit":
+		return "📓"
+	case "read_session":
+		return "📜"
+	case "run_skill", "install_skill", "install_source", "slash_command":
+		return "📚"
+	case "read_skill":
+		return "📖"
+	case "gh", "git":
+		return "🔀"
+	case "docker":
+		return "🐳"
+	case "systemctl", "service":
+		return "⚙️"
+	case "list_scheduled_tasks":
+		return "📅"
+	case "list_sessions":
+		return "💬"
+	default:
+		if strings.HasPrefix(toolName, "mcp_") {
+			return "🔬"
+		}
+		return "🔧"
+	}
+}
+
 type turnResult struct {
 	err error
+}
+
+// subagentDisplayMode 返回子代理工具调用的显示模式
+// 通过环境变量 SUBAGENT_DISPLAY 控制：verbose | summary | silent
+// 默认 verbose（向后兼容）
+func (a *App) subagentDisplayMode() string {
+	mode := os.Getenv("SUBAGENT_DISPLAY")
+	switch mode {
+	case "silent", "summary":
+		return mode
+	default:
+		return "verbose"
+	}
+}
+
+// sendSubagentSummary 发送子代理汇总消息（summary 模式的初始消息）
+// 返回消息 ID，供后续 editCommentary 更新
+func (a *App) sendSubagentSummary(chatID int64, text string) int {
+	text = capTelegramMessage(text)
+	formatted := formatMessage(text)
+	msg := newMessage(chatID, formatted)
+	msg.ParseMode = tgbotapi.ModeMarkdownV2
+	if a.cfg.NotificationMode == "important" {
+		msg.DisableNotification = true
+	}
+	sent, err := a.sendWithRetry(msg, chatID)
+	if err != nil {
+		plain := stripMdv2(text)
+		msg.ParseMode = ""
+		msg.Text = plain
+		sent, err = a.sendWithRetry(msg, chatID)
+		if err != nil {
+			log.Printf("chat=%d: subagent summary send failed: %v", chatID, err)
+			return 0
+		}
+	}
+	a.recordSentText(sent.MessageID, text)
+	return sent.MessageID
 }
 
 func (a *App) reasonixEnv(chatID int64) []string {
@@ -911,6 +1077,9 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 	var bufferingAsk bool // true while accumulating question text for ask tool
 	var askTextBuffer strings.Builder
 
+	// 子代理追踪（summary/silent 模式）
+	subagentTrackers := make(map[string]*subagentTracker) // parentID → tracker
+
 	// SSE idle watchdog: close body if no data for 2 min (Hermes-inspired).
 	var lastActivityUnix int64 = time.Now().Unix()
 	watchdogCtx, watchdogCancel := context.WithCancel(ctx)
@@ -1009,6 +1178,42 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 			} else {
 				// tool mode: signal tool boundary, then send commentary
 				if ev.Tool != nil && !ev.Tool.Partial && ev.Tool.Name != "" {
+					// 子代理分流：检测 ParentID 非空 = 来自子代理的工具调用
+					if ev.Tool.ParentID != "" {
+						switch a.subagentDisplayMode() {
+						case "silent":
+							continue // 完全丢弃
+						case "summary":
+							pid := ev.Tool.ParentID
+							t, ok := subagentTrackers[pid]
+							if !ok {
+								t = &subagentTracker{
+									parentID:   pid,
+									toolCounts: make(map[string]int),
+								}
+								subagentTrackers[pid] = t
+							}
+							t.update(ev.Tool.Name)
+							if t.totalCalls == 1 {
+								text := fmt.Sprintf("🔄 子代理运行中… (%d 步)", t.totalCalls)
+								t.msgID = onCommentary(text)
+								lastToolMsgID = t.msgID
+								lastToolText = text
+								lastToolName = "" // 阻止后续同工具合并逻辑干扰
+							} else {
+								text := fmt.Sprintf("🔄 子代理运行中… (%d 步 — %s)", t.totalCalls, t.summaryLine())
+								if newID, err := a.editCommentary(chatID, t.msgID, text); newID != 0 {
+									t.msgID = newID
+								} else if err != nil {
+									log.Printf("chat=%d: subagent summary edit failed: %v", chatID, err)
+								}
+								lastToolText = text
+								lastToolName = "" // 阻止后续同工具合并逻辑干扰
+							}
+							continue
+						// default "verbose": fall through to existing logic
+						}
+					}
 					// ask tool: buffer text as question, handled by ask_request event
 					if ev.Tool.Name == "ask" {
 						bufferingAsk = true
@@ -1049,6 +1254,21 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 						lastToolMsgID = onCommentary(newLine)
 						lastToolText = newLine
 					}
+					// 顶级工具调度：finalize 之前活跃的子代理 tracker
+					if ev.Tool.ParentID == "" && len(subagentTrackers) > 0 {
+						for pid, t := range subagentTrackers {
+							if !t.finalized && t.totalCalls > 0 {
+								text := fmt.Sprintf("✅ 子代理完成 — 共 %d 步 (%s)", t.totalCalls, t.summaryLine())
+								t.finalized = true
+								if t.msgID != 0 {
+									if _, err := a.editCommentary(chatID, t.msgID, text); err != nil {
+										log.Printf("chat=%d: subagent finalize edit failed: %v", chatID, err)
+									}
+								}
+							}
+							delete(subagentTrackers, pid)
+						}
+					}
 					continue
 				}
 			}
@@ -1074,6 +1294,21 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 						}
 						// Keep lastToolMsgID alive so next tool appends to this bubble.
 					}
+				}
+			}
+			// 顶级工具 result：兜底 finalize 子代理 tracker
+			if ev.Tool != nil && ev.Tool.ParentID == "" && len(subagentTrackers) > 0 {
+				for pid, t := range subagentTrackers {
+					if !t.finalized && t.totalCalls > 0 {
+						text := fmt.Sprintf("✅ 子代理完成 — 共 %d 步 (%s)", t.totalCalls, t.summaryLine())
+						t.finalized = true
+						if t.msgID != 0 {
+							if _, err := a.editCommentary(chatID, t.msgID, text); err != nil {
+								log.Printf("chat=%d: subagent finalize (tool_result) edit failed: %v", chatID, err)
+							}
+						}
+					}
+					delete(subagentTrackers, pid)
 				}
 			}
 		case "ask_request":
@@ -1115,6 +1350,19 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 				onUsage(*ev.Usage)
 			}
 		case "turn_done":
+			// 兜底：finalize 所有未完成的子代理 tracker
+			for pid, t := range subagentTrackers {
+				if !t.finalized && t.totalCalls > 0 {
+					text := fmt.Sprintf("✅ 子代理完成 — 共 %d 步 (%s)", t.totalCalls, t.summaryLine())
+					t.finalized = true
+					if t.msgID != 0 {
+						if _, err := a.editCommentary(chatID, t.msgID, text); err != nil {
+							log.Printf("chat=%d: subagent finalize (turn_done) edit failed: %v", chatID, err)
+						}
+					}
+				}
+				delete(subagentTrackers, pid)
+			}
 			log.Printf("chat=%d: turn_done err=%q", chatID, ev.Err)
 			if ev.Err != "" {
 				turnErr = fmt.Errorf("%s", ev.Err)
