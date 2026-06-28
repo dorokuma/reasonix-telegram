@@ -319,9 +319,7 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 		// Signal the goroutine: it will SIGINT the process group, wait up to
 		// 5s, then SIGKILL if still alive. s.task is cleared by runTask's defer
 		// when the process actually exits, NOT here — so /status stays accurate.
-		if t.stopTyping != nil {
-			t.stopTyping()
-		}
+		t.StopTyping()
 		t.cancel()
 		a.reply(m.Chat.ID, "🛑 已发送中止信号")
 		return

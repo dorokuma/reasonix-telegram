@@ -64,7 +64,9 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 	}
 
 	stopTyping := a.beginTyping(chatID)
+	thisTask.mu.Lock()
 	thisTask.stopTyping = stopTyping
+	thisTask.mu.Unlock()
 
 	defer func() {
 		s.mu.Lock()
@@ -193,7 +195,6 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			}
 			log.Printf("chat=%d draftID=%d: finalize %d part(s) total=%d runes", chatID, draftID, n, utf8.RuneCountInString(body))
 		} else {
-			hadLiveDraft := draftShown || liveDraftEver
 			if useFreshFinal && streamMsgID > 0 {
 				// Stale preview — upgrade it to rich text in-place instead of
 				// deleting + resending (avoids duplicate messages).
@@ -226,12 +227,6 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			} else {
 				n = a.sendTextParts(chatID, body, nil)
 			}
-			if n > 0 && hadLiveDraft {
-				a.clearDraftPreview(chatID, draftID)
-				draftShown = false
-				liveDraftEver = false
-				lastDraftBody = ""
-			}
 			if n == 0 {
 				log.Printf("chat=%d: finalize send failed (0 parts), trying plain text fallback", chatID)
 				plain := stripMdv2(body)
@@ -252,6 +247,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				if n == 0 {
 					log.Printf("chat=%d: finalize send failed after fallback, closing stream", chatID)
 					a.reply(chatID, "（回复生成完成但发送失败，请重试。）")
+					a.dismissDraft(chatID, draftID)
 					streamDone = true
 					releaseTask()
 				}
@@ -260,6 +256,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		if n > 0 {
 			replyDelivered.Store(true)
 			lastSentBody = body
+			a.dismissDraft(chatID, draftID)
 			streamDone = true
 			releaseTask()
 		}

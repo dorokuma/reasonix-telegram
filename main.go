@@ -356,8 +356,19 @@ type session struct {
 }
 
 type runningTask struct {
+	mu         sync.Mutex
 	cancel     context.CancelFunc
-	stopTyping context.CancelFunc // nil if typing not started yet
+	stopTyping context.CancelFunc // nil if typing not started yet; guarded by mu
+}
+
+// StopTyping calls stopTyping under lock, safe to call from any goroutine.
+func (t *runningTask) StopTyping() {
+	t.mu.Lock()
+	f := t.stopTyping
+	t.mu.Unlock()
+	if f != nil {
+		f()
+	}
 }
 
 type App struct {
