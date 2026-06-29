@@ -606,6 +606,16 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			},
 			func(approvalID, toolName string) {
 				// onApprovalRequest: model needs user approval for a tool.
+				// Set pendingApproval for callback
+				s.mu.Lock()
+				apID := fmt.Sprintf("%s%s", prefixApproval, approvalID)
+				s.pendingApproval = &approvalState{
+					approvalID: approvalID,
+					toolName:   toolName,
+					port:       s.servePort,
+				}
+				s.mu.Unlock()
+
 				// Finalize current stream content first.
 				signalFlush()
 				// Reset stream state so post-approval output can flow in a fresh draft.
@@ -634,16 +644,6 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 					label = toolName
 					emoji = "🔧"
 				}
-
-				// Set pendingApproval for callback
-				s.mu.Lock()
-				apID := fmt.Sprintf("%s%s", prefixApproval, approvalID)
-				s.pendingApproval = &approvalState{
-					approvalID: approvalID,
-					toolName:   toolName,
-					port:       s.servePort,
-				}
-				s.mu.Unlock()
 
 				text := fmt.Sprintf("%s 需要批准：%s\n\n```\n%s\n```\n\n请选择：", emoji, escapeMdv2(label), escapeMdv2(label))
 				oncePayload := fmt.Sprintf("%s:%s", apID, actionOnce)

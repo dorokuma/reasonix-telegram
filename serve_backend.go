@@ -1182,41 +1182,57 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 			} else {
 				// tool mode: signal tool boundary, then send commentary
 				if ev.Tool != nil && !ev.Tool.Partial && ev.Tool.Name != "" {
-					// 子代理分流：检测 ParentID 非空 = 来自子代理的工具调用
-					if ev.Tool.ParentID != "" {
-						switch a.subagentDisplayMode(chatID) {
-						case "silent":
-							continue // 完全丢弃
-						case "summary":
-							pid := ev.Tool.ParentID
-							t, ok := subagentTrackers[pid]
-							if !ok {
-								t = &subagentTracker{
-									parentID:   pid,
-									toolCounts: make(map[string]int),
-								}
-								subagentTrackers[pid] = t
-							}
-							t.update(ev.Tool.Name)
-							if t.totalCalls == 1 {
-								text := fmt.Sprintf("🔄 子代理运行中… (%d 步)", t.totalCalls)
-								t.msgID = onCommentary(text)
-								lastToolMsgID = t.msgID
-								lastToolText = text
-								lastToolName = "" // 阻止后续同工具合并逻辑干扰
-							} else {
-								text := fmt.Sprintf("🔄 子代理运行中… (%d 步 — %s)", t.totalCalls, t.summaryLine())
-								if newID, err := a.editCommentary(chatID, t.msgID, text); newID != 0 {
-									t.msgID = newID
-								} else if err != nil {
-									log.Printf("chat=%d: subagent summary edit failed: %v", chatID, err)
-								}
-								lastToolText = text
-								lastToolName = "" // 阻止后续同工具合并逻辑干扰
-							}
-							continue
-						// default "verbose": fall through to existing logic
+					// 统一显示模式分流（覆盖主代理和子代理）
+					switch a.subagentDisplayMode(chatID) {
+					case "silent":
+						continue // 完全丢弃（主代理+子代理）
+					case "summary":
+						key := ev.Tool.ParentID
+						label := "子代理"
+						if key == "" {
+							key = "__main__"
+							label = "Agent"
 						}
+						t, ok := subagentTrackers[key]
+						if !ok {
+							t = &subagentTracker{
+								parentID:   key,
+								toolCounts: make(map[string]int),
+							}
+							subagentTrackers[key] = t
+						}
+						t.update(ev.Tool.Name)
+						if t.totalCalls == 1 {
+							text := fmt.Sprintf("🔄 %s运行中… (%d 步)", label, t.totalCalls)
+							t.msgID = onCommentary(text)
+							lastToolMsgID = t.msgID
+							lastToolText = text
+							lastToolName = "" // 阻止后续同工具合并逻辑干扰
+						} else {
+							text := fmt.Sprintf("🔄 %s运行中… (%d 步 — %s)", label, t.totalCalls, t.summaryLine())
+							if newID, err := a.editCommentary(chatID, t.msgID, text); newID != 0 {
+								t.msgID = newID
+							} else if err != nil {
+								log.Printf("chat=%d: summary edit failed: %v", chatID, err)
+							}
+							lastToolText = text
+							lastToolName = "" // 阻止后续同工具合并逻辑干扰
+						}
+						// finalize 已完成的其他子代理 tracker
+						for pk, pt := range subagentTrackers {
+							if pk != key && !pt.finalized && pt.totalCalls > 0 {
+								text := fmt.Sprintf("✅ 子代理完成 — 共 %d 步 (%s)", pt.totalCalls, pt.summaryLine())
+								pt.finalized = true
+								if pt.msgID != 0 {
+									if _, err := a.editCommentary(chatID, pt.msgID, text); err != nil {
+										log.Printf("chat=%d: subagent finalize edit failed: %v", chatID, err)
+									}
+								}
+								delete(subagentTrackers, pk)
+							}
+						}
+						continue
+					// default "verbose": fall through to existing logic
 					}
 					// ask tool: buffer text as question, handled by ask_request event
 					if ev.Tool.Name == "ask" {
