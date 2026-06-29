@@ -63,7 +63,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		return
 	}
 
-	stopTyping := a.beginTyping(chatID)
+	stopTyping := a.beginTyping(ctx, chatID)
 	thisTask.mu.Lock()
 	thisTask.stopTyping = stopTyping
 	thisTask.mu.Unlock()

@@ -610,8 +610,8 @@ func (a *App) sendTyping(chatID int64) {
 }
 
 // beginTyping shows Telegram "typing…" until the returned stop function runs.
-func (a *App) beginTyping(chatID int64) (stop func()) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+func (a *App) beginTyping(parentCtx context.Context, chatID int64) (stop func()) {
+	ctx, cancel := context.WithCancel(parentCtx)
 	send := func() { a.sendTyping(chatID) }
 	send()
 	go func() {

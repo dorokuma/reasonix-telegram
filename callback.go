@@ -441,19 +441,14 @@ func (a *App) subagentDisplayHandler(m *tgbotapi.Message, mode string) {
 }
 
 func (a *App) persistSubagentDisplay(chatID int64, mode string) {
-	s := a.getOrCreateSession(chatID)
-	_ = a.state.upsert(chatRecord{
-		ChatID:          chatID,
-		Workdir:         s.workdir,
-		SessionPath:     a.state.sessionPathForChat(chatID),
-		Port:            s.servePort,
-		Model:           s.model,
-		SubagentDisplay: mode,
-		CumPrompt:       s.cumPrompt,
-		CumComplete:     s.cumCompletion,
-		CumTotal:        s.cumTotal,
-		CumCost:         s.cumCost,
-		CumCurrency:     s.cumCurrency,
+	_ = a.state.updateAll(func(records []chatRecord) []chatRecord {
+		for i, rec := range records {
+			if rec.ChatID == chatID {
+				records[i].SubagentDisplay = mode
+				return records
+			}
+		}
+		return append(records, chatRecord{ChatID: chatID, SubagentDisplay: mode})
 	})
 }
 
