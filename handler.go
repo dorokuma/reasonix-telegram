@@ -311,11 +311,28 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 		s := a.getOrCreateSession(m.Chat.ID)
 		s.mu.Lock()
 		t := s.task
+		pa := s.pendingApproval
 		s.mu.Unlock()
 		if t == nil {
-			a.reply(m.Chat.ID, "当前没有进行中的回复")
+			if pa == nil {
+				a.reply(m.Chat.ID, "当前没有进行中的回复")
+				return
+			}
+			// task 已丢失（如被 releaseTask 误清）但仍有 pending approval →
+			// 直接通知 serve 取消，并清空 approval 状态。
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_ = a.postJSON(ctx, pa.port, "/cancel", map[string]any{})
+			s.mu.Lock()
+			s.pendingApproval = nil
+			s.mu.Unlock()
+			a.reply(m.Chat.ID, "🛑 已发送中止信号")
 			return
 		}
+		// 先清空 pendingApproval，让 releaseTask 正常执行清理
+		s.mu.Lock()
+		s.pendingApproval = nil
+		s.mu.Unlock()
 		// Signal the goroutine: it will SIGINT the process group, wait up to
 		// 5s, then SIGKILL if still alive. s.task is cleared by runTask's defer
 		// when the process actually exits, NOT here — so /status stays accurate.
@@ -432,6 +449,16 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 
 	case strings.HasPrefix(text, "/effort"):
 		a.effortHandler(m, strings.TrimSpace(strings.TrimPrefix(text, "/effort")))
+		return
+
+	case text == "/verbose":
+		go a.subagentDisplayHandler(m, "verbose")
+		return
+	case text == "/summary":
+		go a.subagentDisplayHandler(m, "summary")
+		return
+	case text == "/silent":
+		go a.subagentDisplayHandler(m, "silent")
 		return
 
 	default:

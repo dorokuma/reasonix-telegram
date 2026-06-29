@@ -317,16 +317,17 @@ type turnResult struct {
 }
 
 // subagentDisplayMode 返回子代理工具调用的显示模式
-// 通过环境变量 SUBAGENT_DISPLAY 控制：verbose | summary | silent
+// 通过 session.subagentDisplay 控制：verbose | summary | silent
 // 默认 verbose（向后兼容）
-func (a *App) subagentDisplayMode() string {
-	mode := os.Getenv("SUBAGENT_DISPLAY")
-	switch mode {
-	case "silent", "summary":
-		return mode
-	default:
+func (a *App) subagentDisplayMode(chatID int64) string {
+	s := a.getOrCreateSession(chatID)
+	s.mu.Lock()
+	mode := s.subagentDisplay
+	s.mu.Unlock()
+	if mode == "" {
 		return "verbose"
 	}
+	return mode
 }
 
 // sendSubagentSummary 发送子代理汇总消息（summary 模式的初始消息）
@@ -865,6 +866,9 @@ func (a *App) restorePersistedSessions() {
 			s.servePort = portForChat(rec.ChatID)
 		}
 		s.model = rec.Model
+		if rec.SubagentDisplay != "" {
+			s.subagentDisplay = rec.SubagentDisplay
+		}
 		s.cumPrompt = rec.CumPrompt
 		s.cumCompletion = rec.CumComplete
 		s.cumTotal = rec.CumTotal
@@ -1180,7 +1184,7 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 				if ev.Tool != nil && !ev.Tool.Partial && ev.Tool.Name != "" {
 					// 子代理分流：检测 ParentID 非空 = 来自子代理的工具调用
 					if ev.Tool.ParentID != "" {
-						switch a.subagentDisplayMode() {
+						switch a.subagentDisplayMode(chatID) {
 						case "silent":
 							continue // 完全丢弃
 						case "summary":

@@ -350,6 +350,7 @@ type session struct {
 	cumCost       float64
 	cumCurrency   string
 	liveDraftID   int64 // open sendMessageDraft on Telegram (session-level for pre-empt cleanup)
+	subagentDisplay   string // display mode for sub-agent tool calls: verbose|summary|silent
 	serveRestartCount int       // consecutive health-check restart failures
 	serveLastRestart  time.Time // last restart attempt time
 	encryptDone       chan struct{} // closed when the encrypt-from-plain goroutine finishes

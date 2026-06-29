@@ -28,8 +28,9 @@ type chatRecord struct {
 	CumComplete int     `json:"cum_completion,omitempty"`
 	CumTotal    int     `json:"cum_total,omitempty"`
 	CumCost     float64 `json:"cum_cost,omitempty"`
-	CumCurrency string  `json:"cum_currency,omitempty"`
-	HMACKey     string  `json:"hmac_key,omitempty"` // base64-encoded HMAC key for callback signing
+	CumCurrency     string `json:"cum_currency,omitempty"`
+	HMACKey         string `json:"hmac_key,omitempty"` // base64-encoded HMAC key for callback signing
+	SubagentDisplay string `json:"subagent_display,omitempty"`
 }
 
 type stateFile struct {

@@ -118,6 +118,13 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 	lastSentBody := "" // tracks last finalized text to prevent duplicate sends
 	releaseTask := func() {
 		s.mu.Lock()
+		if s.pendingApproval != nil {
+			// Approval 期间不清空 task，防止 /stop 误判。
+			// releaseTask 仅在 endStream 中被调用，而 approval 只是一个暂停，
+			// 当前轮次并未结束，task 应由后续的正式结束路径释放。
+			s.mu.Unlock()
+			return
+		}
 		if s.task == thisTask {
 			s.task = nil
 			s.wakePusher = nil

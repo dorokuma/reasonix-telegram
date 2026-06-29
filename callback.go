@@ -417,6 +417,46 @@ func (a *App) persistModel(chatID int64, modelID string) error {
 	})
 }
 
+func (a *App) subagentDisplayHandler(m *tgbotapi.Message, mode string) {
+	chatID := m.Chat.ID
+	s := a.getOrCreateSession(chatID)
+
+	s.mu.Lock()
+	s.subagentDisplay = mode
+	s.mu.Unlock()
+
+	// Persist to state.json.
+	a.persistSubagentDisplay(chatID, mode)
+
+	// Short confirmation message.
+	label := map[string]string{
+		"verbose": "详细模式",
+		"summary": "摘要模式",
+		"silent":  "静默模式",
+	}[mode]
+
+	text := "✅ " + label
+	msg := tgbotapi.NewMessage(chatID, text)
+	a.sendWithRetry(msg, chatID)
+}
+
+func (a *App) persistSubagentDisplay(chatID int64, mode string) {
+	s := a.getOrCreateSession(chatID)
+	_ = a.state.upsert(chatRecord{
+		ChatID:          chatID,
+		Workdir:         s.workdir,
+		SessionPath:     a.state.sessionPathForChat(chatID),
+		Port:            s.servePort,
+		Model:           s.model,
+		SubagentDisplay: mode,
+		CumPrompt:       s.cumPrompt,
+		CumComplete:     s.cumCompletion,
+		CumTotal:        s.cumTotal,
+		CumCost:         s.cumCost,
+		CumCurrency:     s.cumCurrency,
+	})
+}
+
 // signCallback signs a callback payload with HMAC-SHA256 and returns
 // "payload.base64url(signature)".  If key is nil (legacy), returns payload unchanged.
 func signCallback(key []byte, payload string) string {

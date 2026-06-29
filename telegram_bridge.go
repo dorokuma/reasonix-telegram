@@ -69,6 +69,9 @@ func (t *TelegramBridge) RegisterCommands() error {
 		{Command: "cron", Description: "创建定时任务：/cron [表达式] [Prompt]"},
 		{Command: "cron_list", Description: "查看定时任务列表"},
 		{Command: "cron_del", Description: "删除定时任务：/cron_del [ID]"},
+		{Command: "verbose", Description: "子代理工具调用详细展示（每条独立消息）"},
+		{Command: "summary", Description: "子代理工具调用汇总为一条消息"},
+		{Command: "silent", Description: "完全隐藏子代理工具调用"},
 	}
 	_, err := t.bot.Request(tgbotapi.NewSetMyCommands(cmds...))
 	return err
