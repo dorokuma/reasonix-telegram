@@ -1188,10 +1188,8 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 						continue // 完全丢弃（主代理+子代理）
 					case "summary":
 						key := ev.Tool.ParentID
-						label := "子代理"
 						if key == "" {
 							key = "__main__"
-							label = "Agent"
 						}
 						t, ok := subagentTrackers[key]
 						if !ok {
@@ -1203,13 +1201,13 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 						}
 						t.update(ev.Tool.Name)
 						if t.totalCalls == 1 {
-							text := fmt.Sprintf("🔄 %s运行中… (%d 步)", label, t.totalCalls)
+							text := fmt.Sprintf("🔄 运行中… (%d 步)", t.totalCalls)
 							t.msgID = onCommentary(text)
 							lastToolMsgID = t.msgID
 							lastToolText = text
 							lastToolName = "" // 阻止后续同工具合并逻辑干扰
 						} else {
-							text := fmt.Sprintf("🔄 %s运行中… (%d 步 — %s)", label, t.totalCalls, t.summaryLine())
+							text := fmt.Sprintf("🔄 运行中… (%d 步 — %s)", t.totalCalls, t.summaryLine())
 							if newID, err := a.editCommentary(chatID, t.msgID, text); newID != 0 {
 								t.msgID = newID
 							} else if err != nil {
@@ -1221,7 +1219,7 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 						// finalize 已完成的其他子代理 tracker
 						for pk, pt := range subagentTrackers {
 							if pk != key && !pt.finalized && pt.totalCalls > 0 {
-								text := fmt.Sprintf("✅ 子代理完成 — 共 %d 步 (%s)", pt.totalCalls, pt.summaryLine())
+								text := fmt.Sprintf("✅ 完成 — 共 %d 步 (%s)", pt.totalCalls, pt.summaryLine())
 								pt.finalized = true
 								if pt.msgID != 0 {
 									if _, err := a.editCommentary(chatID, pt.msgID, text); err != nil {
@@ -1278,7 +1276,7 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 					if ev.Tool.ParentID == "" && len(subagentTrackers) > 0 {
 						for pid, t := range subagentTrackers {
 							if !t.finalized && t.totalCalls > 0 {
-								text := fmt.Sprintf("✅ 子代理完成 — 共 %d 步 (%s)", t.totalCalls, t.summaryLine())
+								text := fmt.Sprintf("✅ 完成 — 共 %d 步 (%s)", t.totalCalls, t.summaryLine())
 								t.finalized = true
 								if t.msgID != 0 {
 									if _, err := a.editCommentary(chatID, t.msgID, text); err != nil {
@@ -1320,7 +1318,7 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 			if ev.Tool != nil && ev.Tool.ParentID == "" && len(subagentTrackers) > 0 {
 				for pid, t := range subagentTrackers {
 					if !t.finalized && t.totalCalls > 0 {
-						text := fmt.Sprintf("✅ 子代理完成 — 共 %d 步 (%s)", t.totalCalls, t.summaryLine())
+						text := fmt.Sprintf("✅ 完成 — 共 %d 步 (%s)", t.totalCalls, t.summaryLine())
 						t.finalized = true
 						if t.msgID != 0 {
 							if _, err := a.editCommentary(chatID, t.msgID, text); err != nil {
@@ -1373,7 +1371,7 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 			// 兜底：finalize 所有未完成的子代理 tracker
 			for pid, t := range subagentTrackers {
 				if !t.finalized && t.totalCalls > 0 {
-					text := fmt.Sprintf("✅ 子代理完成 — 共 %d 步 (%s)", t.totalCalls, t.summaryLine())
+					text := fmt.Sprintf("✅ 完成 — 共 %d 步 (%s)", t.totalCalls, t.summaryLine())
 					t.finalized = true
 					if t.msgID != 0 {
 						if _, err := a.editCommentary(chatID, t.msgID, text); err != nil {
