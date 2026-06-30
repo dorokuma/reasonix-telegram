@@ -672,7 +672,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				}
 				replyDelivered.Store(true)
 			},
-			func(approvalID, toolName, scope string) {
+			func(approvalID, toolName, scope, preview string) {
 				// onApprovalRequest: model needs user approval for a tool.
 				// Set pendingApproval for callback
 				s.mu.Lock()
@@ -681,6 +681,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 					approvalID: approvalID,
 					toolName:   toolName,
 					scope:      scope,
+					preview:    preview,
 					port:       s.servePort,
 				}
 				s.mu.Unlock()
@@ -714,7 +715,13 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 					emoji = "🔧"
 				}
 
-				text := fmt.Sprintf("%s 需要批准：%s\n\n```\n%s\n```\n\n请选择： `%s`", emoji, escapeMdv2(label), escapeMdv2(label), apID)
+				var body string
+				if preview != "" {
+					body = escapeMdv2(preview)
+				} else {
+					body = escapeMdv2(toolName)
+				}
+				text := fmt.Sprintf("%s 需要批准：%s\n\n%s\n\n请选择：", emoji, escapeMdv2(label), body)
 				oncePayload := fmt.Sprintf("%s:%s", apID, actionOnce)
 				onceData := signCallback(s.hmacKey, oncePayload)
 				denyPayload := fmt.Sprintf("%s:%s", apID, actionDeny)

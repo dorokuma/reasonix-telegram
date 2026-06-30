@@ -326,6 +326,7 @@ type approvalState struct {
 	approvalID string
 	toolName   string
 	scope      string
+	preview    string
 	port       int
 }
 
