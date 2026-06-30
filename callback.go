@@ -567,9 +567,13 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
-		if err := a.postJSON(ctx, pa.port, "/approve", map[string]any{
-			"id": approvalID, "allow": allow, "session": session,
-		}); err != nil {
+		body := map[string]any{
+			"id": approvalID, "allow": allow,
+		}
+		if pa.scope != "task" {
+			body["session"] = session
+		}
+		if err := a.postJSON(ctx, pa.port, "/approve", body); err != nil {
 			a.reply(chatID, "操作失败，reasonix serve 可能已重启，请重新操作")
 		}
 		log.Printf("chat=%d: approval %s -> allow=%v session=%v", chatID, approvalID, allow, session)

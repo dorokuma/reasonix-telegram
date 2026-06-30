@@ -158,8 +158,9 @@ type wireEvent struct {
 		ParentID string `json:"parentId,omitempty"`
 	} `json:"tool,omitempty"`
 	Approval *struct {
-		ID   string `json:"id"`
-		Tool string `json:"tool"`
+		ID    string `json:"id"`
+		Tool  string `json:"tool"`
+		Scope string `json:"scope,omitempty"`
 	} `json:"approval,omitempty"`
 	Ask   *wireAsk    `json:"ask,omitempty"`
 	Usage *wireUsage  `json:"usage,omitempty"`
@@ -1003,7 +1004,7 @@ func (a *App) postSteer(ctx context.Context, port int, input string) error {
 // runServeTurn submits a prompt to the long-lived reasonix serve process and
 // streams SSE events until turn_done. The conversation history stays in the
 // same Reasonix session file across Telegram messages and bridge restarts.
-func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string) int, onAskRequest func(askID string, questions []askQuestionData), onApprovalRequest func(approvalID string, toolName string), onUsage func(wireUsage)) error {
+func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string) int, onAskRequest func(askID string, questions []askQuestionData), onApprovalRequest func(approvalID string, toolName string, scope string), onUsage func(wireUsage)) error {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	s := a.getOrCreateSession(chatID)
@@ -1042,7 +1043,7 @@ func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onC
 // should not be retried, since retrying would produce the same non-SSE response.
 var errNonSSEResponse = errors.New("serve returned non-SSE response")
 
-func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, lastSeq int64, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string) int, onAskRequest func(askID string, questions []askQuestionData), onApprovalRequest func(approvalID string, toolName string), onUsage func(wireUsage)) (int64, error) {
+func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, lastSeq int64, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string) int, onAskRequest func(askID string, questions []askQuestionData), onApprovalRequest func(approvalID string, toolName string, scope string), onUsage func(wireUsage)) (int64, error) {
 	// Derive a cancellable context so chat-only tool blocking can abort the SSE loop.
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -1374,7 +1375,7 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 					if toolName == "" {
 						toolName = "approval"
 					}
-					onApprovalRequest(ev.Approval.ID, toolName)
+					onApprovalRequest(ev.Approval.ID, toolName, ev.Approval.Scope)
 				}
 			}
 		case "usage":
@@ -1441,7 +1442,7 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 // It retries transient connection failures up to 3 times with exponential
 // backoff (500ms, 1s, 2s). Fatal errors (non-SSE response, context
 // cancellation, dead serve process) are returned immediately without retry.
-func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string) int, onAskRequest func(askID string, questions []askQuestionData), onApprovalRequest func(approvalID string, toolName string), onUsage func(wireUsage)) turnResult {
+func (a *App) consumeServeEvents(ctx context.Context, chatID int64, port int, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string) int, onAskRequest func(askID string, questions []askQuestionData), onApprovalRequest func(approvalID string, toolName string, scope string), onUsage func(wireUsage)) turnResult {
 	const maxRetries = 3
 	backoffs := []time.Duration{500 * time.Millisecond, 5 * time.Second, 30 * time.Second}
 	var offset int64

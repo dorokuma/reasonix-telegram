@@ -325,6 +325,7 @@ type clarifyState struct {
 type approvalState struct {
 	approvalID string
 	toolName   string
+	scope      string
 	port       int
 }
 

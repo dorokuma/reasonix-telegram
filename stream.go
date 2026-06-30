@@ -672,7 +672,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				}
 				replyDelivered.Store(true)
 			},
-			func(approvalID, toolName string) {
+			func(approvalID, toolName, scope string) {
 				// onApprovalRequest: model needs user approval for a tool.
 				// Set pendingApproval for callback
 				s.mu.Lock()
@@ -680,6 +680,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				s.pendingApproval = &approvalState{
 					approvalID: approvalID,
 					toolName:   toolName,
+					scope:      scope,
 					port:       s.servePort,
 				}
 				s.mu.Unlock()
@@ -716,17 +717,26 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				text := fmt.Sprintf("%s 需要批准：%s\n\n```\n%s\n```\n\n请选择： `%s`", emoji, escapeMdv2(label), escapeMdv2(label), apID)
 				oncePayload := fmt.Sprintf("%s:%s", apID, actionOnce)
 				onceData := signCallback(s.hmacKey, oncePayload)
-				sessionPayload := fmt.Sprintf("%s:%s", apID, actionSession)
-				sessionData := signCallback(s.hmacKey, sessionPayload)
 				denyPayload := fmt.Sprintf("%s:%s", apID, actionDeny)
 				denyData := signCallback(s.hmacKey, denyPayload)
 				msg := newMessage(chatID, text)
 				msg.ParseMode = tgbotapi.ModeMarkdownV2
-				msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
-					[]tgbotapi.InlineKeyboardButton{{Text: "✅ 批准一次", CallbackData: &onceData}},
-					[]tgbotapi.InlineKeyboardButton{{Text: "🔒 始终批准", CallbackData: &sessionData}},
-					[]tgbotapi.InlineKeyboardButton{{Text: "❌ 拒绝此次", CallbackData: &denyData}},
-				)
+				if scope == "task" {
+					// Task-tool approval: only approve/deny, no session persistence.
+					msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+						[]tgbotapi.InlineKeyboardButton{{Text: "✅ 批准", CallbackData: &onceData}},
+						[]tgbotapi.InlineKeyboardButton{{Text: "❌ 拒绝", CallbackData: &denyData}},
+					)
+				} else {
+					// Gate approval: approve-once, approve-session, deny.
+					sessionPayload := fmt.Sprintf("%s:%s", apID, actionSession)
+					sessionData := signCallback(s.hmacKey, sessionPayload)
+					msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+						[]tgbotapi.InlineKeyboardButton{{Text: "✅ 批准一次", CallbackData: &onceData}},
+						[]tgbotapi.InlineKeyboardButton{{Text: "🔒 始终批准", CallbackData: &sessionData}},
+						[]tgbotapi.InlineKeyboardButton{{Text: "❌ 拒绝此次", CallbackData: &denyData}},
+					)
+				}
 				a.sendSafe(msg)
 			},
 			func(u wireUsage) {
