@@ -707,21 +707,22 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				replyDelivered.Store(true)
 
 				// Show approval prompt with inline buttons
-				var label string
-				var emoji string
-				switch toolName {
-				default:
-					label = toolName
-					emoji = "🔧"
+				meta := getToolMeta(toolName)
+				emoji := "🔴"
+				if meta.Risk == "safe" {
+					emoji = "🟢"
 				}
 
-				var body string
+				title := fmt.Sprintf("%s %s", emoji, escapeMdv2(meta.Label))
+				var text string
 				if preview != "" {
-					body = escapeMdv2(preview)
+					summary := escapeMdv2(firstLine(preview, 100))
+					safePreview := strings.ReplaceAll(preview, `\`, `\\`)
+					safePreview = strings.ReplaceAll(safePreview, "`", "\\`")
+					text = fmt.Sprintf("%s\n\n📁 %s\n\n```json\n%s\n```", title, summary, safePreview)
 				} else {
-					body = escapeMdv2(toolName)
+					text = title
 				}
-				text := fmt.Sprintf("%s 需要批准：%s\n\n%s\n\n请选择：", emoji, escapeMdv2(label), body)
 				oncePayload := fmt.Sprintf("%s:%s", apID, actionOnce)
 				onceData := signCallback(s.hmacKey, oncePayload)
 				denyPayload := fmt.Sprintf("%s:%s", apID, actionDeny)
