@@ -67,9 +67,6 @@ func TestIsReasonixNoise(t *testing.T) {
 		"  · 7646 tok · in 7580",
 		"  ▎ thinking",
 		"  ▎ reasoning",
-		"❌ something failed",
-		"✅ something succeeded",
-		"ℹ️ info message",
 		"hook blocked something",
 		"exit status 1",
 		"command exited: exit status 1",
@@ -80,6 +77,9 @@ func TestIsReasonixNoise(t *testing.T) {
 		"[ctx] something something",
 	}
 	keep := []string{
+		"❌ something failed",
+		"✅ something succeeded",
+		"ℹ️ info message",
 		"hello world",
 		"this is normal text",
 		"  indented but not noise",

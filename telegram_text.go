@@ -554,6 +554,34 @@ func (a *App) sendWithRetry(msg tgbotapi.Chattable, chatID int64) (tgbotapi.Mess
 
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
+		var parseMode, displayText string
+		switch v := msg.(type) {
+		case tgbotapi.MessageConfig:
+			parseMode = v.ParseMode
+			displayText = v.Text
+		case tgbotapi.EditMessageTextConfig:
+			parseMode = v.ParseMode
+			displayText = v.Text
+		case tgbotapi.PhotoConfig:
+			parseMode = v.ParseMode
+			displayText = v.Caption
+		case tgbotapi.VideoConfig:
+			parseMode = v.ParseMode
+			displayText = v.Caption
+		case tgbotapi.AnimationConfig:
+			parseMode = v.ParseMode
+			displayText = v.Caption
+		case tgbotapi.AudioConfig:
+			parseMode = v.ParseMode
+			displayText = v.Caption
+		case tgbotapi.DocumentConfig:
+			parseMode = v.ParseMode
+			displayText = v.Caption
+		default:
+			displayText = fmt.Sprintf("%T", msg)
+		}
+		log.Printf("DEBUG SEND chat=%d parse_mode=%s text=[%s]", chatID, parseMode, displayText)
+		log.Printf("DEBUG SEND chat=%d parse_mode=%s text=[%s]", chatID, parseMode, displayText)
 		m, err := a.bot.Send(msg)
 		if err == nil {
 			// Record successful send in cache.

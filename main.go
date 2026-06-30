@@ -80,7 +80,7 @@ func isReasonixNoise(line string) bool {
 	if trimmed == "" {
 		return false // 保留空行作为段落分隔
 	}
-	if strings.HasPrefix(trimmed, "❌") || strings.HasPrefix(trimmed, "✅") || strings.HasPrefix(trimmed, "ℹ️") || strings.HasPrefix(trimmed, "hook ") || strings.HasPrefix(trimmed, "[ctx]") || strings.HasPrefix(trimmed, "exit status") || strings.HasPrefix(trimmed, "command exited") || strings.HasPrefix(trimmed, "remembered") || strings.HasPrefix(trimmed, "unknown ref") || strings.HasPrefix(trimmed, "unknown tool") || strings.Contains(trimmed, "unknown tool") {
+	if strings.HasPrefix(trimmed, "hook ") || strings.HasPrefix(trimmed, "[ctx]") || strings.HasPrefix(trimmed, "exit status") || strings.HasPrefix(trimmed, "command exited") || strings.HasPrefix(trimmed, "remembered") || strings.HasPrefix(trimmed, "unknown ref") || strings.HasPrefix(trimmed, "unknown tool") || strings.Contains(trimmed, "unknown tool") {
 		return true
 	}
 	if reThinkingBar.MatchString(trimmed) {
