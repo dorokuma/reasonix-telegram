@@ -22,6 +22,39 @@ import (
 func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 	s := a.getOrCreateSession(chatID)
 
+	// If there's already a running task, steer the input into it instead of
+	// pre-empting and submitting a new turn.
+	s.mu.Lock()
+	existing := s.task
+	port := s.servePort
+	s.mu.Unlock()
+
+	if existing != nil {
+		// Defensive: /stop should be caught in handler.go, but guard here too.
+		clean := strings.TrimSpace(prompt)
+		if clean == "/stop" || clean == "/cancel" || strings.HasPrefix(clean, "/stop ") || strings.HasPrefix(clean, "/cancel ") {
+			log.Printf("chat=%d: /stop via runTask", chatID)
+			existing.StopTyping()
+			existing.cancel()
+			return
+		}
+
+		if port > 0 {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			if err := a.postSteer(ctx, port, prompt); err != nil {
+				log.Printf("chat=%d: steer failed: %v, falling back to cancel+submit", chatID, err)
+			} else {
+				log.Printf("chat=%d: steered input into running turn", chatID)
+				a.dismissSessionDraft(chatID)
+				return
+			}
+		} else {
+			log.Printf("chat=%d: steer skipped (port=0), falling back to cancel+submit", chatID)
+		}
+		// Fall through to original cancel+submit when steer is unavailable.
+	}
+
 	// Construct thisTask before locking (cancel function must be ready).
 	var ctx context.Context
 	var cancel context.CancelFunc
@@ -281,9 +314,10 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 	}
 
 	pushDraft := func() {
+		// --- snapshot: read state under lock, then release before blocking API ---
 		draftMu.Lock()
-		defer draftMu.Unlock()
 		if streamDone {
+			draftMu.Unlock()
 			log.Printf("chat=%d: pushDraft skip (streamDone)", chatID)
 			return
 		}
@@ -291,6 +325,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		body := strings.TrimSpace(buf.String())
 		bufMu.Unlock()
 		if body == "" {
+			draftMu.Unlock()
 			log.Printf("chat=%d: pushDraft skip (empty buffer)", chatID)
 			return
 		}
@@ -300,9 +335,20 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 		// a stream message to edit, stay on the edit path for this segment.
 		if useDraft && streamMsgID == 0 {
 			if preview == lastDraftBody {
+				draftMu.Unlock()
 				return
 			}
-			if a.sendDraft(chatID, draftID, preview) {
+			// CRITICAL: release draftMu before blocking Telegram API call (sendDraft
+			// is a synchronous HTTP request with up to 65 s timeout). Re-acquire
+			// after the call to update state.
+			draftMu.Unlock()
+			ok := a.sendDraft(chatID, draftID, preview)
+			draftMu.Lock()
+			if streamDone {
+				draftMu.Unlock()
+				return
+			}
+			if ok {
 				draftFailCount = 0
 				lastDraftBody = preview
 				draftShown = true
@@ -313,6 +359,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				if msgCreatedAt.IsZero() {
 					msgCreatedAt = time.Now()
 				}
+				draftMu.Unlock()
 				return
 			}
 			draftFailCount++
@@ -322,14 +369,24 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				useDraft = false
 				draftID = a.nextDraftID()
 			}
+			draftMu.Unlock()
+			return
 		}
+		// Non-draft paths below — release lock before any blocking API calls.
 		if streamMsgID == 0 {
 			msg := newMessage(chatID, preview)
 			msg.ParseMode = "" // plain text preview; final send uses Rich Messages
+			draftMu.Unlock()
 			sent, err := a.sendWithRetry(msg, chatID)
+			draftMu.Lock()
+			if streamDone {
+				draftMu.Unlock()
+				return
+			}
 			if err != nil {
 				log.Printf("chat=%d: stream send failed: %v", chatID, err)
 				editFailCount++
+				draftMu.Unlock()
 				return
 			}
 			editFailCount = 0
@@ -339,21 +396,31 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			if msgCreatedAt.IsZero() {
 				msgCreatedAt = time.Now()
 			}
+			draftMu.Unlock()
 			return
 		}
 		if streamEditFallback {
+			draftMu.Unlock()
 			return
 		}
 		if preview == lastDraftBody {
+			draftMu.Unlock()
 			return
 		}
 		edit := tgbotapi.NewEditMessageText(chatID, streamMsgID, preview)
 		edit.ParseMode = "" // plain text edit; final send uses Rich Messages
+		draftMu.Unlock()
 		_, err := a.sendWithRetry(edit, chatID)
+		draftMu.Lock()
+		if streamDone {
+			draftMu.Unlock()
+			return
+		}
 		if telegramEditOK(err) {
 			editFailCount = 0
 			lastDraftBody = preview
 			streamVisiblePrefix = preview
+			draftMu.Unlock()
 			return
 		}
 		editFailCount++
@@ -362,6 +429,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 			streamVisiblePrefix = lastDraftBody
 			log.Printf("chat=%d: stream edit fallback (flood=%v strikes=%d)", chatID, telegramErrorIsFlood(err), editFailCount)
 		}
+		draftMu.Unlock()
 	}
 
 	signalFlush := func() {
@@ -645,7 +713,7 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 					emoji = "🔧"
 				}
 
-				text := fmt.Sprintf("%s 需要批准：%s\n\n```\n%s\n```\n\n请选择：", emoji, escapeMdv2(label), escapeMdv2(label))
+				text := fmt.Sprintf("%s 需要批准：%s\n\n```\n%s\n```\n\n请选择： `%s`", emoji, escapeMdv2(label), escapeMdv2(label), apID)
 				oncePayload := fmt.Sprintf("%s:%s", apID, actionOnce)
 				onceData := signCallback(s.hmacKey, oncePayload)
 				sessionPayload := fmt.Sprintf("%s:%s", apID, actionSession)
@@ -655,13 +723,9 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				msg := newMessage(chatID, text)
 				msg.ParseMode = tgbotapi.ModeMarkdownV2
 				msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
-					[]tgbotapi.InlineKeyboardButton{
-						{Text: "✅ 批准一次", CallbackData: &onceData},
-						{Text: "🔒 始终批准", CallbackData: &sessionData},
-					},
-					[]tgbotapi.InlineKeyboardButton{
-						{Text: "❌ 拒绝", CallbackData: &denyData},
-					},
+					[]tgbotapi.InlineKeyboardButton{{Text: "✅ 批准一次", CallbackData: &onceData}},
+					[]tgbotapi.InlineKeyboardButton{{Text: "🔒 始终批准", CallbackData: &sessionData}},
+					[]tgbotapi.InlineKeyboardButton{{Text: "❌ 拒绝此次", CallbackData: &denyData}},
 				)
 				a.sendSafe(msg)
 			},
@@ -697,17 +761,18 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				}
 				// Copy needed fields to local variables before releasing the lock.
 				rec := chatRecord{
-					ChatID:      chatID,
-					Workdir:     s.workdir,
-					SessionPath: a.state.sessionPathForChat(chatID),
-					Port:        s.servePort,
-					Model:       s.model,
-					CumPrompt:   s.cumPrompt,
-					CumComplete: s.cumCompletion,
-					CumTotal:    s.cumTotal,
-					CumCost:     s.cumCost,
-					CumCurrency: s.cumCurrency,
-					HMACKey:     base64.StdEncoding.EncodeToString(s.hmacKey),
+					ChatID:          chatID,
+					Workdir:         s.workdir,
+					SessionPath:     a.state.sessionPathForChat(chatID),
+					Port:            s.servePort,
+					Model:           s.model,
+					CumPrompt:       s.cumPrompt,
+					CumComplete:     s.cumCompletion,
+					CumTotal:        s.cumTotal,
+					CumCost:         s.cumCost,
+					CumCurrency:     s.cumCurrency,
+					HMACKey:         base64.StdEncoding.EncodeToString(s.hmacKey),
+					SubagentDisplay: s.subagentDisplay,
 				}
 				s.mu.Unlock()
 				// Persist cumulative values outside the lock so they survive restart.
@@ -815,6 +880,12 @@ func (a *App) runTask(chatID int64, replyTo int, prompt string) {
 				continue
 			}
 			select {
+			case <-ctx.Done():
+				log.Printf("chat=%d: pusher: context done, exiting", chatID)
+				pushDraft()
+				endStream()
+				debounce.Stop()
+				return
 			case <-pushWake:
 				log.Printf("chat=%d: pusher: pushWake", chatID)
 				stopDebounce()

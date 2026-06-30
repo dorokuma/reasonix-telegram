@@ -505,11 +505,11 @@ func (a *App) handleCallbackQuery(cq *tgbotapi.CallbackQuery) {
 	// Per-chat rate limit: at most 1 callback per 3 seconds.
 	const minInterval = 3 * time.Second
 	now := time.Now()
-	if last, loaded := a.rateLimits.LoadOrStore(chatID, now); loaded {
+	if last, loaded := a.rateLimits.LoadOrStore("cb:"+strconv.FormatInt(chatID, 10), now); loaded {
 		if now.Sub(last.(time.Time)) < minInterval {
 			return // silently drop
 		}
-		a.rateLimits.Store(chatID, now)
+		a.rateLimits.Store("cb:"+strconv.FormatInt(chatID, 10), now)
 	}
 	if !a.allowed(cq.From) {
 		a.answerCallback(cq.ID, "⛔ 无权限")

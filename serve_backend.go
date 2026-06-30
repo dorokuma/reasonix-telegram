@@ -446,7 +446,7 @@ func (a *App) stopSessionServe(s *session, chatID int64) {
 		log.Printf("chat=%d: stopping serve (pid %d)", chatID, cmd.Process.Pid)
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 
-		waitDone := make(chan struct{})
+		waitDone := make(chan struct{}, 1)
 		go func() {
 			_, _ = cmd.Process.Wait()
 			close(waitDone)
@@ -518,6 +518,7 @@ func (a *App) startServe(chatID int64, skipPortCheck bool) error {
 	cumTotal := s.cumTotal
 	cumCost := s.cumCost
 	cumCurrency := s.cumCurrency
+	displayMode := s.subagentDisplay // sub-agent display mode: verbose|summary|silent
 	s.mu.Unlock()
 
 	// Always use the canonical encrypted path (.jsonl.enc) so state.json never
@@ -721,17 +722,18 @@ func (a *App) startServe(chatID int64, skipPortCheck bool) error {
 	}
 	log.Printf("chat=%d: serve cwd=%s mode=%s", chatID, workDir, a.getMode())
 	if err := a.state.upsert(chatRecord{
-		ChatID:      chatID,
-		Workdir:     workDir,
-		SessionPath: sessionPath,
-		Port:        port,
-		Model:       sessionModel,
-		CumPrompt:   cumPrompt,
-		CumComplete: cumCompletion,
-		CumTotal:    cumTotal,
-		CumCost:     cumCost,
-		CumCurrency: cumCurrency,
-		HMACKey:     base64.StdEncoding.EncodeToString(s.hmacKey),
+		ChatID:          chatID,
+		Workdir:         workDir,
+		SessionPath:     sessionPath,
+		Port:            port,
+		Model:           sessionModel,
+		CumPrompt:       cumPrompt,
+		CumComplete:     cumCompletion,
+		CumTotal:        cumTotal,
+		CumCost:         cumCost,
+		CumCurrency:     cumCurrency,
+		HMACKey:         base64.StdEncoding.EncodeToString(s.hmacKey),
+		SubagentDisplay: displayMode,
 	}); err != nil {
 		log.Printf("chat=%d: persist state failed: %v", chatID, err)
 	}
@@ -990,6 +992,14 @@ func (a *App) postJSON(ctx context.Context, port int, path string, body any) err
 	return nil
 }
 
+// postSteer sends a /steer request to the reasonix serve process, injecting
+// user input into the currently running turn without canceling it.
+func (a *App) postSteer(ctx context.Context, port int, input string) error {
+	return a.postJSON(ctx, port, "/steer", map[string]any{
+		"input": input,
+	})
+}
+
 // runServeTurn submits a prompt to the long-lived reasonix serve process and
 // streams SSE events until turn_done. The conversation history stays in the
 // same Reasonix session file across Telegram messages and bridge restarts.
@@ -1033,6 +1043,10 @@ func (a *App) runServeTurn(ctx context.Context, chatID int64, prompt string, onC
 var errNonSSEResponse = errors.New("serve returned non-SSE response")
 
 func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, lastSeq int64, onChunk func(string), onComplete func(), onToolDispatch func(), onCommentary func(string) int, onAskRequest func(askID string, questions []askQuestionData), onApprovalRequest func(approvalID string, toolName string), onUsage func(wireUsage)) (int64, error) {
+	// Derive a cancellable context so chat-only tool blocking can abort the SSE loop.
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	eventsURL := serveBaseURL(port) + "/events"
 	if lastSeq > 0 {
 		eventsURL = fmt.Sprintf("%s/events?offset=%d", serveBaseURL(port), lastSeq)
@@ -1118,11 +1132,11 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 			return lastSeq, ctx.Err()
 		default:
 		}
-		atomic.StoreInt64(&lastActivityUnix, time.Now().Unix())
 		line := sc.Text()
 		if !strings.HasPrefix(line, "data: ") {
 			continue
 		}
+		atomic.StoreInt64(&lastActivityUnix, time.Now().Unix())
 		payload := strings.TrimPrefix(line, "data: ")
 		var ev wireEvent
 		if err := json.Unmarshal([]byte(payload), &ev); err != nil {
@@ -1177,6 +1191,7 @@ func (a *App) connectAndConsumeSSE(ctx context.Context, chatID int64, port int, 
 					cancelOnce.Do(func() {
 						log.Printf("chat-only: blocked tool %s, cancelling turn", ev.Tool.Name)
 						_ = a.postJSON(ctx, port, "/cancel", map[string]any{})
+						cancel() // cancel local context to break SSE reading loop
 					})
 				}
 			} else {

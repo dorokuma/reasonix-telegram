@@ -304,6 +304,9 @@ func (st *stateStore) migrateOldSessions() {
 		}
 		oldPath := filepath.Join(st.sessionsDir(), name)
 		base := strings.TrimSuffix(name, ".jsonl")
+		if _, err := strconv.ParseInt(base, 10, 64); err != nil {
+			continue
+		}
 		newPath := filepath.Join(st.sessionsDir(), base+".jsonl.enc")
 
 		// If the encrypted file already exists, just remove the old plaintext.
@@ -349,6 +352,9 @@ func (st *stateStore) cleanupOrphanSessionArtifacts() {
 		name := ent.Name()
 		if ent.IsDir() && strings.HasSuffix(name, ".ckpt") {
 			chatID := strings.TrimSuffix(name, ".ckpt")
+			if _, err := strconv.ParseInt(chatID, 10, 64); err != nil {
+				continue
+			}
 			// Check both .jsonl.enc and .jsonl; remove orphan if neither exists.
 			if _, err := os.Stat(filepath.Join(st.sessionsDir(), chatID+".jsonl.enc")); os.IsNotExist(err) {
 				if _, err := os.Stat(filepath.Join(st.sessionsDir(), chatID+".jsonl")); os.IsNotExist(err) {
@@ -361,6 +367,9 @@ func (st *stateStore) cleanupOrphanSessionArtifacts() {
 		}
 		if strings.HasSuffix(name, ".jsonl.meta") {
 			chatID := strings.TrimSuffix(name, ".jsonl.meta")
+			if _, err := strconv.ParseInt(chatID, 10, 64); err != nil {
+				continue
+			}
 			// Check both .jsonl.enc and .jsonl; remove orphan if neither exists.
 			if _, err := os.Stat(filepath.Join(st.sessionsDir(), chatID+".jsonl.enc")); os.IsNotExist(err) {
 				if _, err := os.Stat(filepath.Join(st.sessionsDir(), chatID+".jsonl")); os.IsNotExist(err) {

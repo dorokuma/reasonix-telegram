@@ -263,14 +263,20 @@ func (a *App) startRestartWatchdog() {
 		go func() {
 			t := time.NewTicker(15 * time.Second)
 			defer t.Stop()
-			for range t.C {
-				a.restartMu.Lock()
-				stuck := a.restarting && time.Since(a.restartStarted) > 45*time.Second
-				if stuck {
-					a.restarting = false
-					log.Printf("WARN: restart appears stuck >45s; accepting messages again")
+			for {
+				select {
+				case <-t.C:
+					a.restartMu.Lock()
+					stuck := a.restarting && time.Since(a.restartStarted) > 45*time.Second
+					if stuck {
+						a.restarting = false
+						log.Printf("WARN: restart appears stuck >45s; accepting messages again")
+					}
+					a.restartMu.Unlock()
+				case <-a.healthCheckStop:
+					log.Printf("restart watchdog: shutdown signal, exiting")
+					return
 				}
-				a.restartMu.Unlock()
 			}
 		}()
 	})

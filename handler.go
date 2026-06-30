@@ -31,15 +31,22 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 	if m.From == nil {
 		return
 	}
-	// Per-chat rate limit: at most 1 message per 3 seconds.
-	const minInterval = 3 * time.Second
-	now := time.Now()
-	if last, loaded := a.rateLimits.LoadOrStore(m.Chat.ID, now); loaded {
-		lastTime, ok := last.(time.Time)
-		if !ok || now.Sub(lastTime) < minInterval {
-			return // silently drop
+	// Control commands (/stop, /cancel, /restart) must always be processed — skip rate limit.
+	ctrlText := strings.TrimSpace(m.Text)
+	if ctrlText == "" {
+		ctrlText = strings.TrimSpace(m.Caption)
+	}
+	if !(ctrlText == "/stop" || ctrlText == "/cancel" || ctrlText == "/restart" || strings.HasPrefix(ctrlText, "/stop ") || strings.HasPrefix(ctrlText, "/cancel ")) {
+		// Per-chat rate limit: at most 1 message per 3 seconds.
+		const minInterval = 3 * time.Second
+		now := time.Now()
+		if last, loaded := a.rateLimits.LoadOrStore("msg:"+strconv.FormatInt(m.Chat.ID, 10), now); loaded {
+			lastTime, ok := last.(time.Time)
+			if !ok || now.Sub(lastTime) < minInterval {
+				return // silently drop
+			}
+			a.rateLimits.Store("msg:"+strconv.FormatInt(m.Chat.ID, 10), now)
 		}
-		a.rateLimits.Store(m.Chat.ID, now)
 	}
 	// Inbound message_id dedup: drop duplicate Telegram updates.
 	// LoadOrStore provides an atomic check-and-store, eliminating the TOCTOU
@@ -307,7 +314,7 @@ func (a *App) handleMessage(m *tgbotapi.Message) {
 		a.handleCronDel(m, args)
 		return
 
-	case text == "/stop" || text == "/cancel":
+	case strings.HasPrefix(text, "/stop") || strings.HasPrefix(text, "/cancel"):
 		s := a.getOrCreateSession(m.Chat.ID)
 		s.mu.Lock()
 		t := s.task
